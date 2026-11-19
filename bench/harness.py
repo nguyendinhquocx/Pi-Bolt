@@ -21,6 +21,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +47,8 @@ def done(prompt: int) -> str:
     are on the screen too, and are written again when the screen is redrawn."""
     return f"{DONE} (prompt {prompt})."
 MODEL_ARGS = ["--model", "fake/fake-model"]
+# What Pi shows for a prompt submitted while it is still starting (the prompt stays in the editor).
+STARTUP_IN_PROGRESS = b"Startup is still in progress"
 ANSI = re.compile(rb"\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[=>78]|\x1b[()][A-Z0-9]")
 
 
@@ -160,6 +163,66 @@ def workdir():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# The Pi homes a tool can start with: `blank` has only the fake model (pi_home()); `realistic` adds what a home and project in
+# daily use have (realistic_home()).
+HOMES = ("blank", "realistic")
+# (Built-in providers whose pi.dev catalogs a refresh keeps in models-store.json: their API, base URL and number of models.)
+STORE_PROVIDERS = {
+    "anthropic": ("anthropic-messages", "https://api.anthropic.com", 24),
+    "openai": ("openai-responses", "https://api.openai.com/v1", 40),
+    "opencode": ("openai-completions", "https://opencode.ai/zen/v1", 54),
+}
+# The time of the stored catalogs (2100-01-01): later than any build's own catalog, so that Pi uses them as it does a catalog
+# refreshed after the build was made, instead of ignoring them as older.
+STORE_LAST_MODIFIED = 4102444800000
+
+
+def models_store() -> dict:
+    """A models-store.json as Pi writes it after refreshing the catalogs of three built-in providers from pi.dev: 118 chat
+    models, about 120 KB. Generated (the same every time), with model ids of its own, so the merged catalogs grow by 118."""
+    store = {}
+    for provider, (api, base_url, count) in STORE_PROVIDERS.items():
+        models = []
+        for n in range(count):
+            reasoning = n % 3 != 0
+            models.append({
+                "id": f"{provider}-bench-{n:03d}", "name": f"{provider.title()} Bench Model {n}", "api": api,
+                "provider": provider, "baseUrl": base_url, "reasoning": reasoning,
+                "input": ["text", "image"] if n % 4 else ["text"],
+                "cost": {"input": 0.25 * (n % 12 + 1), "output": 1.25 * (n % 12 + 1), "cacheRead": 0.025 * (n % 12 + 1),
+                         "cacheWrite": 0.3125 * (n % 12 + 1)},
+                "contextWindow": (128000, 200000, 400000, 1000000)[n % 4], "maxTokens": (16384, 32000, 64000, 128000)[n % 4],
+                **({"thinkingLevelMap": {"off": None, "xhigh": "xhigh"}} if reasoning else {}),
+                "compat": {"supportsDeveloperRole": n % 2 == 0, "supportsReasoningEffort": reasoning, "maxTokensField": "max_completion_tokens"},
+                "inputLimits": {"images": {"resize": {"maxWidth": 2000, "maxHeight": 2000, "maxBytes": 4718592, "jpegQuality": 80}}},
+                "type": "chat",
+            })
+        store[provider] = {"models": models, "lastModified": STORE_LAST_MODIFIED, "checkedAt": STORE_LAST_MODIFIED,
+                           "etag": f'W/"bench-{provider}"'}
+    return store
+
+
+def realistic_home(home: Path, cwd: Path) -> None:
+    """Fills a Pi home (pi_home()) and project folder (workdir()) as they are after daily use: 43 prompt templates and 8 skills
+    with frontmatter, a models-store.json (models_store()), global and project AGENTS.md, and a .git folder in the project."""
+    (home / "prompts").mkdir(exist_ok=True)
+    for i in range(43):
+        (home / "prompts" / f"p{i}.md").write_text(f'---\ndescription: Prompt number {i} does a thing\nargument-hint: "[file]"\n---\n'
+                                                   f"Do the thing {i} with $ARGUMENTS\n" + "body line\n" * 20)
+    for i in range(8):
+        skill = home / "skills" / f"skill{i}"
+        skill.mkdir(parents=True, exist_ok=True)
+        (skill / "SKILL.md").write_text(f"---\nname: skill{i}\ndescription: Use this skill when the user asks for thing {i}\n---\n"
+                                        + "text\n" * 50)
+    # (Indented as Pi writes it.)
+    (home / "models-store.json").write_text(json.dumps(models_store(), indent=2))
+    (home / "AGENTS.md").write_text("# Global rules\n" + "- rule\n" * 40)
+    (Path(cwd) / "AGENTS.md").write_text("# Project rules\n" + "- rule\n" * 80)
+    git = Path(cwd) / ".git"
+    git.mkdir(exist_ok=True)
+    (git / "HEAD").write_text("ref: refs/heads/main\n")
+
+
 def pi_env(home: Path, extra: dict | None = None) -> dict:
     # Nothing from the caller's BUN_* / NODE_* environment: those change what a build does.
     env = {k: v for k, v in os.environ.items() if not k.startswith(("BUN_", "NODE_", "PI_"))}
@@ -245,6 +308,47 @@ def peak_footprint_mb(pid: int, block: bool = True) -> float | None:
 
 
 last_exit_counters: dict = {}
+
+
+class PeakOwnSampler:
+    """Linux: the largest private memory a running process reached, the counterpart of macOS's peak footprint. ru_maxrss also
+    counts the clean pages of the files it maps (Pi-Bolt's executable maps its 114 MB static heap and compiled code; a Go
+    binary maps its own text), which the kernel can drop and share. RssAnon (in /proc/<pid>/status) is the process's own
+    resident memory: its heaps, and file pages it has written to. Linux keeps no peak of it, so a thread samples it every
+    `interval` seconds from start() until the process is gone or stop(): a spike shorter than that can be missed.
+    Elsewhere it does nothing and `peak_mb` stays None."""
+
+    def __init__(self, pid: int, interval: float = 0.002):
+        self.pid, self.interval, self.peak_mb = pid, interval, None
+        self._stop = threading.Event()
+        self._thread = None
+        if sys.platform.startswith("linux"):
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def _sample(self) -> bool:
+        try:
+            with open(f"/proc/{self.pid}/status") as f:
+                for line in f:
+                    if line.startswith("RssAnon:"):
+                        mb = round(int(line.split()[1]) / 1024, 1)
+                        self.peak_mb = mb if self.peak_mb is None else max(self.peak_mb, mb)
+                        return True
+        except OSError:
+            pass
+        return False  # gone, or reaped (a zombie's status has no RssAnon line)
+
+    def _run(self):
+        while not self._stop.is_set() and self._sample():
+            self._stop.wait(self.interval)
+
+    def stop(self) -> float | None:
+        """Stops sampling (call it before the process is reaped, or right after) and returns the peak in MB."""
+        if self._thread:
+            self._sample()
+            self._stop.set()
+            self._thread.join()
+        return self.peak_mb
 
 
 class WinTty:
@@ -333,12 +437,29 @@ class Tty:
         os.write(self.fd, data)
 
     def wait_for(self, text, since, deadline):
+        """Until `text` is on the screen (written after `since`). A prompt submitted before Pi has finished starting is
+        kept in the editor with the status "Startup is still in progress" (a tool may see Pi's screen before startup ends,
+        and type at once): Enter is pressed again then, as a person would, until Pi takes it."""
         needle = text.encode()
         scan = since
+        startup_scan = since
+        # (When Pi said so last, and when Enter was pressed again. The status may stay on the screen without being drawn
+        # again, so Enter is pressed every 0.3 s for a while: on an empty editor it does nothing.)
+        startup_seen = sent = -1.0
         while time.perf_counter() < deadline:
             self.pump(0.01)
             if needle in ANSI.sub(b"", self.buf[scan:]):
                 return True
+            now = time.perf_counter()
+            if STARTUP_IN_PROGRESS in ANSI.sub(b"", self.buf[startup_scan:]):
+                startup_scan = len(self.buf)
+                startup_seen = now
+            else:
+                # (Only the end is read again: reading all that a long transcript wrote, at every read, took minutes.)
+                startup_scan = max(startup_scan, len(self.buf) - 8192)
+            if startup_seen >= 0 and now - startup_seen < 10 and now - sent > 0.3:
+                self.send(b"\r")
+                sent = now
             scan = max(since, len(self.buf) - 8192)
         return False
 

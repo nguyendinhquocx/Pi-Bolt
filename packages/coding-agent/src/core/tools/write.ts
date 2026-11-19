@@ -1,17 +1,12 @@
-import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { mkdir as fsMkdir, writeFile as fsWriteFile } from "fs/promises";
 import { dirname } from "path";
-import { type Static, Type } from "typebox";
+import type { Static } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { resolveToCwd } from "./path-utils.ts";
 import { writeRenderers } from "./renderers/write.ts";
-import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
-
-const writeSchema = Type.Object({
-	path: Type.String({ description: "Path to the file to write (relative or absolute)" }),
-	content: Type.String({ description: "Content to write to the file" }),
-});
+import { type TypeBoxAgentTool, wrapToolDefinition } from "./tool-definition-wrapper.ts";
+import { writeSchema } from "./tool-schemas.generated.ts";
 
 export const writeToolSystemPromptContribution = {
 	snippet: "Create or overwrite files",
@@ -92,6 +87,6 @@ export function createWriteToolDefinition(
 	};
 }
 
-export function createWriteTool(cwd: string, options?: WriteToolOptions): AgentTool<typeof writeSchema> {
+export function createWriteTool(cwd: string, options?: WriteToolOptions): TypeBoxAgentTool<typeof writeSchema> {
 	return wrapToolDefinition(createWriteToolDefinition(cwd, options));
 }

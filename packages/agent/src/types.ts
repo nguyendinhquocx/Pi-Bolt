@@ -14,7 +14,7 @@ import type {
 	TranscriptContext,
 	Usage,
 } from "@earendil-works/pi-ai";
-import type { Static, TSchema } from "typebox";
+import type { Static } from "@earendil-works/pi-schema";
 
 /**
  * Stream function used by the agent loop. `Models.streamSimple` satisfies
@@ -339,7 +339,31 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * The hook receives the agent abort signal and is responsible for honoring it.
 	 */
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
+
+	/**
+	 * Lets a tool call start while the rest of the assistant message is still streaming. See {@link EarlyToolExecution}.
+	 * Without it, tool calls start after the message has ended.
+	 */
+	earlyToolExecution?: EarlyToolExecution;
 }
+
+/**
+ * Decides whether a tool call may start as soon as its arguments are complete, while the rest of the assistant
+ * message is still streaming. Arguments are complete when the provider ends the tool call, or when its streamed
+ * JSON arguments form a complete object. A call is considered only if every tool call before it in the message
+ * started early, so it never runs ahead of a call that may have side effects.
+ *
+ * Return undefined to run the call as usual. Return a function to start it early: the run is invisible until the
+ * loop reaches the call after the message has ended. There the loop emits `tool_execution_start`, prepares and
+ * validates the arguments and runs `beforeToolCall` as usual, then uses the early run in place of executing the
+ * tool only if the function still returns true, the call was not blocked, the run is not aborted, and the final
+ * validated arguments equal those the run started with. Otherwise the early run is aborted and the call runs as
+ * usual. Early runs that are not used (an error, an abort, a truncated message, a blocked call) are aborted and
+ * their results dropped. Updates an early run reports are passed on once the loop reaches the call.
+ *
+ * Only return a function for tools without side effects, whose result may be dropped.
+ */
+export type EarlyToolExecution = (toolCall: AgentToolCall, tool: AgentTool<any>) => (() => boolean) | undefined;
 
 /**
  * Thinking/reasoning level for models that support it.
@@ -462,27 +486,39 @@ export interface AgentToolCallOutcome {
  */
 export type AgentToolUpdateCallback<T = any> = (partialResult: AgentToolResult<T>) => void;
 
-/** Tool definition used by the agent runtime. */
-export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any> extends Tool<TParameters> {
+/**
+ * The arguments type of a tool with parameter schema `TParameters`: pi-schema's `Static<TParameters>` (the builders'
+ * type, TypeBox's for the common TypeBox kinds, else `unknown`), and `any` for `AgentTool<any>`.
+ */
+export type AgentToolParams<TParameters> = IsAny<TParameters> extends true ? any : Static<TParameters>;
+
+// `0 extends 1 & T` is resolved too early for a `T` constrained to `object`; this form waits for the argument.
+type IsAny<T> = boolean extends (T extends never ? true : false) ? true : false;
+
+/**
+ * Tool definition used by the agent runtime. `parameters` is any JSON Schema object; see {@link AgentToolParams} for
+ * the type `execute` receives.
+ */
+export interface AgentTool<TParameters extends object = object, TDetails = any> extends Tool<TParameters> {
 	/** Human-readable label for UI display. */
 	label: string;
 	/**
 	 * Optional compatibility shim for raw tool-call arguments before schema validation.
 	 * Must return an object that matches `TParameters`.
 	 */
-	prepareArguments?: (args: unknown) => Static<TParameters>;
+	prepareArguments?: (args: unknown) => AgentToolParams<TParameters>;
 	/**
 	 * JSON Schema of `structuredContent` in successful results. Tools that declare it should always
 	 * set `structuredContent`.
 	 */
-	outputSchema?: TSchema;
+	outputSchema?: object;
 	/**
 	 * Execute the tool call. Throw on failure, or return a result with `isError: true`; do not only
 	 * describe the failure in `content`.
 	 */
 	execute: (
 		toolCallId: string,
-		params: Static<TParameters>,
+		params: AgentToolParams<TParameters>,
 		signal?: AbortSignal,
 		onUpdate?: AgentToolUpdateCallback<TDetails>,
 	) => Promise<AgentToolResult<TDetails>>;

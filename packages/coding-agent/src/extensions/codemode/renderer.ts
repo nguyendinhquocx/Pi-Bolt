@@ -7,12 +7,12 @@
  * Nested calls are not separate tool rows because they never reach the model as tool calls.
  */
 
-import { Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, Spacer, sanitizeTerminalText, Text } from "@earendil-works/pi-tui";
 import type { ToolDefinition } from "../../core/extensions/types.ts";
 import { getTextOutput, replaceTabs, startToolTimer, str, toolTimerText } from "../../core/tools/render-utils.ts";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
 import { VisualLinePreview } from "../../modes/interactive/components/visual-truncate.ts";
-import { highlightCode, type Theme } from "../../modes/interactive/theme/theme.ts";
+import { CodeHighlighter, type Theme } from "../../modes/interactive/theme/theme.ts";
 import type { CodemodeNestedCall, CodemodeToolDetails } from "./tool.ts";
 
 const CODE_PREVIEW_LINES = 10;
@@ -20,6 +20,12 @@ const CALL_PREVIEW_COUNT = 8;
 const OUTPUT_PREVIEW_LINES = 5;
 const COLLAPSED_ARGS_CHARS = 80;
 const SCRIPT_HEADER = /^Script (completed|failed)\nWall time [\d.]+ seconds\nOutput:\n$/;
+
+/** Renderer state of a codemode row. */
+interface CodemodeRenderState {
+	// Progress, timer ticks and expanding redraw the call, so the row keeps the script's highlighting.
+	scriptHighlighter?: CodeHighlighter;
+}
 
 function expandHint(theme: Theme, hidden: number, noun: string): string {
 	return `${theme.fg("muted", `... (${hidden} more ${noun},`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
@@ -49,16 +55,21 @@ function statusIcon(call: CodemodeNestedCall, theme: Theme): string {
 }
 
 function formatCall(call: CodemodeNestedCall, theme: Theme, expanded: boolean): string {
+	// (The script, which the model wrote, chose the name and arguments: sanitizeTerminalText() keeps escape sequences in them
+	// from acting on the terminal.)
+	const callArgs = sanitizeTerminalText(call.args);
 	const args =
-		!expanded && call.args.length > COLLAPSED_ARGS_CHARS
-			? `${call.args.slice(0, COLLAPSED_ARGS_CHARS - 3)}...`
-			: call.args;
+		!expanded && callArgs.length > COLLAPSED_ARGS_CHARS
+			? `${callArgs.slice(0, COLLAPSED_ARGS_CHARS - 3)}...`
+			: callArgs;
 	const duration = formatDuration(call.durationMs);
-	let line = `${statusIcon(call, theme)} ${theme.fg("toolTitle", call.name)}`;
+	let line = `${statusIcon(call, theme)} ${theme.fg("toolTitle", sanitizeTerminalText(call.name))}`;
 	if (args) line += ` ${theme.fg("muted", args)}`;
 	if (duration) line += ` ${theme.fg("dim", duration)}`;
 	if (call.cost) line += ` ${theme.fg("dim", formatCost(call.cost))}`;
-	if (expanded && call.error) line += `\n    ${theme.fg("error", call.error.split("\n").join("\n    "))}`;
+	if (expanded && call.error) {
+		line += `\n    ${theme.fg("error", sanitizeTerminalText(call.error).split("\n").join("\n    "))}`;
+	}
 	return line;
 }
 
@@ -79,7 +90,11 @@ export const codemodeRenderers: Pick<
 		}
 		component.addChild(new Text(title, 0, 0));
 		if (code) {
-			const highlighted = highlightCode(replaceTabs(code.replace(/\r/g, "").trimEnd()), "javascript").join("\n");
+			const state = context.state as CodemodeRenderState;
+			state.scriptHighlighter ??= new CodeHighlighter();
+			const highlighted = state.scriptHighlighter
+				.highlight(replaceTabs(code.replace(/\r/g, "").trimEnd()), "javascript")
+				.join("\n");
 			component.addChild(
 				context.expanded
 					? new Text(highlighted, 0, 0)

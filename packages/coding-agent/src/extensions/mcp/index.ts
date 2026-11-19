@@ -27,7 +27,8 @@
  */
 
 import { join, resolve } from "node:path";
-import type { SelectItem } from "@earendil-works/pi-tui";
+import { createMcpToolName, mcpNamespace } from "@earendil-works/pi-mcp";
+import { type SelectItem, sanitizeTerminalText } from "@earendil-works/pi-tui";
 import type { TSchema } from "typebox";
 import { getAgentDir } from "../../config.ts";
 import type {
@@ -37,8 +38,8 @@ import type {
 	ExtensionFactory,
 	ToolDefinition,
 } from "../../core/extensions/types.ts";
-import { mcpNamespace } from "../../core/mcp-servers.ts";
 import type { ModelRegistry } from "../../core/model-registry.ts";
+import { sliceHead } from "../../core/tools/truncate.ts";
 import { openBrowser } from "../../utils/open-browser.ts";
 import { CODEMODE_TOOL_NAME } from "../codemode/tool.ts";
 import { TOOL_SEARCH_TOOL_NAME } from "../tool-search/tool.ts";
@@ -61,7 +62,7 @@ import {
 import { loadMcpRuntime } from "./runtime.lazy.ts";
 import type * as McpRuntime from "./runtime.ts";
 import type { McpServerConnection, McpServerLog, McpTransportFactory } from "./runtime.ts";
-import { createMcpToolDefinition, createMcpToolName, createMcpToolRenderers, type McpToolDetails } from "./tools.ts";
+import { createMcpToolDefinition, createMcpToolRenderers, type McpToolDetails } from "./tools.ts";
 import { type McpMenu, type McpUi, showMcpManager } from "./ui.ts";
 
 export type { McpTransportFactory } from "./runtime.ts";
@@ -120,12 +121,14 @@ const EXPOSURE_DESCRIPTIONS: Record<Exclude<McpExposure, "hidden">, string> = {
 	direct: "declared to the model like built-in tools",
 };
 
+/** An error's message, to show: it can hold what an MCP server sent, whose escape sequences would act on the terminal. */
 function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
+	return sanitizeTerminalText(error instanceof Error ? error.message : String(error));
 }
 
+/** The first line of text an MCP server sent (a description, an error), to show. */
 function firstLine(text: string): string {
-	return text.split("\n", 1)[0] ?? "";
+	return sanitizeTerminalText(text.split("\n", 1)[0] ?? "");
 }
 
 function isEnabled(server: Pick<McpServer, "entry">): boolean {
@@ -172,7 +175,7 @@ function serversSectionIntro(reaches: ReadonlySet<string>): string {
 
 function truncate(text: string, max: number): string {
 	if (text.length <= max) return text;
-	return max <= 1 ? "" : `${text.slice(0, max - 1).trimEnd()}…`;
+	return max <= 1 ? "" : `${sliceHead(text, max - 1).trimEnd()}…`;
 }
 
 /** What the `mcp_servers` section needs of a server. */
@@ -1032,7 +1035,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 						: (connection?.state ?? "starting");
 				const error =
 					connection?.error && connection.state !== "connected"
-						? `\n    ${connection.error.split("\n").join("\n    ")}`
+						? `\n    ${sanitizeTerminalText(connection.error).split("\n").join("\n    ")}`
 						: "";
 				return `${name}: ${state}${tools} (${exposure})${error}`;
 			});

@@ -21,6 +21,7 @@ import {
 	type FullscreenExitOutput,
 	type MermaidRenderingMode,
 	type QuietStartup,
+	type SessionShareDestination,
 	type TuiMode,
 	type WarningSettings,
 } from "../../../core/settings-manager.ts";
@@ -70,6 +71,7 @@ export interface SettingsConfig {
 	steeringMode: "all" | "one-at-a-time";
 	followUpMode: "all" | "one-at-a-time";
 	transport: Transport;
+	sessionShareDestination: SessionShareDestination;
 	httpIdleTimeoutMs: number;
 	cacheWarmingMode: CacheWarmingMode;
 	thinkingLevel: ThinkingLevel;
@@ -81,8 +83,12 @@ export interface SettingsConfig {
 	hideThinkingBlock: boolean;
 	mermaidRenderingMode: MermaidRenderingMode;
 	showCacheMissNotices: boolean;
+	shadedCodeBlocks: boolean;
 	collapseChangelog: boolean;
 	enableInstallTelemetry: boolean;
+	remoteControlEnabled: boolean;
+	/** Pi-Bolt's `piBolt.autoUpdate`; the setting is not listed without it (a build that is not Pi-Bolt). */
+	piBoltAutoUpdate?: boolean;
 	doubleEscapeAction: "fork" | "tree" | "none";
 	treeFilterMode: "default" | "no-tools" | "user-only" | "labeled-only" | "all";
 	showHardwareCursor: boolean;
@@ -111,6 +117,7 @@ export interface SettingsCallbacks {
 	onSteeringModeChange: (mode: "all" | "one-at-a-time") => void;
 	onFollowUpModeChange: (mode: "all" | "one-at-a-time") => void;
 	onTransportChange: (transport: Transport) => void;
+	onSessionShareDestinationChange: (destination: SessionShareDestination) => void;
 	onHttpIdleTimeoutMsChange: (timeoutMs: number) => void;
 	onCacheWarmingModeChange: (mode: CacheWarmingMode) => void;
 	onModelThinkingLevelChange: (provider: string, modelId: string, level: ThinkingLevel) => void;
@@ -120,8 +127,11 @@ export interface SettingsCallbacks {
 	onHideThinkingBlockChange: (hidden: boolean) => void;
 	onMermaidRenderingModeChange: (mode: MermaidRenderingMode) => void;
 	onShowCacheMissNoticesChange: (shown: boolean) => void;
+	onShadedCodeBlocksChange: (shaded: boolean) => void;
 	onCollapseChangelogChange: (collapsed: boolean) => void;
 	onEnableInstallTelemetryChange: (enabled: boolean) => void;
+	onRemoteControlEnabledChange: (enabled: boolean) => void;
+	onPiBoltAutoUpdateChange?: (enabled: boolean) => void;
 	onDoubleEscapeActionChange: (action: "fork" | "tree" | "none") => void;
 	onTreeFilterModeChange: (mode: "default" | "no-tools" | "user-only" | "labeled-only" | "all") => void;
 	onShowHardwareCursorChange: (enabled: boolean) => void;
@@ -510,6 +520,14 @@ export class SettingsSelectorComponent extends Container {
 				values: ["sse", "websocket", "websocket-cached", "auto"],
 			},
 			{
+				id: "share-destination",
+				label: "Session share destination",
+				description:
+					"Where to upload sessions with /share (auto prefers Radius when authenticated, otherwise GitHub Gist)",
+				currentValue: config.sessionShareDestination,
+				values: ["auto", "gist", "radius"],
+			},
+			{
 				id: "http-idle-timeout",
 				label: "HTTP idle timeout",
 				description:
@@ -547,6 +565,13 @@ export class SettingsSelectorComponent extends Container {
 				values: ["true", "false"],
 			},
 			{
+				id: "shaded-code-blocks",
+				label: "Shaded code blocks",
+				description: "Show code blocks on a background instead of between ``` fence lines",
+				currentValue: config.shadedCodeBlocks ? "true" : "false",
+				values: ["true", "false"],
+			},
+			{
 				id: "collapse-changelog",
 				label: "Collapse changelog",
 				description: "Show condensed changelog after updates",
@@ -567,6 +592,26 @@ export class SettingsSelectorComponent extends Container {
 				currentValue: config.enableInstallTelemetry ? "true" : "false",
 				values: ["true", "false"],
 			},
+			{
+				id: "remote-control",
+				label: "Remote control",
+				description:
+					"Control sessions from the Pi-Bolt phone app: /remote-control and the background service (global setting)",
+				currentValue: config.remoteControlEnabled ? "true" : "false",
+				values: ["true", "false"],
+			},
+			...(config.piBoltAutoUpdate === undefined
+				? []
+				: [
+						{
+							id: "pibolt-auto-update",
+							label: "Automatic updates",
+							description:
+								"Install new Pi-Bolt releases in the background at startup, at most once a day; they start next time. The installer's installations only (global setting; PIBOLT_NO_AUTO_UPDATE=1 turns it off)",
+							currentValue: config.piBoltAutoUpdate ? "true" : "false",
+							values: ["true", "false"],
+						},
+					]),
 			{
 				id: "default-project-trust",
 				label: "Default project trust",
@@ -900,6 +945,9 @@ export class SettingsSelectorComponent extends Container {
 					case "transport":
 						callbacks.onTransportChange(newValue as Transport);
 						break;
+					case "share-destination":
+						callbacks.onSessionShareDestinationChange(newValue as SessionShareDestination);
+						break;
 					case "http-idle-timeout": {
 						const choice = HTTP_IDLE_TIMEOUT_CHOICES.find((item) => item.label === newValue);
 						if (choice) {
@@ -919,6 +967,9 @@ export class SettingsSelectorComponent extends Container {
 					case "cache-miss-notices":
 						callbacks.onShowCacheMissNoticesChange(newValue === "true");
 						break;
+					case "shaded-code-blocks":
+						callbacks.onShadedCodeBlocksChange(newValue === "true");
+						break;
 					case "collapse-changelog":
 						callbacks.onCollapseChangelogChange(newValue === "true");
 						break;
@@ -927,6 +978,12 @@ export class SettingsSelectorComponent extends Container {
 						break;
 					case "install-telemetry":
 						callbacks.onEnableInstallTelemetryChange(newValue === "true");
+						break;
+					case "remote-control":
+						callbacks.onRemoteControlEnabledChange(newValue === "true");
+						break;
+					case "pibolt-auto-update":
+						callbacks.onPiBoltAutoUpdateChange?.(newValue === "true");
 						break;
 					case "default-project-trust": {
 						const defaultProjectTrust = DEFAULT_PROJECT_TRUST_BY_LABEL.get(newValue);

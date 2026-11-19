@@ -1,5 +1,41 @@
 # Changelog
 
+## [1.5.2] - 2026-11-10
+
+## [1.5.1] - 2026-11-09
+
+### Added
+
+- Added `resolveSchemaRef(ref, root)`, which returns the subschema a local `$ref` (`#`, `#/$defs/Item`) names in a schema, with URI-decoded and JSON Pointer unescaped segments ([#11803](https://github.com/earendil-works/pi/issues/11803))
+
+### Fixed
+
+- Fixed `schemaToType()`, `renderDeclarations()`, `renderToolSignature()`, and `renderToolSample()` throwing `URIError` for a local `$ref` with a malformed percent escape (`#/$defs/%E0`), so one such tool schema failed every caller that renders all tools. The reference now renders as `unknown`, like a reference that names nothing ([#11803](https://github.com/earendil-works/pi/issues/11803))
+- Fixed `console.*` output and thrown non-Error values in scripts showing `NaN`, `Infinity`, and `-Infinity` as `null`; they now print as `text()` prints them ([#11901](https://github.com/earendil-works/pi/issues/11901))
+
+## [1.5.0] - 2026-11-02
+
+### Changed
+
+- README: the codemode tool example builds its parameters with `@earendil-works/pi-schema` instead of TypeBox.
+
+## [1.4.0] - 2026-10-21
+
+## [1.3.0] - 2026-10-15
+
+### Breaking Changes
+
+- Worker-backed results and `close()` now settle after requesting shutdown, not after worker exit. Hosts that require actual exit must track `onWorkerStarted(exited)` or retain capacity through `acquireWorker()`'s release callback
+
+### Added
+
+- Added `CodemodeSandbox`'s `onWorkerStarted(exited)` callback so hosts can count a worker against concurrency limits until it actually exits, independently of its script result
+- Added `CodemodeSandbox`'s `acquireWorker()` hook to reserve shared capacity before starting a worker and release it only on actual exit or constructor failure
+
+### Fixed
+
+- Fixed aborts, timeouts, and `close()` waiting for worker termination on Bun while a non-interruptible built-in runs; shutdown now requests termination without waiting for exit ([#10748](https://github.com/earendil-works/pi/issues/10748))
+
 ## [1.2.0] - 2026-10-12
 
 ### Breaking Changes

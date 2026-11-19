@@ -2,10 +2,11 @@
  * GitHub Copilot OAuth flow
  */
 
-import { GITHUB_COPILOT_MODELS } from "../../providers/github-copilot.models.ts";
+import { GITHUB_COPILOT_MODEL_CATALOG } from "../../providers/github-copilot.catalog.generated.ts";
 import { sleep } from "../../utils/sleep.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
+import { trustedHttpUrl } from "./trusted-url.ts";
 
 const decode = (s: string) => atob(s);
 const CLIENT_ID = decode("SXYxLmI1MDdhMDhjODdlY2ZlOTg=");
@@ -125,7 +126,7 @@ function parseGitHubCopilotModelCatalog(raw: unknown, allowPolicyFallback: boole
 		.filter(
 			(model) =>
 				model.policyState === "unconfigured" &&
-				Object.hasOwn(GITHUB_COPILOT_MODELS, model.id) &&
+				Object.hasOwn(GITHUB_COPILOT_MODEL_CATALOG.chat(), model.id) &&
 				(model.pickerEnabled || usePolicyFallback),
 		)
 		.map((model) => model.id);
@@ -239,22 +240,15 @@ async function startDeviceFlow(domain: string, signal: AbortSignal): Promise<Dev
 		throw new Error("Invalid device code response fields");
 	}
 
-	// The verification URI is opened in the user's browser and to prevent `open` from
-	// opening an executable or similar, we force it to be a URL.
-	let parsedUri: URL;
-	try {
-		parsedUri = new URL(verificationUri);
-	} catch {
-		throw new Error("Untrusted verification_uri in device code response");
-	}
-	if (parsedUri.protocol !== "https:" && parsedUri.protocol !== "http:") {
+	const trustedVerificationUri = trustedHttpUrl(verificationUri);
+	if (!trustedVerificationUri) {
 		throw new Error("Untrusted verification_uri in device code response");
 	}
 
 	return {
 		device_code: deviceCode,
 		user_code: userCode,
-		verification_uri: parsedUri.href,
+		verification_uri: trustedVerificationUri,
 		interval,
 		expires_in: expiresIn,
 	};

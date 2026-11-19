@@ -9,6 +9,7 @@ This document explains what a Pi-Bolt executable contains, how it is built, and 
 - [JIT off and JIT on](#jit-off-and-jit-on)
 - [The x86-64 port](#the-x86-64-port)
 - [The macOS ARM64 port](#the-macos-arm64-port)
+- [The Linux ARM64 port](#the-linux-arm64-port)
 - [Limitations](#limitations)
 
 ## The executable
@@ -182,8 +183,23 @@ the engine's classes, the text of static strings. On Linux the runtime is linked
 On macOS the executable runs at the address it was linked for: `pi` is a small launcher
 ([`scripts/lib/darwin-launcher.c`](../scripts/lib/darwin-launcher.c)) that starts `pi-bin`, the executable beside it, that way in
 the same process (`posix_spawn` with `POSIX_SPAWN_SETEXEC`). The system's libraries still move at every boot; the build checks
-that the heap points at none of their functions or objects. If the executable is not at its address after all, it runs from
-bytecode.
+that the heap points at none of their functions or objects. The check reads every 8-byte word of the heap, data such as the
+bytecode it carries included, so it can warn about a word that only happens to equal a library symbol's address at that boot
+(`warning: the static heap points at ...`): a real pointer is reported on every machine, such a word on one machine and not on
+another. If the executable is not at its address after all, it runs from bytecode.
+
+**Binding libSystem's imports.** dyld looks each of `pi-bin`'s ~480 libSystem imports up in libSystem's 39 re-exported
+libraries one after another until one exports it (about 24 lookups each: libsystem_kernel, which has 175 of them, is 32nd), some
+25 million instructions at every start. The runtime loads `@rpath/libSystem.B.dylib`, with the rpaths
+`@executable_path/libsystem` and `/usr/lib` ([`scripts/build-runtime.sh`](../scripts/build-runtime.sh)), and the build puts a
+`libsystem/libSystem.B.dylib` beside `pi-bin` ([`scripts/lib/darwin_libsystem.py`](../scripts/lib/darwin_libsystem.py)): no
+code, it re-exports libsystem_c, \_m, \_kernel, \_platform and \_pthread, in libSystem's order, then libSystem itself. 420 of the
+imports are found in two to six lookups and the rest through libSystem as before: 16 million fewer instructions per start. The
+binary names no library of libSystem's, so nothing depends on how a macOS splits libSystem: a symbol that moves to another of
+its libraries is found through libSystem; a library that is gone is replaced by an empty one from `libsystem/fallback`; without
+`libsystem/` (a copied `pi-bin`, the runtime on its own) dyld loads `/usr/lib/libSystem.B.dylib`. libSystem's libraries export no
+name twice, so each import binds to what it bound to before; the build checks that with a program importing the same symbols,
+with, without and through the fallback, and leaves `libsystem/` out if one address differs.
 
 **A start from disk.** When `pi-bin` is not in memory (after a restart or an update), a start reads its pages one by one as each
 is first touched, and waits for the disk each time: about 170 ms instead of 30. `build-pi.sh` records which parts of `pi-bin` a
@@ -226,9 +242,38 @@ program `import()`s) requires the builtin modules it imports when it is evaluate
 imported before the program starts. A start of Pi then loads none of `node:http`, `https`, `net` and `tls`, which only Bedrock,
 the proxy agents and the OAuth callback servers use (the first two alone cost a start about 60 million instructions).
 
+## The Linux ARM64 port
+
+The ARM64 code generation is the macOS port's; the Linux ARM64 port is about the many kinds of ARM64 Linux machine, and Android.
+Its parts of Pi-Bolt's [WebKit patch](../patches/webkit.patch) and [Bun patch](../patches/bun.patch) apply to Linux on ARM64 only.
+
+**Address space.** Many ARM64 kernels give a process 512 GB of addresses (39-bit: Android's, the Raspberry Pi 3's and 4's) or
+4 TB (42-bit, with 64 KB pages), where 0x200000000000 is out of reach. On Linux ARM64 the static region is at 64 GB
+(0x1000000000), with the Structures' 4 GB after it at 96 GB: below where the kernel puts a program's loader (two thirds of the way
+up), its other mappings (from the top down) and, in the legacy layout of an unlimited stack, the first of them (a quarter of the
+way up: 128 GB on a 39-bit kernel), on every address size.
+
+**Page size.** ARM64 kernels use 4, 16 or 64 KB pages. The heap and the code image are laid out in 64 KB pages (as are the
+executable's segments), so one executable maps them on all three.
+
+**One build for every ARM64 CPU.** The compiler leaves out what ARMv8.0 does not have (LSE atomics, JSCVT, FP16, FRINTTS, SHA3,
+DotProd: `BUN_AOT_CPU=baseline`, which `build-pi.sh` sets on Linux ARM64), so the same code runs on a Raspberry Pi 3 and on
+Graviton 4. The JIT build's JIT still uses what the CPU has.
+
+**Android.** Android's libc is not glibc, and an Android executable must be position-independent, which the static heap's
+pointers into the executable rule out. In Termux, Pi-Bolt runs as the Linux build with Termux's glibc: the executable's loader
+path (PT_INTERP) is the usual one with room after it, which the installer overwrites with Termux's
+(`$PREFIX/glibc/lib/ld-linux-aarch64.so.1`), so nothing in the file moves. Android's system call filter kills an app's process
+for calls it does not allow, where other Linux kernels return ENOSYS; Termux's glibc avoids them, but the runtime makes some
+itself (`epoll_pwait2`, `close_range`, `openat2`, `pidfd_open`, ...). On Android (`/system/bin/linker64` is there) the runtime
+returns ENOSYS for a call the filter refused, from its SIGSYS handler, and falls back as on an older kernel. The installer's
+launcher starts Pi-Bolt without Termux's `LD_PRELOAD`, which glibc's loader cannot load, and Pi gives it back to the programs it
+starts.
+
 ## Limitations
 
-- **Linux x86-64 and macOS on Apple silicon** only. Windows and Linux on ARM64 are not built yet.
+- **Linux x86-64 and ARM64 (Android too, in Termux), macOS on Apple silicon and Windows x64.** Windows on ARM64 runs the x64
+  build in emulation.
 - **Code loaded at run time is not compiled ahead of time.** With the JIT off it is interpreted. Compile plugins in
   ([PLUGINS.md](PLUGINS.md)) or use the JIT-on build.
 - **No type feedback.** A warmed-up JIT specializes on the types it actually observes, and the AOT compiler can only use what

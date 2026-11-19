@@ -44,6 +44,7 @@ export {
 	generateBranchSummary,
 	generateSummary,
 	generateSummaryWithUsage,
+	getCompactionThreshold,
 	getLastAssistantUsage,
 	prepareBranchEntries,
 	serializeConversation,
@@ -110,6 +111,8 @@ export type {
 	ExtensionToolContext,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
+	ExtensionUIHost,
+	ExtensionViewUI,
 	ExtensionVirtualModel,
 	ExtensionWidgetOptions,
 	FindToolCallEvent,
@@ -118,11 +121,15 @@ export type {
 	InputEvent,
 	InputEventResult,
 	InputSource,
+	KeybindingHints,
 	KeybindingsManager,
 	LoadExtensionsResult,
 	LsToolCallEvent,
+	MarkdownMessageType,
 	MarkdownTransformContext,
 	MarkdownTransformer,
+	MarkdownTransformerOptions,
+	MarkdownTransformerRegistration,
 	McpServersChangeEvent,
 	MessageEndEvent,
 	MessageEndEventResult,
@@ -144,6 +151,7 @@ export type {
 	ProviderStreamEvent,
 	ReadToolCallEvent,
 	RegisteredCommand,
+	RegisteredPage,
 	RegisteredTool,
 	ResolvedCommand,
 	ResourcesDiscoverEvent,
@@ -219,6 +227,30 @@ export {
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
 export type { RegisteredMcpServer } from "./core/mcp-servers.ts";
 export { convertToLlm } from "./core/messages.ts";
+export { viewToLines } from "./core/mobile-ui/text.ts";
+// The mobile UI kit (docs/mobile-ui.md)
+export type {
+	MobilePageDefinition,
+	MobileTileDefinition,
+	MobileView,
+	MobileViewButton,
+	MobileViewChart,
+	MobileViewField,
+	MobileViewIcon,
+	MobileViewLocation,
+	MobileViewNode,
+	MobileViewOp,
+	MobileViewOptions,
+	MobileViewResult,
+	MobileViewSlot,
+	MobileViewTable,
+	MobileViewTone,
+	MobileViewValue,
+	ShowViewOptions,
+	ViewEvent,
+	ViewEventKind,
+} from "./core/mobile-ui/types.ts";
+export { validateTile, validateView } from "./core/mobile-ui/validate.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export {
 	type ModelScopeDiagnostic,
@@ -236,6 +268,7 @@ export {
 	type ModelRuntimeAuthOverrides,
 } from "./core/model-runtime.ts";
 export type {
+	PackageInstallFailure,
 	PackageManager,
 	PathMetadata,
 	ProgressCallback,
@@ -390,6 +423,7 @@ export {
 	type WriteToolOptions,
 	withFileMutationQueue,
 } from "./core/tools/index.ts";
+export { formatReadLineRange } from "./core/tools/render-utils.ts";
 export {
 	hasTrustRequiringProjectResources,
 	type ProjectTrustDecision,

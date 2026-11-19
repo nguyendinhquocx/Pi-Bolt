@@ -91,6 +91,34 @@ describe("Radius OAuth", () => {
 		expect(urls).toEqual([`${GATEWAY}/v1/oauth/device`, `${GATEWAY}/v1/oauth/token`]);
 	});
 
+	it("rejects a device verification URI that is not a web URL", async () => {
+		for (const verificationUri of ["file:///System/Applications/Calculator.app", "-aTerminal", "vscode://x"]) {
+			const events: AuthEvent[] = [];
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (input: unknown) => {
+					const url = requestUrl(input);
+					if (url === `${GATEWAY}/v1/oauth/device`) {
+						return jsonResponse({
+							device_code: "device-code",
+							user_code: "ABCD-1234",
+							verification_uri: verificationUri,
+							expires_in: 600,
+							interval: 5,
+						});
+					}
+					throw new Error(`Unexpected request: ${url}`);
+				}),
+			);
+
+			const oauth = createRadiusOAuth({ name: "Radius", gateway: GATEWAY });
+			await expect(oauth.login(interaction("device-code", events)), verificationUri).rejects.toThrow(
+				"Untrusted verification_uri",
+			);
+			expect(events).toEqual([]);
+		}
+	});
+
 	it("refreshes directly through the gateway without discovery", async () => {
 		const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
 			expect(requestUrl(input)).toBe(`${GATEWAY}/v1/oauth/token`);
@@ -126,6 +154,39 @@ describe("Radius OAuth", () => {
 		const oauth = createRadiusOAuth({ name: "Radius", gateway: GATEWAY });
 		await expect(oauth.login(interaction("browser"))).rejects.toThrow(`Invalid Radius OAuth config from ${GATEWAY}`);
 		expect(fetchMock).toHaveBeenCalledOnce();
+	});
+
+	it("rejects an authorization endpoint that is not an http(s) URL", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => jsonResponse({ authorizationEndpoint: "file:///Users/victim/Downloads/payload.app" })),
+		);
+		const events: AuthEvent[] = [];
+
+		const oauth = createRadiusOAuth({ name: "Radius", gateway: GATEWAY });
+		await expect(oauth.login(interaction("browser", events))).rejects.toThrow(
+			`Invalid Radius OAuth config from ${GATEWAY}`,
+		);
+		expect(events).toEqual([]);
+	});
+
+	it("rejects a device verification URI that is not an http(s) URL", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () =>
+				jsonResponse({
+					device_code: "device-code",
+					user_code: "ABCD-1234",
+					verification_uri: "file:///Users/victim/Downloads/payload.app",
+					expires_in: 600,
+				}),
+			),
+		);
+		const events: AuthEvent[] = [];
+
+		const oauth = createRadiusOAuth({ name: "Radius", gateway: GATEWAY });
+		await expect(oauth.login(interaction("device-code", events))).rejects.toThrow("Untrusted verification_uri");
+		expect(events).toEqual([]);
 	});
 
 	it("exchanges the browser callback code before showing the sign-in page", async () => {

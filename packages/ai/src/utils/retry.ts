@@ -25,6 +25,13 @@ const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
 	// Sign in with ChatGPT: the subscription's shared usage limit, which resets
 	// after hours rather than seconds.
 	"subscription_sharing_usage_limit_exceeded",
+	// Sign in with ChatGPT on a ChatGPT Business plan: a usage limit set by the
+	// workspace admin. Only the admin can raise it.
+	"subscription_sharing_workplace_individual_usage_limit_exceeded",
+
+	// Zhipu/Z.ai (open.bigmodel.cn) error code 1308: the plan's usage limit is
+	// reached, sent as HTTP 429. It resets after hours, not seconds (#11537).
+	'"code"\\s*:\\s*"?1308(?![0-9])',
 ]);
 
 const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
@@ -36,14 +43,10 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	"model is at capacity",
 	"rate.?limit",
 	"too many requests",
-	"429",
-	"500",
-	"502",
-	"503",
-	"504",
-	"520",
-	"524",
-	"service.?unavailable",
+	// Status codes must not be part of a longer word or number, e.g. a request id or byte count (#11057).
+	"(?<![a-z0-9])(?:429|500|502|503|504|520|524)(?![a-z0-9])",
+	// Also matches "The service is temporarily unavailable" (#10965).
+	"service.?(?:is.?)?(?:temporarily.?)?unavailable",
 	"server.?error",
 	"internal.?error",
 
@@ -52,6 +55,14 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	// "The upstream provider returned an error" (#10842).
 	"provider.?returned.?(?:an.?)?error",
 	"exceeded request buffer limit while retrying upstream",
+	// Gateway failure relaying the upstream response stream, sent as an OpenAI
+	// Responses `response.failed` event without an error code (#10920).
+	"unable to forward upstream",
+	// Other gateway upstream failures relayed as `response.failed` error codes (#10920).
+	"upstream.?request.?failed",
+	"upstream_stream_read_error",
+	"stream was interrupted",
+	"http/?2 stream failed",
 
 	// Network, proxy, and fetch transport failures. This includes OpenAI Codex
 	// raw-fetch failures such as "upstream connect", "connection refused", and
@@ -62,6 +73,9 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	"connection.?lost",
 	"other side closed",
 	"fetch failed",
+	// node-fetch system errors, e.g. the Google ADC OAuth token refresh used by
+	// google-vertex. The reason is often empty (#10996).
+	"request to \\S+ failed, reason:",
 	"getaddrinfo",
 	"ENOTFOUND",
 	"EAI_AGAIN",
@@ -84,6 +98,12 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	"stream ended before message_stop",
 	"stream ended before a terminal response event",
 	"http2 request did not get a response",
+	// Codex CLI mid-stream disconnect, relayed by proxies that wrap the Codex CLI,
+	// e.g. "stream disconnected before completion: stream closed before response.completed" (#11057).
+	"stream disconnected before completion",
+	// Magpie gateway relaying a dropped upstream Anthropic stream, e.g.
+	// "Claude Code's stream from Anthropic was cut short after the reply had begun" (#11879).
+	"cut short after the reply had begun",
 	// Node ERR_HTTP2_STREAM_CANCEL: the HTTP/2 session died before the request was
 	// sent, e.g. after the Bedrock SDK's 5-minute session timeout (#10379).
 	"pending stream has been canceled",
@@ -126,8 +146,16 @@ export interface RetryPolicy {
 
 export const DEFAULT_MAX_AGENT_RETRY_DELAY_MS = 60_000;
 
-export function retryDelayMs(policy: Pick<RetryPolicy, "baseDelayMs" | "maxAgentDelayMs">, attempt: number): number {
-	const delay = policy.baseDelayMs * 2 ** Math.max(0, attempt - 1);
+/**
+ * Delay before retry `attempt` (1-indexed): the exponential backoff, raised to `serverDelayMs` when the failed response
+ * asked for a longer wait, and capped by `maxAgentDelayMs`.
+ */
+export function retryDelayMs(
+	policy: Pick<RetryPolicy, "baseDelayMs" | "maxAgentDelayMs">,
+	attempt: number,
+	serverDelayMs?: number,
+): number {
+	const delay = Math.max(policy.baseDelayMs * 2 ** Math.max(0, attempt - 1), Math.ceil(serverDelayMs ?? 0));
 	const safeDelay = Number.isSafeInteger(delay) ? delay : Number.MAX_SAFE_INTEGER;
 	return Math.min(safeDelay, policy.maxAgentDelayMs ?? DEFAULT_MAX_AGENT_RETRY_DELAY_MS);
 }
@@ -181,10 +209,11 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
  *   too, so callers do not need to care when cancellation happened.
  * - A non-retryable error (per {@link isRetryableAssistantError}, including quota/
  *   billing exhaustion) is returned immediately so deterministic errors fail fast.
- * - Otherwise retries up to `maxRetries` times with exponential backoff, emitting
- *   `onRetryScheduled` before each sleep, `onRetryAttemptStart` after each sleep before
- *   the retried call starts, and `onRetryFinished` once at the end (whether the loop
- *   ends in success, exhausted retries, or an aborted backoff).
+ * - Otherwise retries up to `maxRetries` times with exponential backoff, waiting at least
+ *   the failed response's `retryAfterMs`, emitting `onRetryScheduled` before each sleep,
+ *   `onRetryAttemptStart` after each sleep before the retried call starts, and
+ *   `onRetryFinished` once at the end (whether the loop ends in success, exhausted
+ *   retries, or an aborted backoff).
  *
  * When `policy` is undefined or disabled, the first response is returned unchanged
  * (equivalent to calling `produce()` directly).
@@ -222,7 +251,7 @@ export async function retryAssistantCall(
 
 		attempt++;
 		lastRetry = { attempt, errorMessage: response.errorMessage || "Unknown error" };
-		const delayMs = retryDelayMs(policy!, attempt);
+		const delayMs = retryDelayMs(policy!, attempt, response.retryAfterMs);
 		await callbacks?.onRetryScheduled?.(attempt, maxAttempts, delayMs, lastRetry.errorMessage);
 
 		// Normalize aborts during retry backoff to the same AssistantMessage shape as

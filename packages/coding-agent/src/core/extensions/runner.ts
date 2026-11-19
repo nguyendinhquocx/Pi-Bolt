@@ -12,9 +12,19 @@ import {
 } from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
+import { PIBOLT } from "../../pi-bolt.ts";
 import type { CacheWarmingAction } from "../cache-warmer.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
+import {
+	type ViewAnchor,
+	type ViewChannel,
+	type ViewClientEvent,
+	ViewHost,
+	type ViewSnapshot,
+} from "../mobile-ui/host.ts";
+import { MOBILE_VIEW_LIMITS, type MobileView } from "../mobile-ui/types.ts";
+import { assertView } from "../mobile-ui/validate.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
 import type { SessionManager } from "../session-manager.ts";
@@ -25,6 +35,7 @@ import {
 	normalizeBuildSystemPromptOptions,
 } from "../system-prompt.ts";
 import type { VirtualModelDefinition } from "../virtual-models.ts";
+import { extensionDisplayName, extensionOfStack, isJitRequiredMessage, withJitHint } from "./jit-hint.ts";
 import type {
 	AgentBeforeSettleEvent,
 	BeforeAgentStartCustomEvent,
@@ -58,6 +69,8 @@ import type {
 	ExtensionShortcut,
 	ExtensionToolContext,
 	ExtensionUIContext,
+	ExtensionUIDialogOptions,
+	ExtensionUIHost,
 	InputEvent,
 	InputEventResult,
 	InputSource,
@@ -71,6 +84,7 @@ import type {
 	ProjectTrustEventResult,
 	ProviderConfig,
 	RegisteredCommand,
+	RegisteredPage,
 	RegisteredTool,
 	ReplacedSessionContext,
 	ResolvedCommand,
@@ -273,8 +287,31 @@ export async function emitSessionShutdownEvent(
 	return false;
 }
 
-function snapshotEventHandlers(extensions: Extension[], event: ExtensionEvent["type"]) {
-	return extensions.map((ext) => ({ ext, handlers: ext.handlers.get(event)?.slice() ?? [] }));
+type ExtensionHandler = Extension["handlers"] extends Map<string, Array<infer Handler>> ? Handler : never;
+
+/**
+ * The handlers of `event` per extension, copied so that handlers registered or removed during the dispatch do not change
+ * it. Extensions without a handler are left out: they would contribute nothing, and an entry for each of them cost more
+ * than the dispatch on every streamed event.
+ */
+function snapshotEventHandlers(
+	extensions: Extension[],
+	event: ExtensionEvent["type"],
+): Array<{ ext: Extension; handlers: ExtensionHandler[] }> {
+	const snapshot: Array<{ ext: Extension; handlers: ExtensionHandler[] }> = [];
+	for (const ext of extensions) {
+		const handlers = ext.handlers.get(event);
+		if (handlers !== undefined && handlers.length > 0) snapshot.push({ ext, handlers: handlers.slice() });
+	}
+	return snapshot;
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+	return (
+		(typeof value === "object" || typeof value === "function") &&
+		value !== null &&
+		typeof (value as { then?: unknown }).then === "function"
+	);
 }
 
 function sameMessages(left: AgentMessage[], right: AgentMessage[]): boolean {
@@ -359,6 +396,16 @@ const noOpUIContext: ExtensionUIContext = {
 	setTheme: (_theme: string | Theme) => ({ success: false, error: "UI not available" }),
 	getToolsExpanded: () => false,
 	setToolsExpanded: () => {},
+	// No UI shows views; they are still checked, so a mistake shows in print mode too.
+	setView: (key, view) => {
+		if (view !== undefined) assertView(view, JSON.stringify(key));
+	},
+	updateView: () => {},
+	showView: async (view) => {
+		assertView(view, "sheet");
+		return undefined;
+	},
+	getView: () => undefined,
 };
 
 export class ExtensionRunner {
@@ -396,6 +443,15 @@ export class ExtensionRunner {
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
 	private staleMessage: string | undefined;
+	/** The mobile UI kit's views of this session (docs/mobile-ui.md), made when a mode binds its UI. */
+	private views: ViewHost | undefined;
+	/** Registered pages and tiles whose `open()` returned and that are not closed yet. */
+	private readonly openPages = new Set<string>();
+	/**
+	 * Per page key, the tail of its queue: opens, closes and the session-end cleanup of one key run one after the
+	 * other, in the order they were asked for, so none of them sees another half done.
+	 */
+	private readonly pageQueues = new Map<string, Promise<void>>();
 	private uiPromptDepth = 0;
 	private activeUIPrompt: { kind: UIPromptKind; title?: string } | undefined;
 
@@ -569,21 +625,71 @@ export class ExtensionRunner {
 		this.reloadHandler = async () => {};
 	}
 
-	setUIContext(uiContext?: ExtensionUIContext, mode: ExtensionMode = "print"): void {
-		this.uiContext = uiContext ? this.wrapUIPromptContext(uiContext) : noOpUIContext;
+	setUIContext(uiContext?: ExtensionUIHost, mode: ExtensionMode = "print", viewChannel?: ViewChannel): void {
+		this.uiContext = uiContext ? this.wrapUIPromptContext(uiContext, viewChannel) : noOpUIContext;
 		this.mode = mode;
 	}
 
-	private wrapUIPromptContext(ui: ExtensionUIContext): ExtensionUIContext {
+	private wrapUIPromptContext(ui: ExtensionUIHost, viewChannel: ViewChannel | undefined): ExtensionUIContext {
+		const dialogs = {
+			select: (title: string, options: string[], opts?: ExtensionUIDialogOptions) =>
+				this.withUIPrompt("select", title, () => ui.select(title, options, opts)),
+			confirm: (title: string, message: string, opts?: ExtensionUIDialogOptions) =>
+				this.withUIPrompt("confirm", title, () => ui.confirm(title, message, opts)),
+			input: (title: string, placeholder?: string, opts?: ExtensionUIDialogOptions) =>
+				this.withUIPrompt("input", title, () => ui.input(title, placeholder, opts)),
+		};
+		const viewUI = {
+			select: ui.select,
+			confirm: ui.confirm,
+			input: ui.input,
+			setWidget: (key: string, lines: string[] | undefined) => ui.setWidget(key, lines),
+		};
+		if (this.views) this.views.rebind(viewUI, viewUI, viewChannel);
+		else {
+			this.views = new ViewHost({
+				ui: viewUI,
+				channel: viewChannel,
+				emit: (event) => void this.emit(event),
+				anchor: () => this.viewAnchor(),
+			});
+		}
+		const views = this.views;
 		return {
 			...ui,
-			select: (title, options, opts) => this.withUIPrompt("select", title, () => ui.select(title, options, opts)),
-			confirm: (title, message, opts) => this.withUIPrompt("confirm", title, () => ui.confirm(title, message, opts)),
-			input: (title, placeholder, opts) =>
-				this.withUIPrompt("input", title, () => ui.input(title, placeholder, opts)),
+			...dialogs,
+			setView: (key, view, options) => views.set(key, view, options),
+			updateView: (key, ops) => views.update(key, ops),
+			showView: (view, options) => this.withUIPrompt("view", view.title, () => views.show(view, options)),
+			getView: (key) => views.get(key),
 			editor: (title, prefill) => this.withUIPrompt("editor", title, () => ui.editor(title, prefill)),
 			custom: (factory, options) => this.withUIPrompt("custom", undefined, () => ui.custom(factory, options)),
+			// Pi-Bolt without the JIT: an extension's own notice of "bun:ffi requires the JIT" says which extension needs the JIT
+			// build (core/extensions/jit-hint.ts). The extension is the one whose code called notify().
+			...(PIBOLT && !PIBOLT.jit
+				? {
+						notify: (message: string, type?: "info" | "warning" | "error") =>
+							ui.notify(
+								withJitHint(message, () =>
+									this.jitExtensionName(
+										extensionOfStack(
+											new Error().stack,
+											this.extensions.map((extension) => extension.resolvedPath),
+										),
+									),
+								),
+								type,
+							),
+					}
+				: {}),
 		};
+	}
+
+	/** How the JIT hint names an extension, by its path as loaded or as configured. */
+	private jitExtensionName(extensionPath: string | undefined): string | undefined {
+		if (extensionPath === undefined) return undefined;
+		const extension = this.extensions.find((e) => e.path === extensionPath || e.resolvedPath === extensionPath);
+		return extensionDisplayName(extension?.resolvedPath ?? extensionPath);
 	}
 
 	private withUIPrompt<T>(kind: UIPromptKind, title: string | undefined, run: () => Promise<T>): Promise<T> {
@@ -623,6 +729,155 @@ export class ExtensionRunner {
 
 	getUIContext(): ExtensionUIContext {
 		return this.uiContext;
+	}
+
+	/**
+	 * Where an inline view set now belongs (docs/mobile-ui.md#slots): under the latest tool call while the turn is at
+	 * one, else at the end of the latest turn (its user message's timestamp).
+	 */
+	private viewAnchor(): ViewAnchor | undefined {
+		const branch = this.sessionManager.getBranch();
+		let finished = false;
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const entry = branch[i];
+			if (entry.type !== "message") continue;
+			const message = entry.message as { role?: string; content?: unknown; toolCallId?: string; timestamp?: number };
+			if (message.role === "user")
+				return typeof message.timestamp === "number" ? { turn: message.timestamp } : undefined;
+			if (finished) continue;
+			if (message.role === "toolResult" && message.toolCallId) return { toolCallId: message.toolCallId };
+			if (message.role === "assistant") {
+				const calls = Array.isArray(message.content)
+					? message.content.filter(
+							(block: { type?: string; id?: string }) => block.type === "toolCall" && block.id,
+						)
+					: [];
+				if (calls.length > 0) return { toolCallId: (calls.at(-1) as { id: string }).id };
+				// The turn ended with an answer: the view goes at the end of the turn.
+				finished = true;
+			}
+		}
+		return undefined;
+	}
+
+	/** Every view now, for a client that connects (remote control's `remote_hello`). */
+	viewSnapshot(): ViewSnapshot[] {
+		return this.views?.snapshot() ?? [];
+	}
+
+	/** A client started rendering views (`set_client_features`): it gets them all. */
+	resyncViews(): void {
+		this.views?.resync();
+	}
+
+	/** The registered pages and tiles (first registration per key wins), at most 16. */
+	getRegisteredPages(): RegisteredPage[] {
+		const pages = new Map<string, RegisteredPage>();
+		for (const extension of this.extensions) {
+			for (const [key, page] of extension.pages ?? []) {
+				if (!pages.has(key) && pages.size < MOBILE_VIEW_LIMITS.registeredPages) pages.set(key, page);
+			}
+		}
+		return [...pages.values()];
+	}
+
+	/** Runs `op` after every earlier page operation of `key` settled; resolves or rejects with it. */
+	private queuePage(key: string, op: () => Promise<void>): Promise<void> {
+		const previous = this.pageQueues.get(key) ?? Promise.resolve();
+		const result = previous.then(op);
+		const tail = result.catch(() => {});
+		this.pageQueues.set(key, tail);
+		void tail.then(() => {
+			if (this.pageQueues.get(key) === tail) this.pageQueues.delete(key);
+		});
+		return result;
+	}
+
+	/**
+	 * A client opens a registered page or tile: its `open()` builds the view, set under its key in its slot. A page that
+	 * is open already is sent again as it is now (or built again if the extension removed its view).
+	 */
+	async openPage(key: string): Promise<void> {
+		this.assertActive();
+		const views = this.views;
+		if (!views) throw new Error("No client shows views");
+		const page = this.getRegisteredPages().find((candidate) => candidate.key === key);
+		if (!page) throw new Error(`No page ${JSON.stringify(key)}`);
+		await this.queuePage(key, async () => {
+			if (this.staleMessage) return;
+			if (this.openPages.has(key) && views.get(key)) {
+				views.resend(key);
+				return;
+			}
+			if (page.kind === "tile") views.allowTile(key, true);
+			let view: MobileView;
+			try {
+				view = await page.definition.open(this.createContext());
+			} catch (error) {
+				if (!this.openPages.has(key)) views.allowTile(key, false);
+				throw error;
+			}
+			// From here the page holds what open() started: a close, or the session's end, runs its close().
+			this.openPages.add(key);
+			if (this.staleMessage) return;
+			try {
+				views.set(key, view, { slot: page.kind });
+			} catch (error) {
+				// Not shown (an invalid view, the session's view limit): what open() started is cleaned up.
+				this.openPages.delete(key);
+				views.allowTile(key, false);
+				await this.runPageClose(page);
+				throw error;
+			}
+		});
+	}
+
+	/** A context with every value read now: it keeps working after the runner goes stale (a page's cleanup). */
+	private cleanupContext(): ExtensionContext {
+		const live = this.createContext() as unknown as Record<string, unknown>;
+		const values: Record<string, unknown> = {};
+		for (const name of Object.keys(Object.getOwnPropertyDescriptors(live))) {
+			try {
+				values[name] = live[name];
+			} catch {
+				// A value this runner cannot give (no session yet, say) stays absent.
+			}
+		}
+		return values as unknown as ExtensionContext;
+	}
+
+	/** A client closed a registered page or tile: its view goes and its `close()` runs (after any open in progress). */
+	async closePage(key: string): Promise<void> {
+		if (!this.openPages.has(key) && !this.pageQueues.has(key)) return;
+		// Read now, while the runner is live: the close may run after an open in progress, when the session has ended.
+		const ctx = this.cleanupContext();
+		await this.queuePage(key, async () => {
+			if (!this.openPages.delete(key)) return;
+			const page = this.getRegisteredPages().find((candidate) => candidate.key === key);
+			this.views?.set(key, undefined);
+			this.views?.allowTile(key, false);
+			await this.runPageClose(page, ctx);
+		});
+	}
+
+	/** Runs a page's `close()`; `ctx` defaults to a live context. */
+	private async runPageClose(page: RegisteredPage | undefined, ctx?: ExtensionContext): Promise<void> {
+		if (!page?.definition.close) return;
+		try {
+			await page.definition.close(ctx ?? this.createContext());
+		} catch (error) {
+			this.emitError({
+				extensionPath: page.sourceInfo.path,
+				event: "page_close",
+				error: error instanceof Error ? error.message : String(error),
+				stack: error instanceof Error ? error.stack : undefined,
+			});
+		}
+	}
+
+	/** A client's `extension_ui_event`: emitted as a `view_event` when it fits the view, else dropped (false). */
+	handleViewEvent(event: ViewClientEvent): boolean {
+		return this.views?.handleEvent(event) ?? false;
 	}
 
 	hasUI(): boolean {
@@ -730,8 +985,19 @@ export class ExtensionRunner {
 		message = "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 	): void {
 		if (!this.staleMessage) {
+			// Open pages and tiles close with the session: queued behind their operations in progress (so close() cleans
+			// up what a late open() started), with a context whose values were read now, before the runner went stale.
+			for (const page of this.getRegisteredPages()) {
+				if (!this.openPages.has(page.key) && !this.pageQueues.has(page.key)) continue;
+				const ctx = this.cleanupContext();
+				void this.queuePage(page.key, async () => {
+					if (this.openPages.delete(page.key)) await this.runPageClose(page, ctx);
+				});
+			}
 			this.staleMessage = message;
 			this.runtime.invalidate(message);
+			// The session's views go with it; the next runner starts without any.
+			this.views?.dispose();
 		}
 	}
 
@@ -747,6 +1013,9 @@ export class ExtensionRunner {
 	}
 
 	emitError(error: ExtensionError): void {
+		if (isJitRequiredMessage(error.error)) {
+			error = { ...error, error: withJitHint(error.error, () => this.jitExtensionName(error.extensionPath)) };
+		}
 		for (const listener of this.errorListeners) {
 			listener(error);
 		}
@@ -779,6 +1048,18 @@ export class ExtensionRunner {
 		return false;
 	}
 
+	/** Whether an extension other than those loaded from `extensionPaths` handles `eventType`. */
+	hasHandlersOutside(eventType: string, extensionPaths: ReadonlySet<string>): boolean {
+		for (const ext of this.extensions) {
+			if (extensionPaths.has(ext.path)) continue;
+			const handlers = ext.handlers.get(eventType);
+			if (handlers && handlers.length > 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	getMessageRenderer(customType: string): MessageRenderer | undefined {
 		for (const ext of this.extensions) {
 			const renderer = ext.messageRenderers.get(customType);
@@ -789,8 +1070,15 @@ export class ExtensionRunner {
 		return undefined;
 	}
 
+	/** Markdown transformers in extension load order; each one leaves Markdown of unregistered surfaces unchanged. */
 	getMarkdownTransformers(): MarkdownTransformer[] {
-		return this.extensions.flatMap((ext) => (ext.markdownTransformer ? [ext.markdownTransformer] : []));
+		return this.extensions.flatMap((ext): MarkdownTransformer[] => {
+			if (!ext.markdownTransformer) return [];
+			const { transformer, messageTypes } = ext.markdownTransformer;
+			return [
+				(markdown, context) => (messageTypes.has(context.messageType) ? transformer(markdown, context) : markdown),
+			];
+		});
 	}
 
 	/** Renderers of calls to `toolName`: extension resolvers in load order, then `base`. */
@@ -1124,6 +1412,68 @@ export class ExtensionRunner {
 		}
 
 		return result as RunnerEmitResult<TEvent>;
+	}
+
+	/**
+	 * `emit` for an event whose handlers' results are not used (`agent_start`, `message_update`, `tool_execution_end`,
+	 * ...), without an await while handlers return synchronously. Returns undefined when every handler returned
+	 * synchronously, or a promise of the rest of the dispatch from the first handler that returned a promise. Handlers
+	 * run in the same order, with the same context and error reporting, as with `emit`.
+	 */
+	dispatch(event: Exclude<RunnerEmitEvent, SessionBeforeEvent>): Promise<void> | undefined {
+		if (!this.hasHandlers(event.type)) return undefined;
+		const ctx = this.createContext();
+		const snapshot = snapshotEventHandlers(this.extensions, event.type);
+		for (let extensionIndex = 0; extensionIndex < snapshot.length; extensionIndex++) {
+			const { ext, handlers } = snapshot[extensionIndex];
+			for (let handlerIndex = 0; handlerIndex < handlers.length; handlerIndex++) {
+				let result: unknown;
+				try {
+					result = handlers[handlerIndex](event, ctx);
+				} catch (err) {
+					this.emitHandlerError(ext, event.type, err);
+					continue;
+				}
+				if (isPromiseLike(result)) {
+					return this.finishDispatch(result, event, ctx, snapshot, extensionIndex, handlerIndex);
+				}
+			}
+		}
+		return undefined;
+	}
+
+	private async finishDispatch(
+		pending: PromiseLike<unknown>,
+		event: Exclude<RunnerEmitEvent, SessionBeforeEvent>,
+		ctx: ExtensionContext,
+		snapshot: Array<{ ext: Extension; handlers: ExtensionHandler[] }>,
+		extensionIndex: number,
+		handlerIndex: number,
+	): Promise<void> {
+		try {
+			await pending;
+		} catch (err) {
+			this.emitHandlerError(snapshot[extensionIndex].ext, event.type, err);
+		}
+		for (let e = extensionIndex; e < snapshot.length; e++) {
+			const { ext, handlers } = snapshot[e];
+			for (let h = e === extensionIndex ? handlerIndex + 1 : 0; h < handlers.length; h++) {
+				try {
+					await handlers[h](event, ctx);
+				} catch (err) {
+					this.emitHandlerError(ext, event.type, err);
+				}
+			}
+		}
+	}
+
+	private emitHandlerError(ext: Extension, event: string, err: unknown): void {
+		this.emitError({
+			extensionPath: ext.path,
+			event,
+			error: err instanceof Error ? err.message : String(err),
+			stack: err instanceof Error ? err.stack : undefined,
+		});
 	}
 
 	/** Returns the event's own action unless a handler overrides it; the last override wins. */

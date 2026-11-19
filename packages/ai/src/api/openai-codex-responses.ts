@@ -5,7 +5,6 @@ import type {
 	ResponseInput,
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
-
 import { clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
@@ -29,8 +28,11 @@ import {
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
+import { getIdentityHeaders } from "../utils/identity.ts";
+import { cachedArrayToJSON, cacheJsonSerialization } from "../utils/json-body.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
-import { getPiUserAgent } from "../utils/pi-user-agent.ts";
+import { jsonBodyParts } from "../utils/request-body.ts";
+import { beginRequestCache, type RequestCacheRun } from "../utils/request-cache.ts";
 import { getSystemMessageText } from "../utils/text.ts";
 import {
 	getDeclaredTools,
@@ -42,7 +44,12 @@ import {
 import { uuidv7 } from "../utils/uuid.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
-import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
+import {
+	convertResponsesMessages,
+	convertResponsesTools,
+	getResponsesToolSupport,
+	processResponsesStream,
+} from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
 // ============================================================================
@@ -181,11 +188,15 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 			reject(new Error("Request was aborted"));
 			return;
 		}
-		const timeout = setTimeout(resolve, ms);
-		signal?.addEventListener("abort", () => {
+		const onAbort = () => {
 			clearTimeout(timeout);
 			reject(new Error("Request was aborted"));
-		});
+		};
+		const timeout = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		signal?.addEventListener("abort", onAbort, { once: true });
 	});
 }
 
@@ -212,16 +223,20 @@ function loadNodeZlib(): typeof NodeZlib | null {
 	return (process as ProcessWithBuiltinModule).getBuiltinModule?.("node:zlib") ?? null;
 }
 
+function canCompressRequestBodyZstd(): boolean {
+	return typeof loadNodeZlib()?.zstdCompressSync === "function";
+}
+
 // Returns the zstd-compressed body bytes, or null when compression is
 // unavailable (browser/Vite builds). Callers fall back to sending the
 // uncompressed JSON when this returns null.
-function compressRequestBodyZstd(bodyJson: string): Uint8Array<ArrayBuffer> | null {
+function compressRequestBodyZstd(bodyUtf8: Uint8Array): Uint8Array<ArrayBuffer> | null {
 	const zlib = loadNodeZlib();
 	if (!zlib || typeof zlib.zstdCompressSync !== "function") {
 		return null;
 	}
 	try {
-		const compressed = zlib.zstdCompressSync(bodyJson, {
+		const compressed = zlib.zstdCompressSync(bodyUtf8, {
 			params: { [zlib.constants.ZSTD_c_compressionLevel]: REQUEST_COMPRESSION_ZSTD_LEVEL },
 		});
 		// A copy owns a plain ArrayBuffer, which fetch accepts as a body under every lib.
@@ -229,6 +244,20 @@ function compressRequestBodyZstd(bodyJson: string): Uint8Array<ArrayBuffer> | nu
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * The UTF-8 bytes of JSON.stringify(body). The input items reuse the bytes they were sent as in the conversation's
+ * previous request (request-body.ts), and with `cache` the bytes of the items its run handed out, so only new or
+ * changed items are serialized again.
+ */
+function encodeRequestBody(
+	body: RequestBody,
+	conversation: string | undefined,
+	cache: RequestCacheRun | undefined,
+): Blob {
+	const parts = jsonBodyParts(body, "input", conversation ?? "", cachedArrayToJSON, cache?.sentValues());
+	return new Blob(parts ?? [JSON.stringify(body)]);
 }
 
 // ============================================================================
@@ -262,6 +291,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			timestamp: Date.now(),
 		};
 
+		let cache: RequestCacheRun | undefined;
 		try {
 			const apiKey = options?.apiKey;
 			if (!apiKey) {
@@ -275,21 +305,56 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			);
 			const cacheSessionId = options?.cacheRetention === "none" ? undefined : options?.sessionId;
 			const codexSessionId = clampOpenAIPromptCacheKey(cacheSessionId);
-			let body = buildRequestBody(model, normalizedContext, options, codexSessionId, grammarToolInputProperties);
+			// Everything buildRequestBody's conversion reads besides the messages: the model and its compat settings.
+			cache = beginRequestCache("openai-codex-responses", options, [
+				model.id,
+				model.provider,
+				model.api,
+				model.input,
+				model.reasoning,
+				model.compat,
+				grammarToolInputProperties,
+			]);
+			let body = buildRequestBody(
+				model,
+				normalizedContext,
+				options,
+				codexSessionId,
+				grammarToolInputProperties,
+				cache,
+			);
+			cache?.end();
 			const nextBody = await options?.onPayload?.(body, model);
 			if (nextBody !== undefined) {
 				body = nextBody as RequestBody;
 			}
+			cacheJsonSerialization(body.input);
 			const websocketRequestId = codexSessionId || uuidv7();
-			const sseHeaders = buildSSEHeaders(model.headers, options?.headers, accountId, apiKey, codexSessionId);
+			// Codex expects an originator on every request; it is not attribution.
+			const identityHeaders = { originator: "pi", ...getIdentityHeaders(model, options?.identity) };
+			const sseHeaders = buildSSEHeaders(
+				identityHeaders,
+				model.headers,
+				options?.headers,
+				accountId,
+				apiKey,
+				codexSessionId,
+			);
 			const websocketHeaders = buildWebSocketHeaders(
+				identityHeaders,
 				model.headers,
 				options?.headers,
 				accountId,
 				apiKey,
 				websocketRequestId,
 			);
-			const bodyJson = JSON.stringify(body);
+			// The whole body as bytes is needed only on the SSE path and for a WebSocket failure's diagnostic: a
+			// WebSocket request sends its own serialization (only the new input, when it continues a response).
+			let bodyBytes: Blob | undefined;
+			const getBodyBytes = (): Blob => {
+				bodyBytes ??= encodeRequestBody(body, options?.sessionId, cache);
+				return bodyBytes;
+			};
 			const httpTimeoutMs = normalizeTimeoutMs(options?.timeoutMs);
 			const websocketConnectTimeoutMs = normalizeTimeoutMs(options?.websocketConnectTimeoutMs);
 			const transport = options?.transport || "auto";
@@ -332,6 +397,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							throw new Error("Request was aborted");
 						}
 						assertSuccessfulOutput(output);
+						recordWebSocketSuccess(cacheSessionId);
 						stream.push({
 							type: "done",
 							reason: output.stopReason,
@@ -361,7 +427,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 								...(websocketStarted ? {} : { fallbackTransport: "sse" }),
 								eventsEmitted: websocketStarted,
 								phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
-								requestBytes: new TextEncoder().encode(bodyJson).byteLength,
+								requestBytes: getBodyBytes().size,
 							}),
 						);
 						recordWebSocketFailure(cacheSessionId, error);
@@ -377,11 +443,13 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			// Compress the request body once for the SSE path. The Codex backend
 			// decodes Content-Encoding: zstd; the WebSocket transport above sends the
 			// uncompressed JSON frame, matching the official Codex client.
-			const compressedBody = compressRequestBodyZstd(bodyJson);
+			const compressedBody = canCompressRequestBodyZstd()
+				? compressRequestBodyZstd(new Uint8Array(await getBodyBytes().arrayBuffer()))
+				: null;
 			if (compressedBody) {
 				sseHeaders.set("content-encoding", "zstd");
 			}
-			const sseBody: Uint8Array<ArrayBuffer> | string = compressedBody ?? bodyJson;
+			const sseBody: Uint8Array<ArrayBuffer> | string = compressedBody ?? JSON.stringify(body);
 
 			// Fetch with retry logic for rate limits and transient errors
 			let response: Response | undefined;
@@ -483,11 +551,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
-			for (const block of output.content) {
-				// Streaming scratch buffers are only used during parsing; never persist them.
-				delete (block as { partialJson?: string }).partialJson;
-				delete (block as { customInput?: unknown }).customInput;
-			}
+			cache?.end();
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = formatProviderError(normalizeProviderError(error));
 			stream.push({ type: "error", reason: output.stopReason, error: output });
@@ -534,12 +598,20 @@ function buildRequestBody(
 		getDeclaredTools(context.messages),
 		model.compat?.supportsOpenAIGrammarTools ?? false,
 	),
+	cache?: RequestCacheRun,
 ): RequestBody {
 	const supportsStrictMode = model.compat?.supportsStrictMode ?? true;
 	const supportsOpenAIGrammarTools = model.compat?.supportsOpenAIGrammarTools ?? false;
 	const supportsAdditionalTools = model.compat?.supportsAdditionalTools ?? false;
 	const supportsToolSearch = model.compat?.supportsToolSearch ?? false;
-	const transcriptTools = resolveTranscriptTools(context.messages, supportsAdditionalTools || supportsToolSearch);
+	const transcriptTools = resolveTranscriptTools(
+		context.messages,
+		getResponsesToolSupport({
+			supportsMidConvoSystemMessages: model.compat?.supportsMidConvoSystemMessages ?? false,
+			supportsAdditionalTools,
+			supportsToolSearch,
+		}),
+	);
 	const messages = convertResponsesMessages(model, context, CODEX_TOOL_CALL_PROVIDERS, {
 		includeSystemPrompt: false,
 		grammarToolInputProperties,
@@ -547,6 +619,7 @@ function buildRequestBody(
 		supportsAdditionalTools,
 		supportsToolSearch,
 		toolOptions: { strict: null, supportsStrictMode, supportsOpenAIGrammarTools },
+		cache,
 	});
 
 	const initialSystemMessage = getInitialSystemMessage(context.messages);
@@ -908,9 +981,19 @@ export interface OpenAICodexWebSocketDebugStats {
 	lastWebSocketError?: string;
 }
 
+// After a WebSocket failure a session uses SSE until `retryAt`, then tries WebSocket again. Each
+// consecutive failure doubles the cooldown up to the maximum; a WebSocket success clears the state.
+interface WebSocketSseFallbackState {
+	consecutiveFailures: number;
+	retryAt: number;
+}
+
+const WEBSOCKET_SSE_FALLBACK_BASE_COOLDOWN_MS = 60 * 1000;
+const WEBSOCKET_SSE_FALLBACK_MAX_COOLDOWN_MS = 30 * 60 * 1000;
+
 const websocketSessionCache = new Map<string, Map<string, CachedWebSocketConnection>>();
 const websocketDebugStats = new Map<string, OpenAICodexWebSocketDebugStats>();
-const websocketSseFallbackSessions = new Set<string>();
+const websocketSseFallbackSessions = new Map<string, WebSocketSseFallbackState>();
 
 function getOrCreateWebSocketDebugStats(sessionId: string): OpenAICodexWebSocketDebugStats {
 	let stats = websocketDebugStats.get(sessionId);
@@ -934,7 +1017,11 @@ function getOrCreateWebSocketDebugStats(sessionId: string): OpenAICodexWebSocket
 
 export function getOpenAICodexWebSocketDebugStats(sessionId: string): OpenAICodexWebSocketDebugStats | undefined {
 	const stats = websocketDebugStats.get(sessionId);
-	return stats ? { ...stats } : undefined;
+	if (!stats) return undefined;
+	// The fallback expires with time rather than with a request, so report its current state.
+	return stats.websocketFallbackActive === undefined
+		? { ...stats }
+		: { ...stats, websocketFallbackActive: isWebSocketSseFallbackActive(sessionId) };
 }
 
 export function resetOpenAICodexWebSocketDebugStats(sessionId?: string): void {
@@ -966,7 +1053,8 @@ export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
 registerSessionResourceCleanup(closeOpenAICodexWebSocketSessions);
 
 function isWebSocketSseFallbackActive(sessionId: string | undefined): boolean {
-	return sessionId ? websocketSseFallbackSessions.has(sessionId) : false;
+	const state = sessionId ? websocketSseFallbackSessions.get(sessionId) : undefined;
+	return state !== undefined && Date.now() < state.retryAt;
 }
 
 function recordWebSocketSseFallback(sessionId: string | undefined): void {
@@ -978,12 +1066,27 @@ function recordWebSocketSseFallback(sessionId: string | undefined): void {
 
 function recordWebSocketFailure(sessionId: string | undefined, error: unknown): void {
 	if (!sessionId) return;
-	websocketSseFallbackSessions.add(sessionId);
+	// A concurrent request that fails during an active cooldown does not count as another
+	// failed retry, so only extend the backoff once the previous cooldown has run out.
+	if (!isWebSocketSseFallbackActive(sessionId)) {
+		const consecutiveFailures = (websocketSseFallbackSessions.get(sessionId)?.consecutiveFailures ?? 0) + 1;
+		const cooldownMs = Math.min(
+			WEBSOCKET_SSE_FALLBACK_BASE_COOLDOWN_MS * 2 ** (consecutiveFailures - 1),
+			WEBSOCKET_SSE_FALLBACK_MAX_COOLDOWN_MS,
+		);
+		websocketSseFallbackSessions.set(sessionId, { consecutiveFailures, retryAt: Date.now() + cooldownMs });
+	}
 
 	const stats = getOrCreateWebSocketDebugStats(sessionId);
 	stats.websocketFailures++;
 	stats.lastWebSocketError = formatThrownValue(error);
 	stats.websocketFallbackActive = true;
+}
+
+function recordWebSocketSuccess(sessionId: string | undefined): void {
+	if (!sessionId || !websocketSseFallbackSessions.delete(sessionId)) return;
+	const stats = websocketDebugStats.get(sessionId);
+	if (stats) stats.websocketFallbackActive = false;
 }
 
 type WebSocketConstructor = new (
@@ -1428,12 +1531,80 @@ function requestBodyWithoutInput(body: RequestBody): RequestBody {
 	return rest;
 }
 
+const { isRawJSON } = JSON as unknown as { isRawJSON?: (value: unknown) => boolean };
+
+function hasToJSON(value: unknown): boolean {
+	return typeof value === "object" && value !== null && typeof (value as { toJSON?: unknown }).toJSON === "function";
+}
+
+/** Deeper than this, sameJsonData leaves the answer to JSON.stringify (which also reports a cycle as before). */
+const SAME_JSON_MAX_DEPTH = 64;
+
+/**
+ * True when `a` and `b` are the same plain data, which JSON.stringify serializes to the same text: the same value, or
+ * plain objects (keys in the same order) and arrays whose values are the same plain data. False for anything else
+ * (a toJSON, a class instance, raw JSON, differing data), also when the two would still serialize alike.
+ */
+function sameJsonData(a: unknown, b: unknown, depth: number): boolean {
+	// JSON.stringify throws for a bigint: never called equal here.
+	if (a === b) return typeof a !== "bigint";
+	if (typeof a !== "object" || typeof b !== "object" || a === null || b === null || depth > SAME_JSON_MAX_DEPTH) {
+		return false;
+	}
+	if (hasToJSON(a) || hasToJSON(b)) return false;
+	if (Array.isArray(a)) {
+		if (!Array.isArray(b) || a.length !== b.length) return false;
+		for (let i = 0; i < a.length; i++) {
+			if (!sameJsonData(a[i], b[i], depth + 1)) return false;
+		}
+		return true;
+	}
+	if (Array.isArray(b) || !isPlainJsonRecord(a) || !isPlainJsonRecord(b)) return false;
+	const keysA = Object.keys(a);
+	const keysB = Object.keys(b);
+	if (keysA.length !== keysB.length) return false;
+	for (let i = 0; i < keysA.length; i++) {
+		const key = keysA[i];
+		if (key !== keysB[i]) return false;
+		if (!sameJsonData((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key], depth + 1)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function isPlainJsonRecord(value: object): boolean {
+	const proto = Object.getPrototypeOf(value);
+	return proto === Object.prototype || (proto === null && !isRawJSON?.(value));
+}
+
+/**
+ * Whether JSON.stringify(a ?? []) === JSON.stringify(b ?? []), without serializing the items that are the same plain
+ * data (with the request cache, the previous request's items themselves). The JSON of an array is its items' JSON
+ * joined with commas, and two arrays' JSON can only be equal item by item, so the other items are compared alone.
+ */
 function responseInputsEqual(a: ResponseInput | undefined, b: ResponseInput | undefined): boolean {
-	return JSON.stringify(a ?? []) === JSON.stringify(b ?? []);
+	const left: readonly unknown[] = a ?? [];
+	const right: readonly unknown[] = b ?? [];
+	const wholeArrays = () => JSON.stringify(left) === JSON.stringify(right);
+	if (hasToJSON(left) || hasToJSON(right)) return wholeArrays();
+	if (left.length !== right.length) return false;
+	for (let i = 0; i < left.length; i++) {
+		const x = left[i];
+		const y = right[i];
+		if (sameJsonData(x, y, 0)) continue;
+		// In the array an item's own toJSON is given its index as the key; serialized alone it would get "".
+		if (hasToJSON(x) || hasToJSON(y)) return wholeArrays();
+		// An item that serializes to nothing (undefined, a function) is null in an array.
+		if ((JSON.stringify(x) ?? "null") !== (JSON.stringify(y) ?? "null")) return false;
+	}
+	return true;
 }
 
 function requestBodiesMatchExceptInput(a: RequestBody, b: RequestBody): boolean {
-	return JSON.stringify(requestBodyWithoutInput(a)) === JSON.stringify(requestBodyWithoutInput(b));
+	const left = requestBodyWithoutInput(a);
+	const right = requestBodyWithoutInput(b);
+	return sameJsonData(left, right, 0) || JSON.stringify(left) === JSON.stringify(right);
 }
 
 function getCachedWebSocketInputDelta(
@@ -1639,13 +1810,14 @@ function extractAccountId(token: string): string {
 }
 
 function buildBaseCodexHeaders(
+	defaultHeaders: Record<string, string>,
 	initHeaders: Record<string, string> | undefined,
 	additionalHeaders: ProviderHeaders | undefined,
 	accountId: string,
 	token: string,
 ): Headers {
 	// Defaults first so model and caller headers can override them, matching the other providers.
-	const headers = new Headers({ originator: "pi", "User-Agent": getPiUserAgent() });
+	const headers = new Headers(defaultHeaders);
 	for (const [key, value] of Object.entries(initHeaders || {})) {
 		headers.set(key, value);
 	}
@@ -1662,13 +1834,14 @@ function buildBaseCodexHeaders(
 }
 
 function buildSSEHeaders(
+	defaultHeaders: Record<string, string>,
 	initHeaders: Record<string, string> | undefined,
 	additionalHeaders: ProviderHeaders | undefined,
 	accountId: string,
 	token: string,
 	sessionId?: string,
 ): Headers {
-	const headers = buildBaseCodexHeaders(initHeaders, additionalHeaders, accountId, token);
+	const headers = buildBaseCodexHeaders(defaultHeaders, initHeaders, additionalHeaders, accountId, token);
 	headers.set("OpenAI-Beta", "responses=experimental");
 	headers.set("accept", "text/event-stream");
 	headers.set("content-type", "application/json");
@@ -1682,13 +1855,14 @@ function buildSSEHeaders(
 }
 
 function buildWebSocketHeaders(
+	defaultHeaders: Record<string, string>,
 	initHeaders: Record<string, string> | undefined,
 	additionalHeaders: ProviderHeaders | undefined,
 	accountId: string,
 	token: string,
 	requestId: string,
 ): Headers {
-	const headers = buildBaseCodexHeaders(initHeaders, additionalHeaders, accountId, token);
+	const headers = buildBaseCodexHeaders(defaultHeaders, initHeaders, additionalHeaders, accountId, token);
 	headers.delete("accept");
 	headers.delete("content-type");
 	headers.delete("OpenAI-Beta");

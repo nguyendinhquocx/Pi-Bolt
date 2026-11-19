@@ -142,6 +142,17 @@ function detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink: () => boolean)
 		return { images: "kitty", trueColor: hasTrueColorHint, hyperlinks: true };
 	}
 
+	if (termProgram === "rex") {
+		return { images: "kitty", trueColor: true, hyperlinks: true };
+	}
+
+	// Orca supports Kitty graphics but only advertises it through ORCA_IMAGE_PROTOCOL. Require
+	// both signals so Orca releases predating that advertisement keep the text fallback instead
+	// of reserving image rows that nothing renders.
+	if (termProgram === "orca" && process.env.ORCA_IMAGE_PROTOCOL === "kitty") {
+		return { images: "kitty", trueColor: true, hyperlinks: true };
+	}
+
 	if (process.env.KITTY_WINDOW_ID || termProgram === "kitty") {
 		return { images: "kitty", trueColor: true, hyperlinks: true };
 	}
@@ -167,7 +178,10 @@ function detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink: () => boolean)
 		return { images: null, trueColor: true, hyperlinks: true };
 	}
 
-	if (termProgram === "alacritty" || termProgram === "vscode" || termProgram === "zed") {
+	// Alacritty does not set TERM_PROGRAM. It sets TERM=alacritty when its terminfo entry is
+	// installed (otherwise xterm-256color) and ALACRITTY_WINDOW_ID on Unix and macOS.
+	const isAlacritty = termProgram === "alacritty" || term.startsWith("alacritty") || process.env.ALACRITTY_WINDOW_ID;
+	if (isAlacritty || termProgram === "vscode" || termProgram === "zed") {
 		return { images: null, trueColor: true, hyperlinks: true };
 	}
 
@@ -409,10 +423,20 @@ export interface KittyImagePlacement {
 }
 
 const kittyImageMetadata = new Map<number, RegisteredKittyImageMetadata>();
+/**
+ * Whether an image was ever registered: from then on kittyImageMetadata is never empty (an entry is only deleted to be set
+ * again, or for the next one). Read for every row the layout paints, on every frame.
+ */
+let kittyImageRegistered = false;
 let kittyTransmissionGeneration = 0;
+// Tallest registered image. Bounds backward searches for image lines above a
+// viewport: no image line further up than this can reach into it.
+let maxKittyImageRows = 0;
 
 export function registerKittyImageMetadata(metadata: KittyImageMetadata): void {
 	kittyTransmissionGeneration += 1;
+	kittyImageRegistered = true;
+	maxKittyImageRows = Math.max(maxKittyImageRows, metadata.rows);
 	kittyImageMetadata.delete(metadata.imageId);
 	kittyImageMetadata.set(metadata.imageId, { ...metadata, transmissionGeneration: kittyTransmissionGeneration });
 	if (kittyImageMetadata.size > 1000) {
@@ -434,12 +458,20 @@ function findKittyControls(line: string): { index: number; controls: string; len
 	return { index, controls: line.slice(index + 3, end), length: end + 1 - index };
 }
 
+/** Return the row height of the tallest Kitty image registered so far. */
+export function getMaxKittyImageRows(): number {
+	return maxKittyImageRows;
+}
+
 function getRegisteredKittyImageMetadataFromControls(controls: string): RegisteredKittyImageMetadata | undefined {
 	const imageId = /(?:^|,)i=(\d+)(?:,|$)/.exec(controls)?.[1];
 	return imageId === undefined ? undefined : kittyImageMetadata.get(Number.parseInt(imageId, 10));
 }
 
 function getRegisteredKittyImageMetadata(line: string): RegisteredKittyImageMetadata | undefined {
+	// (No image registered: the line is not searched for a Kitty command, which could name none.) Layout asks this of every
+	// row it paints, on every frame.
+	if (!kittyImageRegistered) return undefined;
 	const controls = findKittyControls(line)?.controls;
 	return controls === undefined ? undefined : getRegisteredKittyImageMetadataFromControls(controls);
 }

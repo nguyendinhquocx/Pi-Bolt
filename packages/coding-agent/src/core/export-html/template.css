@@ -687,6 +687,15 @@
       display: block;
     }
 
+    .system-entry > .message-timestamp {
+      padding-left: var(--line-height);
+      margin-bottom: 4px;
+    }
+
+    .system-entry > :last-child {
+      margin-bottom: 0;
+    }
+
     .system-prompt.provider-prompt {
       border-left: 3px solid var(--warning);
     }
@@ -897,6 +906,10 @@
     .markdown-content a {
       color: var(--mdLink);
       text-decoration: underline;
+    }
+
+    .markdown-content .markdown-link-url {
+      color: var(--mdLinkUrl);
     }
 
     .markdown-content code {

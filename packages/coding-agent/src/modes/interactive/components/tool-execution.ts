@@ -5,8 +5,13 @@ import {
 	getCapabilities,
 	Image,
 	MouseRegion,
-	renderSharedLines,
+	markReportsChanges,
+	renderChildLines,
+	reportRenderChange,
+	reportsChanges,
 	Spacer,
+	sanitizeTerminalText,
+	setSubtreeReportsChanges,
 	Text,
 	type TUI,
 	type TuiMouseEvent,
@@ -20,7 +25,8 @@ import { formatToolCallWithArgs, getTextOutput as getRenderedTextOutput } from "
 import { renderersMayHighlight } from "../../../core/tools/renderers/highlighting.ts";
 import { ensurePngTranscoder } from "../../../utils/image-convert.ts";
 import { liveTheme, theme } from "../theme/theme.ts";
-import { keyHint } from "./keybinding-hints.ts";
+import { freshCopy } from "./fresh-copy.ts";
+import { keyHint, keyText } from "./keybinding-hints.ts";
 
 const FALLBACK_PREVIEW_LINES = 10;
 
@@ -28,13 +34,20 @@ export interface ToolExecutionOptions {
 	showImages?: boolean;
 	imageWidthCells?: number;
 	outputPad?: number;
+	/**
+	 * Its renderers are Pi's own and draw a settled result from it alone: a settled row may then let go of its components
+	 * (compact()) and have them made again. Not for renderers from extensions, or for those that keep what they drew while
+	 * the call streamed in (edit, write).
+	 */
+	compactable?: boolean;
 }
 
 export class ToolExecutionComponent extends Container {
-	private contentBox: Box;
-	private contentText: Text;
-	private contentTextRegion: MouseRegion;
-	private selfRenderContainer: Container;
+	// (Made by addShell(), from the constructor and again after compact().)
+	private contentBox!: Box;
+	private contentText!: Text;
+	private contentTextRegion!: MouseRegion;
+	private selfRenderContainer!: Container;
 	private selfRenderHeight = 0;
 	/** What the self-rendered shell was joined from, and the joined lines (renderShared()). */
 	private selfRenderParts?: string[][];
@@ -60,6 +73,8 @@ export class ToolExecutionComponent extends Container {
 	private cwd: string;
 	private executionStarted = false;
 	private argsComplete = false;
+	/** `updateArgs()` ran since the last display update; the next render applies it. */
+	private argsPending = false;
 	private result?: {
 		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
 		isError: boolean;
@@ -67,6 +82,11 @@ export class ToolExecutionComponent extends Container {
 		durationMs?: number;
 	};
 	private hideComponent = false;
+	private readonly compactable: boolean;
+	/** What renderShared() returned last, at which width, and whether nothing that changes the lines happened since. */
+	private lastRendered?: { width: number; lines: string[]; current: boolean };
+	/** The lines compact() kept, without the components they were rendered from: what a render at `width` returns. */
+	private compacted?: { width: number; lines: string[] };
 
 	constructor(
 		toolName: string,
@@ -85,26 +105,37 @@ export class ToolExecutionComponent extends Container {
 		this.showImages = options.showImages ?? true;
 		this.imageWidthCells = options.imageWidthCells ?? 60;
 		this.outputPad = options.outputPad ?? 1;
+		this.compactable = options.compactable ?? false;
 		this.ui = ui;
 		this.cwd = cwd;
 
-		this.addChild(new Spacer(1));
+		this.addShell();
+		this.updateDisplay();
+	}
 
-		// Always create all shell variants. contentBox is used for default renderer-based composition.
-		// selfRenderContainer is used when the tool renders its own framing.
-		// contentText is reserved for generic fallback rendering when no tool definition exists.
+	/** Makes the shell variants, empty (see addShell()). */
+	private makeShells(): void {
 		this.contentBox = new Box(1, 1, (text: string) => theme.bg("toolPendingBg", text));
+		// (Its backgrounds read the theme, and every theme change invalidates the transcript.)
+		this.contentBox.setBackgroundReported(true);
 		this.contentText = new Text("", 1, 1, (text: string) => theme.bg("toolPendingBg", text));
 		this.contentTextRegion = this.createResultRegion(this.contentText);
 		this.selfRenderContainer = new Container();
+	}
 
+	/**
+	 * Makes the shells and adds the one used, after the spacer above it. Always all shell variants: contentBox for default
+	 * renderer-based composition, selfRenderContainer when the tool renders its own framing, contentText for generic
+	 * fallback rendering when no tool definition exists.
+	 */
+	private addShell(): void {
+		this.makeShells();
+		this.addChild(new Spacer(1));
 		if (this.hasRendererDefinition()) {
 			this.addChild(this.getRenderShell() === "self" ? this.selfRenderContainer : this.contentBox);
 		} else {
 			this.addChild(this.contentTextRegion);
 		}
-
-		this.updateDisplay();
 	}
 
 	private getCallRenderer(): ToolDefinition<any, any>["renderCall"] | undefined {
@@ -142,6 +173,8 @@ export class ToolExecutionComponent extends Container {
 			isError: this.result?.isError ?? false,
 			durationMs: this.isPartial ? undefined : this.result?.durationMs,
 			outputPad: this.outputPad,
+			keyText,
+			keyHint,
 		};
 	}
 
@@ -173,14 +206,23 @@ export class ToolExecutionComponent extends Container {
 		});
 	}
 
-	updateArgs(args: any): void {
+	/**
+	 * Show new partial arguments. Applied at the next render, so a call streaming many argument deltas between two
+	 * frames runs its renderer once per frame, not once per delta (#9265). Returns whether `args` are new arguments,
+	 * which may change what this draws.
+	 */
+	updateArgs(args: any): boolean {
 		// Every message_update hands every tool call of the message its arguments again, and the providers parse
-		// streamed arguments only when they have grown by an eighth (parseStreamingJsonWhileStreaming), keeping the
-		// same object in between: the same object is the same arguments, and drawing them again is wasted work that
-		// grows with their size (the write and edit renderers go over the whole file content).
-		if (args === this.args) return;
+		// streamed arguments again only when that is cheap enough (StreamingJsonParser.snapshot()), keeping the same
+		// object in between: the same object is the same arguments, and nothing on the screen changes.
+		if (args === this.args) return false;
+		this.thaw(false);
+		if (this.lastRendered !== undefined) this.lastRendered.current = false;
 		this.args = args;
-		this.updateDisplay();
+		this.argsPending = true;
+		reportRenderChange(this);
+		this.ui.requestRender();
+		return true;
 	}
 
 	markExecutionStarted(): void {
@@ -231,8 +273,72 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	override invalidate(): void {
+		this.thaw(false);
 		super.invalidate();
 		this.updateDisplay();
+	}
+
+	/**
+	 * For a settled row (a final result, no images) whose renderers allow it (`compactable`), rendered since it last changed:
+	 * keeps the lines it rendered last and lets go of the components it rendered them from. A render at the same width
+	 * returns those lines, the same array; anything that would change them (another width, invalidate(), the setters, a
+	 * click) makes the components again first (thaw()), from the arguments, the result and the renderer state kept.
+	 * Returns whether it compacted.
+	 */
+	compact(): boolean {
+		const last = this.lastRendered;
+		if (
+			!this.compactable ||
+			this.compacted !== undefined ||
+			this.result === undefined ||
+			this.isPartial ||
+			this.argsPending ||
+			this.imageComponents.length > 0 ||
+			(this.hasRendererDefinition() && this.getRenderShell() === "self") ||
+			last === undefined ||
+			!last.current
+		) {
+			return false;
+		}
+		this.compacted = { width: last.width, lines: last.lines };
+		this.lastRendered = undefined;
+		this.clear();
+		this.forgetRendered();
+		// (The shells hold what the renderers drew: new, empty ones until thaw() makes them again.)
+		this.makeShells();
+		this.callRendererComponent = undefined;
+		this.resultRendererComponent = undefined;
+		this.imageSources = [];
+		return true;
+	}
+
+	/** Whether compact() let go of the components (for tests). */
+	isCompacted(): boolean {
+		return this.compacted !== undefined;
+	}
+
+	/**
+	 * After compact(): a copy to put in this row's place (freshCopy()), with shells of its own (those made by compact() call
+	 * back to this row).
+	 */
+	compactedCopy(): ToolExecutionComponent {
+		const copy = freshCopy(this);
+		// (Its lines in an array of its own: the containers it is in take them as changed once.)
+		if (this.compacted !== undefined)
+			copy.compacted = { width: this.compacted.width, lines: this.compacted.lines.slice() };
+		copy.makeShells();
+		return copy;
+	}
+
+	/**
+	 * Makes again the components compact() let go of, and draws them (updateDisplay(), which reports the change) unless the
+	 * caller is about to (`display` false).
+	 */
+	private thaw(display = true): void {
+		if (this.compacted === undefined) return;
+		this.compacted = undefined;
+		this.addShell();
+		if (display) this.updateDisplay();
 	}
 
 	/** Whether this row may show code highlighted in one of `languages` (lowercase names). */
@@ -241,20 +347,44 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	override renderShared(width: number): string[] {
+		if (this.argsPending) this.updateDisplay();
+		const compacted = this.compacted;
+		if (compacted !== undefined) {
+			if (compacted.width === width) {
+				this.noteRendered();
+				return compacted.lines;
+			}
+			this.thaw();
+		}
+		const lines = this.renderSharedLines(width);
+		const last = this.lastRendered;
+		if (last?.current && last.width === width) last.lines = lines;
+		else this.lastRendered = { width, lines, current: true };
+		return lines;
+	}
+
+	private renderSharedLines(width: number): string[] {
 		if (this.hideComponent) {
+			this.noteRendered();
 			return this.emptyLines;
 		}
 
 		if (this.hasRendererDefinition() && this.getRenderShell() === "self") {
+			this.noteRendered();
 			// The parts' lines: all from components that keep their lines (renderSharedLines()), so the same arrays are the
 			// same lines, and the joined lines are kept with them.
-			const parts = [renderSharedLines(this.selfRenderContainer, width)];
+			const parts = [renderChildLines(this, this.selfRenderContainer, width)];
+			let reports = reportsChanges(this.selfRenderContainer);
 			for (let i = 0; i < this.imageComponents.length; i++) {
 				const spacer = this.imageSpacers[i];
-				if (spacer) parts.push(renderSharedLines(spacer, width));
+				if (spacer) parts.push(renderChildLines(this, spacer, width));
 				const imageComponent = this.imageComponents[i];
-				if (imageComponent) parts.push(renderSharedLines(imageComponent, width));
+				if (imageComponent) {
+					parts.push(renderChildLines(this, imageComponent, width));
+					if (!reportsChanges(imageComponent)) reports = false;
+				}
 			}
+			setSubtreeReportsChanges(this, reports);
 			const previous = this.selfRenderParts;
 			if (previous?.length === parts.length && previous.every((part, i) => part === parts[i])) {
 				return this.selfRenderLines;
@@ -279,6 +409,11 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	override handleMouse(event: TuiMouseEvent): ReturnType<Container["handleMouse"]> {
+		if (this.compacted !== undefined) {
+			// Only a left click does anything here (on the result: it expands it); any other event finds no handler.
+			if (event.type !== "click" || event.button !== "left") return undefined;
+			this.thaw();
+		}
 		if (!this.hasRendererDefinition() || this.getRenderShell() !== "self") return super.handleMouse(event);
 		if (event.y <= 0 || event.y > this.selfRenderHeight) return undefined;
 		return this.selfRenderContainer.handleMouse({
@@ -289,6 +424,9 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private updateDisplay(): void {
+		this.thaw(false);
+		if (this.lastRendered !== undefined) this.lastRendered.current = false;
+		this.argsPending = false;
 		const bgFn = this.isPartial
 			? (text: string) => theme.bg("toolPendingBg", text)
 			: this.result?.isError
@@ -409,6 +547,7 @@ export class ToolExecutionComponent extends Container {
 		if (this.hasRendererDefinition() && !hasContent && this.imageComponents.length === 0) {
 			this.hideComponent = true;
 		}
+		reportRenderChange(this);
 	}
 
 	private getTextOutput(): string {
@@ -416,10 +555,11 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private formatToolExecution(): string {
-		let text = theme.fg("toolTitle", theme.bold(this.toolName));
+		let text = theme.fg("toolTitle", theme.bold(sanitizeTerminalText(this.toolName)));
 		const content = JSON.stringify(this.args, null, 2);
 		if (content) {
-			text += `\n\n${content}`;
+			// (JSON.stringify() escapes C0 controls in the model's arguments, but not DEL and C1 controls.)
+			text += `\n\n${sanitizeTerminalText(content)}`;
 		}
 		const output = this.getTextOutput();
 		if (output) {
@@ -428,3 +568,5 @@ export class ToolExecutionComponent extends Container {
 		return text;
 	}
 }
+
+markReportsChanges(ToolExecutionComponent);

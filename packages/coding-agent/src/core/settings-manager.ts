@@ -1,7 +1,6 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import type { ScrollViewScrollbar, TerminalCapabilities, WheelScrollLines } from "@earendil-works/pi-tui";
-import { randomUUID } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
@@ -9,7 +8,9 @@ import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { PIBOLT } from "../pi-bolt.ts";
 import { getFileRevision, normalizePath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
+import type { CompactionSettings as ResolvedCompactionSettings } from "./compaction/compaction.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
+import { getPackageIdentity, resolvePackageOverlay } from "./package-source.ts";
 import { SETTINGS_DEFAULTS } from "./settings-defaults.ts";
 import type {
 	CacheWarmingMode,
@@ -19,6 +20,8 @@ import type {
 	MermaidRenderingMode,
 	PackageSource,
 	QuietStartup,
+	RemoteControlSettings,
+	SessionShareDestination,
 	Settings,
 	ThinkingBudgetsSettings,
 	TransportSetting,
@@ -42,6 +45,7 @@ export type {
 	ProviderRetrySettings,
 	QuietStartup,
 	RetrySettings,
+	SessionShareDestination,
 	Settings,
 	TerminalSettings,
 	ThinkingBudgetsSettings,
@@ -52,10 +56,19 @@ export type {
 /** Cache-warming profile. "idle" also warms between agent runs. */
 export const CACHE_WARMING_MODES = ["off", "streaming", "idle"] as const satisfies readonly CacheWarmingMode[];
 
-const DEFAULT_COMPACTION_TOKEN_SETTINGS: Required<CompactionModelOverride> = {
-	reserveTokens: SETTINGS_DEFAULTS.compaction.reserveTokens,
-	keepRecentTokens: SETTINGS_DEFAULTS.compaction.keepRecentTokens,
+/** Valid range of each compaction token setting, for its ordinary value and model overrides. */
+const COMPACTION_SETTING_RANGES: Record<keyof CompactionModelOverride, { min: number; max: number }> = {
+	reserveTokens: { min: 0, max: Number.MAX_SAFE_INTEGER },
+	keepRecentTokens: { min: 0, max: Number.MAX_SAFE_INTEGER },
+	thresholdPercent: { min: 1, max: 100 },
+	summaryMaxTokens: { min: 1, max: Number.MAX_SAFE_INTEGER },
 };
+
+/** Share of the context window kept as recent context when keepRecentTokens is unset, in percent. */
+const KEEP_RECENT_WINDOW_PERCENT = 5;
+
+/** A model whose compaction settings are resolved: its key for model overrides and its context window. */
+type CompactionSettingsModel = Pick<Model<string>, "provider" | "id"> & Partial<Pick<Model<string>, "contextWindow">>;
 
 function isMergeableObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -81,7 +94,21 @@ function deepMergeObjects(base: Record<string, unknown>, overrides: Record<strin
 }
 
 /** Tools enabled at startup when `defaultTools` does not change them. */
-export const DEFAULT_TOOL_NAMES: readonly string[] = ["read", "bash", "edit", "write"];
+/** Pi's default tools; in Pi-Bolt, grep and find too (searching in-process: core/tools/native-search.ts). */
+export const DEFAULT_TOOL_NAMES: readonly string[] =
+	PIBOLT !== undefined ? ["read", "bash", "edit", "write", "grep", "find"] : ["read", "bash", "edit", "write"];
+
+/** FFF's extension (opensec-pi-fff, @ff-labs/pi-fff), by the path it is loaded from: it brings search tools of its own. */
+const FFF_EXTENSION = /(?:^builtin:|[\\/]node_modules[\\/])(?:opensec-pi-fff|@ff-labs[\\/]pi-fff)(?:[\\/]|$)/;
+
+/**
+ * The default tools with these extensions loaded: in Pi-Bolt, without its grep and find when FFF is loaded (it registers
+ * its own, under those names or as ffgrep and fffind).
+ */
+export function defaultToolNamesFor(extensionPaths: readonly string[]): readonly string[] {
+	if (PIBOLT === undefined || !extensionPaths.some((path) => FFF_EXTENSION.test(path))) return DEFAULT_TOOL_NAMES;
+	return DEFAULT_TOOL_NAMES.filter((name) => name !== "grep" && name !== "find");
+}
 
 /** Whether a tool selection entry is a `+name` or `-name` modifier. */
 export function isToolModifier(entry: unknown): boolean {
@@ -130,12 +157,12 @@ function mergeDefaultTools(base: string[] | undefined, overrides: string[] | und
 }
 
 /**
- * Resolve a merged `defaultTools` list: plain names replace `DEFAULT_TOOL_NAMES`, then `+name` adds
+ * Resolve a merged `defaultTools` list: plain names replace `base` (`DEFAULT_TOOL_NAMES`), then `+name` adds
  * and `-name` removes a tool, in list order.
  */
-function resolveDefaultTools(entries: string[]): string[] {
+function resolveDefaultTools(entries: string[], base: readonly string[]): string[] {
 	const plain = entries.filter((entry) => !isToolModifier(entry));
-	return applyToolModifiers(plain.length > 0 || entries.length === 0 ? plain : DEFAULT_TOOL_NAMES, entries);
+	return applyToolModifiers(plain.length > 0 || entries.length === 0 ? plain : base, entries);
 }
 
 /** Deep merge settings: project/overrides take precedence, nested objects merge recursively */
@@ -232,7 +259,13 @@ export class FileSettingsStorage implements SettingsStorage {
 		const revision = getFileRevision(path);
 		if (revision === undefined) {
 			settingsFileReads.delete(path);
-			return undefined;
+			// A failed stat is not necessarily an absent file (for example, EACCES or a symlink loop).
+			try {
+				return readFileSync(path, "utf-8");
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+				throw error;
+			}
 		}
 		const cached = settingsFileReads.get(path);
 		if (cached?.revision === revision) {
@@ -301,18 +334,8 @@ export class InMemorySettingsStorage implements SettingsStorage {
 }
 
 /**
- * Pi-Bolt and Pi share one agent directory (auth, models, sessions, settings), but Pi-Bolt never changes the packages Pi
- * loads. A list in `piBolt.packages` is Pi-Bolt's, read and written in place of `packages`, which Pi keeps using (it does not
- * read `piBolt`). Until Pi-Bolt changes its packages the first time, it reads `packages` as Pi does; that change makes
- * `piBolt.packages` from Pi's list and changes only it.
- */
-function hasOwnPackageList(settings: Settings): boolean {
-	return PIBOLT !== undefined && Array.isArray(settings.piBolt?.packages);
-}
-
-/**
  * OpenSec's extensions for Pi-Bolt are Bun builds, which Pi on Node cannot load; installers before Pi-Bolt 0.8.4 added them
- * to `packages`, so Pi stopped at them. Pi-Bolt moves them to its own list (made from `packages` if there is none).
+ * to `packages`, so Pi stopped at them. Move only those entries to Pi-Bolt's additive list.
  */
 const PIBOLT_ONLY_PACKAGE = /^npm:opensec-pi-(?:subagents|todo|fff)(?:@|$)/;
 
@@ -329,25 +352,104 @@ function isPiBoltOnlyPackage(entry: unknown): boolean {
 	return source !== undefined && PIBOLT_ONLY_PACKAGE.test(source);
 }
 
+function piBoltSettingsOf(settings: Record<string, unknown>): Record<string, unknown> {
+	return (typeof settings.piBolt === "object" && settings.piBolt !== null ? settings.piBolt : {}) as Record<
+		string,
+		unknown
+	>;
+}
+
+function packageIdentityOf(entry: unknown, baseDir: string): string | undefined {
+	const source = sourceOfPackage(entry);
+	return source === undefined
+		? undefined
+		: getPackageIdentity(source.startsWith("-") ? source.slice(1) : source, baseDir);
+}
+
 /** `settings` with Pi-Bolt's only packages moved out of Pi's list, or undefined when Pi's list has none. */
-function withPiBoltOnlyPackagesMoved(settings: Record<string, unknown>): Record<string, unknown> | undefined {
+function withPiBoltOnlyPackagesMoved(
+	settings: Record<string, unknown>,
+	baseDir: string,
+): Record<string, unknown> | undefined {
 	const packages = settings.packages;
 	if (!Array.isArray(packages) || !packages.some(isPiBoltOnlyPackage)) return undefined;
-	const piBolt = (typeof settings.piBolt === "object" && settings.piBolt !== null ? settings.piBolt : {}) as {
-		packages?: unknown;
-	};
-	const own: unknown[] = Array.isArray(piBolt.packages) ? piBolt.packages : [...packages];
-	const ownSources = new Set(own.map(sourceOfPackage));
-	const moved = packages.filter((entry) => isPiBoltOnlyPackage(entry) && !ownSources.has(sourceOfPackage(entry)));
+	const piBolt = piBoltSettingsOf(settings);
+	const hasList = Array.isArray(piBolt.packages);
+	const own: unknown[] = hasList ? (piBolt.packages as unknown[]) : [];
+	const ownSources = new Set(own.map((entry) => packageIdentityOf(entry, baseDir)));
+	const moved = packages.filter(
+		(entry) => isPiBoltOnlyPackage(entry) && !ownSources.has(packageIdentityOf(entry, baseDir)),
+	);
 	return {
 		...settings,
 		packages: packages.filter((entry) => !isPiBoltOnlyPackage(entry)),
-		piBolt: { ...piBolt, packages: [...own, ...moved] },
+		// A list made here is an overlay; an existing unmarked one is a legacy copy, converted next.
+		piBolt: { ...piBolt, packages: [...own, ...moved], ...(hasList ? {} : { packagesOverlay: true }) },
 	};
 }
 
-function runtimePackages(settings: Settings): Settings {
-	return hasOwnPackageList(settings) ? { ...settings, packages: [...(settings.piBolt?.packages ?? [])] } : settings;
+/** Same package, version or ref and resource filters. Local paths compare by resolved path. */
+function isSamePackageDeclaration(left: unknown, right: unknown, baseDir: string): boolean {
+	const normalize = (entry: unknown) => {
+		const { source, ...filters } = (typeof entry === "string" ? { source: entry } : entry) as Record<string, unknown>;
+		const identity = packageIdentityOf(entry, baseDir);
+		const spec = identity?.startsWith("local:") ? identity : String(source).trim();
+		return JSON.stringify([spec, Object.entries(filters).sort(([a], [b]) => a.localeCompare(b))]);
+	};
+	return normalize(left) === normalize(right);
+}
+
+/**
+ * Pi-Bolt before 0.9.1 kept `piBolt.packages` as an independent list: its first install or removal copied `packages` into it
+ * and edited the copy. The list is now an overlay on `packages`, so a shared package missing from a copy would be loaded again.
+ * Convert a copy once: exclude each shared package it lacks, drop entries identical to their shared entry, and keep the rest
+ * (replacements and Pi-Bolt-only additions). `packagesOverlay` marks a list as an overlay; every writer of the list sets it.
+ * Returns undefined when there is nothing to change.
+ */
+function withLegacyPiBoltPackagesConverted(
+	settings: Record<string, unknown>,
+	baseDir: string,
+): Record<string, unknown> | undefined {
+	const piBolt = piBoltSettingsOf(settings);
+	if (!Array.isArray(piBolt.packages) || piBolt.packagesOverlay === true) return undefined;
+	const own: unknown[] = piBolt.packages;
+	// Exclusions exist only in overlays: such a list was written for the overlay format and is only marked.
+	if (own.some((entry) => typeof entry === "string" && entry.startsWith("-"))) {
+		return { ...settings, piBolt: { ...piBolt, packagesOverlay: true } };
+	}
+	const shared: unknown[] = Array.isArray(settings.packages) ? settings.packages : [];
+	const identity = (entry: unknown) => packageIdentityOf(entry, baseDir);
+	const ownIdentities = new Set(own.map(identity));
+	const exclusions = new Map<string, string>();
+	for (const entry of shared) {
+		const key = identity(entry);
+		if (key !== undefined && !ownIdentities.has(key) && !exclusions.has(key)) {
+			exclusions.set(key, `-${sourceOfPackage(entry)}`);
+		}
+	}
+	const kept = own.filter((entry) => {
+		const key = identity(entry);
+		const same = key === undefined ? [] : shared.filter((sharedEntry) => identity(sharedEntry) === key);
+		return same.length === 0 || !same.every((sharedEntry) => isSamePackageDeclaration(sharedEntry, entry, baseDir));
+	});
+	return { ...settings, piBolt: { ...piBolt, packages: [...exclusions.values(), ...kept], packagesOverlay: true } };
+}
+
+/** Pi-Bolt's package migrations for one settings file, or undefined when it needs none. */
+function withPiBoltPackagesMigrated(
+	settings: Record<string, unknown>,
+	scope: SettingsScope,
+	baseDir: string,
+): Record<string, unknown> | undefined {
+	const moved = scope === "global" ? withPiBoltOnlyPackagesMoved(settings, baseDir) : undefined;
+	return withLegacyPiBoltPackagesConverted(moved ?? settings, baseDir) ?? moved;
+}
+
+/** Directory relative package sources in a settings file resolve against. */
+function getPackageBaseDir(scope: SettingsScope, settingsPaths: SettingsPaths): string {
+	const path = settingsPaths[scope];
+	if (path) return dirname(path);
+	return scope === "global" ? getAgentDir() : join(process.cwd(), CONFIG_DIR_NAME);
 }
 
 export class SettingsManager {
@@ -355,6 +457,7 @@ export class SettingsManager {
 	private globalSettings: Settings;
 	private projectSettings: Settings;
 	private settings: Settings;
+	private packageSettings: Settings = {};
 	private projectTrusted: boolean;
 	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
 	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
@@ -384,7 +487,7 @@ export class SettingsManager {
 		this.projectSettingsLoadError = projectLoadError;
 		this.errors = [...initialErrors];
 		this.settingsPaths = settingsPaths;
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.settings = this.mergeSettings();
 	}
 
 	/** Create a SettingsManager that loads from files */
@@ -414,8 +517,8 @@ export class SettingsManager {
 		settingsPaths: SettingsPaths = {},
 	): SettingsManager {
 		const projectTrusted = options.projectTrusted ?? true;
-		const globalLoad = SettingsManager.tryLoadFromStorage(storage, "global");
-		const projectLoad = SettingsManager.tryLoadFromStorage(storage, "project", projectTrusted);
+		const globalLoad = SettingsManager.tryLoadFromStorage(storage, "global", settingsPaths);
+		const projectLoad = SettingsManager.tryLoadFromStorage(storage, "project", settingsPaths, projectTrusted);
 		const initialErrors: SettingsError[] = [];
 		if (globalLoad.error) {
 			initialErrors.push(toSettingsError("global", globalLoad.error, settingsPaths.global));
@@ -444,7 +547,12 @@ export class SettingsManager {
 		return SettingsManager.fromStorage(storage, options);
 	}
 
-	private static loadFromStorage(storage: SettingsStorage, scope: SettingsScope, projectTrusted = true): Settings {
+	private static loadFromStorage(
+		storage: SettingsStorage,
+		scope: SettingsScope,
+		settingsPaths: SettingsPaths,
+		projectTrusted = true,
+	): Settings {
 		if (scope === "project" && !projectTrusted) {
 			return {};
 		}
@@ -463,30 +571,37 @@ export class SettingsManager {
 			return {};
 		}
 		let settings = JSON.parse(stripBom(content));
-		if (PIBOLT !== undefined && scope === "global") {
-			const separated = withPiBoltOnlyPackagesMoved(settings);
-			if (separated) {
-				settings = separated;
+		if (PIBOLT !== undefined) {
+			const baseDir = getPackageBaseDir(scope, settingsPaths);
+			const migrated = withPiBoltPackagesMigrated(settings, scope, baseDir);
+			if (migrated) {
+				settings = migrated;
 				try {
-					storage.withLock("global", (current) => {
-						const moved = current ? withPiBoltOnlyPackagesMoved(JSON.parse(stripBom(current))) : undefined;
-						return moved ? JSON.stringify(moved, null, 2) : undefined;
+					storage.withLock(scope, (current) => {
+						const next = current
+							? withPiBoltPackagesMigrated(JSON.parse(stripBom(current)), scope, baseDir)
+							: undefined;
+						return next ? JSON.stringify(next, null, 2) : undefined;
 					});
 				} catch {
-					// (Not written: Pi-Bolt still loads them from its list in memory, and moves them at a later start.)
+					// (Not written: Pi-Bolt uses the migrated lists in memory, and migrates the file at a later start.)
 				}
 			}
 		}
-		return runtimePackages(SettingsManager.migrateSettings(settings));
+		return SettingsManager.migrateSettings(settings);
 	}
 
 	private static tryLoadFromStorage(
 		storage: SettingsStorage,
 		scope: SettingsScope,
+		settingsPaths: SettingsPaths,
 		projectTrusted = true,
 	): { settings: Settings; error: Error | null } {
 		try {
-			return { settings: SettingsManager.loadFromStorage(storage, scope, projectTrusted), error: null };
+			return {
+				settings: SettingsManager.loadFromStorage(storage, scope, settingsPaths, projectTrusted),
+				error: null,
+			};
 		} catch (error) {
 			return { settings: {}, error: error as Error };
 		}
@@ -554,15 +669,17 @@ export class SettingsManager {
 		return settings as Settings;
 	}
 
-	/** A copy of the effective settings: global and project settings merged, with overrides. */
+	/** Raw merged settings, not resolved package overlays. Never write a resolved list back to a raw list. */
 	getSettings(): Settings {
 		return structuredClone(this.settings);
 	}
 
+	/** Raw global declarations, including separate shared and Pi-Bolt package lists. */
 	getGlobalSettings(): Settings {
 		return structuredClone(this.globalSettings);
 	}
 
+	/** Raw trusted project declarations. Untrusted projects return empty settings. */
 	getProjectSettings(): Settings {
 		return structuredClone(this.projectSettings);
 	}
@@ -583,22 +700,22 @@ export class SettingsManager {
 		if (!trusted) {
 			this.projectSettings = {};
 			this.projectSettingsLoadError = null;
-			this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+			this.settings = this.mergeSettings();
 			return;
 		}
 
-		const projectLoad = SettingsManager.tryLoadFromStorage(this.storage, "project", trusted);
+		const projectLoad = SettingsManager.tryLoadFromStorage(this.storage, "project", this.settingsPaths, trusted);
 		this.projectSettings = projectLoad.settings;
 		this.projectSettingsLoadError = projectLoad.error;
 		if (projectLoad.error) {
 			this.recordError("project", projectLoad.error);
 		}
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.settings = this.mergeSettings();
 	}
 
 	async reload(): Promise<void> {
 		await this.writeQueue;
-		const globalLoad = SettingsManager.tryLoadFromStorage(this.storage, "global");
+		const globalLoad = SettingsManager.tryLoadFromStorage(this.storage, "global", this.settingsPaths);
 		if (!globalLoad.error) {
 			this.globalSettings = globalLoad.settings;
 			this.globalSettingsLoadError = null;
@@ -612,7 +729,12 @@ export class SettingsManager {
 		this.modifiedProjectFields.clear();
 		this.modifiedProjectNestedFields.clear();
 
-		const projectLoad = SettingsManager.tryLoadFromStorage(this.storage, "project", this.projectTrusted);
+		const projectLoad = SettingsManager.tryLoadFromStorage(
+			this.storage,
+			"project",
+			this.settingsPaths,
+			this.projectTrusted,
+		);
 		if (!projectLoad.error) {
 			this.projectSettings = projectLoad.settings;
 			this.projectSettingsLoadError = null;
@@ -621,12 +743,13 @@ export class SettingsManager {
 			this.recordError("project", projectLoad.error);
 		}
 
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.settings = this.mergeSettings();
 	}
 
 	/** Apply additional overrides on top of current settings */
 	applyOverrides(overrides: Partial<Settings>): void {
 		this.settings = deepMergeSettings(this.settings, overrides);
+		this.packageSettings = deepMergeSettings(this.packageSettings, overrides);
 	}
 
 	/** Mark a global field as modified during this session */
@@ -707,11 +830,6 @@ export class SettingsManager {
 			const mergedSettings: Settings = { ...currentFileSettings };
 			for (const field of modifiedFields) {
 				const value = snapshotSettings[field];
-				if (field === "packages" && PIBOLT !== undefined) {
-					// Pi-Bolt's own list changed (made from Pi's the first time); the one Pi uses stays as it is.
-					mergedSettings.piBolt = { ...currentFileSettings.piBolt, packages: value as PackageSource[] };
-					continue;
-				}
 				if (modifiedNestedFields.has(field) && typeof value === "object" && value !== null) {
 					const nestedModified = modifiedNestedFields.get(field)!;
 					const baseNested = (currentFileSettings[field] as Record<string, unknown>) ?? {};
@@ -731,7 +849,7 @@ export class SettingsManager {
 	}
 
 	private save(): void {
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.settings = this.mergeSettings();
 
 		if (this.globalSettingsLoadError) {
 			return;
@@ -749,7 +867,7 @@ export class SettingsManager {
 	private saveProjectSettings(settings: Settings): void {
 		this.assertProjectTrustedForWrite();
 		this.projectSettings = structuredClone(settings);
-		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+		this.settings = this.mergeSettings();
 
 		if (this.projectSettingsLoadError) {
 			return;
@@ -788,6 +906,19 @@ export class SettingsManager {
 	setLastChangelogVersion(version: string): void {
 		this.globalSettings.lastChangelogVersion = version;
 		this.markModified("lastChangelogVersion");
+		this.save();
+	}
+
+	getExtensionChangelogVersion(key: string): string | undefined {
+		return this.settings.extensionChangelogVersions?.[key];
+	}
+
+	setExtensionChangelogVersion(key: string, version: string): void {
+		this.globalSettings.extensionChangelogVersions = {
+			...(this.globalSettings.extensionChangelogVersions ?? {}),
+			[key]: version,
+		};
+		this.markModified("extensionChangelogVersions", key);
 		this.save();
 	}
 
@@ -908,6 +1039,71 @@ export class SettingsManager {
 		this.save();
 	}
 
+	getSessionShareDestination(): SessionShareDestination {
+		const destination = this.settings.sessionShareDestination;
+		return destination === "gist" || destination === "radius"
+			? destination
+			: SETTINGS_DEFAULTS.sessionShareDestination;
+	}
+
+	getRemoteControlSettings(): RemoteControlSettings {
+		const value = this.settings.remoteControl;
+		return value && typeof value === "object" ? value : {};
+	}
+
+	/** `remoteControl.enabled`, from the global settings only: a project's settings cannot turn remote control on. */
+	getRemoteControlEnabled(): boolean {
+		const value = this.globalSettings.remoteControl;
+		return value !== null && typeof value === "object" && value.enabled === true;
+	}
+
+	setRemoteControlEnabled(enabled: boolean): void {
+		const current = this.globalSettings.remoteControl;
+		this.globalSettings.remoteControl = { ...(current && typeof current === "object" ? current : {}), enabled };
+		this.markModified("remoteControl", "enabled");
+		this.save();
+	}
+
+	/**
+	 * `piBolt.autoUpdate`, from the global settings only: a project's settings cannot make Pi-Bolt install a release
+	 * (pi-bolt-auto-update.ts).
+	 */
+	getPiBoltAutoUpdate(): boolean {
+		return this.globalSettings.piBolt?.autoUpdate === true;
+	}
+
+	setPiBoltAutoUpdate(enabled: boolean): void {
+		this.globalSettings.piBolt = { ...this.globalSettings.piBolt, autoUpdate: enabled };
+		this.markModified("piBolt", "autoUpdate");
+		this.save();
+	}
+
+	/** "Don't ask again" for /remote-control's offer to install cloudflared. */
+	setRemoteControlAskCloudflared(ask: boolean): void {
+		const current = this.globalSettings.remoteControl;
+		this.globalSettings.remoteControl = {
+			...(current && typeof current === "object" ? current : {}),
+			askCloudflared: ask,
+		};
+		this.markModified("remoteControl", "askCloudflared");
+		this.save();
+	}
+
+	/** The background service's tunnel (`pi-bolt service install --no-tunnel` sets "off"). */
+	setRemoteControlServiceTunnel(tunnel: NonNullable<RemoteControlSettings["tunnel"]>): void {
+		const current = this.globalSettings.remoteControl;
+		const remoteControl = current && typeof current === "object" ? current : {};
+		this.globalSettings.remoteControl = { ...remoteControl, service: { ...remoteControl.service, tunnel } };
+		this.markModified("remoteControl", "service");
+		this.save();
+	}
+
+	setSessionShareDestination(destination: SessionShareDestination): void {
+		this.globalSettings.sessionShareDestination = destination;
+		this.markModified("sessionShareDestination");
+		this.save();
+	}
+
 	getCompactionEnabled(): boolean {
 		return this.settings.compaction?.enabled ?? SETTINGS_DEFAULTS.compaction.enabled;
 	}
@@ -921,16 +1117,22 @@ export class SettingsManager {
 		this.save();
 	}
 
-	private getCompactionTokenSetting(
+	/** The compaction setting the user set, from the model override or the ordinary setting, if any. */
+	private getExplicitCompactionSetting(
 		field: keyof CompactionModelOverride,
 		model?: Pick<Model<string>, "provider" | "id">,
-	): number {
+	): number | undefined {
+		const { min, max } = COMPACTION_SETTING_RANGES[field];
+		const range =
+			min === 0 && max === Number.MAX_SAFE_INTEGER
+				? "a non-negative safe integer"
+				: `an integer from ${min} to ${max}`;
+		const isValid = (value: unknown): value is number =>
+			typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
 		const compaction = this.settings.compaction;
 		const ordinary = compaction?.[field];
-		if (ordinary !== undefined && (typeof ordinary !== "number" || !Number.isSafeInteger(ordinary) || ordinary < 0)) {
-			throw new Error(
-				`Invalid compaction.${field} setting: ${String(ordinary)}. Expected a non-negative safe integer.`,
-			);
+		if (ordinary !== undefined && !isValid(ordinary)) {
+			throw new Error(`Invalid compaction.${field} setting: ${String(ordinary)}. Expected ${range}.`);
 		}
 
 		const modelKey = model ? `${model.provider}/${model.id}` : undefined;
@@ -941,32 +1143,54 @@ export class SettingsManager {
 			);
 		}
 		const override = entry?.[field];
-		if (override !== undefined && (typeof override !== "number" || !Number.isSafeInteger(override) || override < 0)) {
+		if (override !== undefined && !isValid(override)) {
 			throw new Error(
-				`Invalid compaction.modelOverrides["${modelKey}"].${field} setting: ${String(override)}. Expected a non-negative safe integer.`,
+				`Invalid compaction.modelOverrides["${modelKey}"].${field} setting: ${String(override)}. Expected ${range}.`,
 			);
 		}
-		return override ?? ordinary ?? DEFAULT_COMPACTION_TOKEN_SETTINGS[field];
+		return override ?? ordinary;
 	}
 
 	getCompactionReserveTokens(model?: Pick<Model<string>, "provider" | "id">): number {
-		return this.getCompactionTokenSetting("reserveTokens", model);
+		return this.getExplicitCompactionSetting("reserveTokens", model) ?? SETTINGS_DEFAULTS.compaction.reserveTokens;
 	}
 
-	getCompactionKeepRecentTokens(model?: Pick<Model<string>, "provider" | "id">): number {
-		return this.getCompactionTokenSetting("keepRecentTokens", model);
+	/** Explicit keepRecentTokens, else the larger of the default and 5% of the context window. */
+	getCompactionKeepRecentTokens(model?: CompactionSettingsModel, contextWindow = model?.contextWindow ?? 0): number {
+		return (
+			this.getExplicitCompactionSetting("keepRecentTokens", model) ??
+			Math.max(
+				SETTINGS_DEFAULTS.compaction.keepRecentTokens,
+				Math.floor((Math.max(contextWindow, 0) * KEEP_RECENT_WINDOW_PERCENT) / 100),
+			)
+		);
 	}
 
-	/** Resolve each token setting through model override, ordinary setting, then built-in default. */
-	getCompactionSettings(model?: Pick<Model<string>, "provider" | "id">): {
-		enabled: boolean;
-		reserveTokens: number;
-		keepRecentTokens: number;
-	} {
+	/**
+	 * Resolve each setting through model override, ordinary setting, then built-in default. Unset
+	 * defaults scale with `contextWindow` (default: the model's): the threshold is also capped at
+	 * thresholdPercent of the window, keepRecentTokens grows to 5% of it, and the summary cap to 3.2%
+	 * of the summarizer's window. An explicit reserveTokens keeps the threshold and summary cap derived
+	 * from reserveTokens alone, unless thresholdPercent or summaryMaxTokens is set too.
+	 */
+	getCompactionSettings(
+		model?: CompactionSettingsModel,
+		contextWindow = model?.contextWindow ?? 0,
+	): ResolvedCompactionSettings {
+		const explicitReserveTokens = this.getExplicitCompactionSetting("reserveTokens", model);
+		const thresholdPercent =
+			this.getExplicitCompactionSetting("thresholdPercent", model) ??
+			(explicitReserveTokens === undefined ? SETTINGS_DEFAULTS.compaction.thresholdPercent : undefined);
+		const summaryMaxTokens = this.getExplicitCompactionSetting("summaryMaxTokens", model);
 		return {
 			enabled: this.getCompactionEnabled(),
-			reserveTokens: this.getCompactionReserveTokens(model),
-			keepRecentTokens: this.getCompactionKeepRecentTokens(model),
+			reserveTokens: explicitReserveTokens ?? SETTINGS_DEFAULTS.compaction.reserveTokens,
+			keepRecentTokens: this.getCompactionKeepRecentTokens(model, contextWindow),
+			...(thresholdPercent === undefined ? {} : { thresholdPercent }),
+			...(summaryMaxTokens === undefined ? {} : { summaryMaxTokens }),
+			...(explicitReserveTokens === undefined && summaryMaxTokens === undefined
+				? { scaleSummaryWithContextWindow: true }
+				: {}),
 		};
 	}
 
@@ -1049,6 +1273,10 @@ export class SettingsManager {
 		return this.settings.showCacheMissNotices ?? SETTINGS_DEFAULTS.showCacheMissNotices;
 	}
 
+	getShadedCodeBlocks(): boolean {
+		return this.settings.shadedCodeBlocks ?? SETTINGS_DEFAULTS.shadedCodeBlocks;
+	}
+
 	getExternalEditorCommand(): string {
 		const configuredEditor = this.settings.externalEditor;
 		if (typeof configuredEditor === "string" && configuredEditor.trim() !== "") {
@@ -1064,6 +1292,12 @@ export class SettingsManager {
 	setHideThinkingBlock(hide: boolean): void {
 		this.globalSettings.hideThinkingBlock = hide;
 		this.markModified("hideThinkingBlock");
+		this.save();
+	}
+
+	setShadedCodeBlocks(shaded: boolean): void {
+		this.globalSettings.shadedCodeBlocks = shaded;
+		this.markModified("shadedCodeBlocks");
 		this.save();
 	}
 
@@ -1159,7 +1393,7 @@ export class SettingsManager {
 		this.globalSettings.enableAnalytics = enabled;
 		this.markModified("enableAnalytics");
 		if (enabled && !this.globalSettings.trackingId) {
-			this.globalSettings.trackingId = randomUUID();
+			this.globalSettings.trackingId = crypto.randomUUID();
 			this.markModified("trackingId");
 		}
 		this.save();
@@ -1172,51 +1406,123 @@ export class SettingsManager {
 	 */
 	getOrCreateDeviceId(): string {
 		if (!this.globalSettings.deviceId) {
-			this.globalSettings.deviceId = randomUUID();
+			this.globalSettings.deviceId = crypto.randomUUID();
 			this.markModified("deviceId");
 			this.save();
 		}
 		return this.globalSettings.deviceId;
 	}
 
-	getPackages(): PackageSource[] {
-		return [...(this.settings.packages ?? [])];
+	/** As in Pi, a project `packages` list replaces the global one. A project Pi-Bolt list alone does not. */
+	private getPackageSettingsScope(): SettingsScope {
+		return this.projectSettings.packages !== undefined ? "project" : "global";
 	}
 
-	/**
-	 * The packages Pi itself loads from this scope's settings, for Pi-Bolt, which changes only its own list: removing a
-	 * package from Pi-Bolt's list leaves files Pi still uses. In Pi itself, none.
-	 */
-	getPackagesKeptForPi(scope: SettingsScope): PackageSource[] {
-		if (scope === "project" && !this.projectTrusted) return [];
+	private mergeSettings(): Settings {
+		this.packageSettings = this.getPackageSettingsScope() === "project" ? this.projectSettings : this.globalSettings;
+		return deepMergeSettings(this.globalSettings, this.projectSettings);
+	}
+
+	/** Resolved runtime packages with project-list-over-global SDK precedence and non-persistent applyOverrides. */
+	getPackages(): PackageSource[] {
+		const scope = this.getPackageSettingsScope();
+		const packages = this.resolvePackages(this.packageSettings, scope);
+		if (scope === "project" || PIBOLT === undefined || !Array.isArray(this.projectSettings.piBolt?.packages)) {
+			return packages;
+		}
+		// Project Pi-Bolt entries without project `packages` add to the global packages or replace one of the same
+		// identity, as the package manager loads them; their exclusions apply only to the project's own (empty) list.
+		const project = this.resolvePackages(this.projectSettings, "project");
+		const identity = (entry: PackageSource, entryScope: SettingsScope) =>
+			getPackageIdentity(
+				typeof entry === "string" ? entry : entry.source,
+				getPackageBaseDir(entryScope, this.settingsPaths),
+			);
+		const projectIdentities = new Set(project.map((entry) => identity(entry, "project")));
+		return [...packages.filter((entry) => !projectIdentities.has(identity(entry, "global"))), ...project];
+	}
+
+	/** Resolve only this file's overlay. Custom storage uses agent dir / cwd/.pi unless baseDir is supplied. */
+	getResolvedPackages(scope: SettingsScope, baseDir?: string): PackageSource[] {
+		const settings = scope === "project" ? this.projectSettings : this.globalSettings;
+		return this.resolvePackages(settings, scope, baseDir);
+	}
+
+	/** Flush queued writes and read current package declarations without resetting unrelated runtime settings. */
+	async getCurrentPackageSettings(scope: SettingsScope): Promise<Pick<Settings, "packages" | "piBolt">> {
+		await this.flush();
+		if (scope === "project" && !this.projectTrusted) return {};
 		let content: string | undefined;
-		if (this.storage.read) {
-			content = this.storage.read(scope);
-		} else {
+		if (this.storage.read) content = this.storage.read(scope);
+		else
 			this.storage.withLock(scope, (current) => {
 				content = current;
 				return undefined;
 			});
+		// An unreadable declaration file must abort removal, not authorise deletion of shared files.
+		let persisted: Settings = content ? JSON.parse(stripBom(content)) : {};
+		if (PIBOLT !== undefined) {
+			// A file written by an older Pi-Bolt since this manager loaded it still holds a legacy copy.
+			persisted =
+				(withLegacyPiBoltPackagesConverted(
+					persisted as Record<string, unknown>,
+					getPackageBaseDir(scope, this.settingsPaths),
+				) as Settings | undefined) ?? persisted;
 		}
-		if (!content) return [];
-		try {
-			const settings = SettingsManager.migrateSettings(JSON.parse(stripBom(content)) as Record<string, unknown>);
-			return PIBOLT !== undefined ? [...(settings.packages ?? [])] : [];
-		} catch {
-			return [];
-		}
+		const current = scope === "project" ? this.projectSettings : this.globalSettings;
+		const modified = scope === "project" ? this.modifiedProjectFields : this.modifiedFields;
+		const nested = scope === "project" ? this.modifiedProjectNestedFields : this.modifiedNestedFields;
+		return structuredClone({
+			packages: modified.has("packages") ? current.packages : persisted.packages,
+			piBolt: {
+				packages: nested.get("piBolt")?.has("packages") ? current.piBolt?.packages : persisted.piBolt?.packages,
+			},
+		});
 	}
 
-	setPackages(packages: PackageSource[]): void {
-		this.globalSettings.packages = packages;
-		this.markModified("packages");
+	private resolvePackages(settings: Settings, scope: SettingsScope, baseDir?: string): PackageSource[] {
+		const shared = settings.packages ?? [];
+		baseDir ??= getPackageBaseDir(scope, this.settingsPaths);
+		const own = Array.isArray(settings.piBolt?.packages) ? settings.piBolt.packages : [];
+		return structuredClone(PIBOLT === undefined ? shared : resolvePackageOverlay(shared, own, baseDir));
+	}
+
+	/**
+	 * Write raw shared declarations. The piBolt option explicitly selects the additive Pi-Bolt list, marked as an overlay so
+	 * it is never taken for a legacy copy (withLegacyPiBoltPackagesConverted).
+	 */
+	setPackages(packages: PackageSource[], options?: { piBolt?: boolean }): void {
+		if (options?.piBolt) {
+			if (PIBOLT === undefined) throw new Error("Pi-Bolt packages require a Pi-Bolt build");
+			this.globalSettings.piBolt = {
+				...this.globalSettings.piBolt,
+				packages: structuredClone(packages),
+				packagesOverlay: true,
+			};
+			this.markModified("piBolt", "packages");
+			this.markModified("piBolt", "packagesOverlay");
+		} else {
+			this.globalSettings.packages = structuredClone(packages);
+			this.markModified("packages");
+		}
 		this.save();
 	}
 
-	setProjectPackages(packages: PackageSource[]): void {
-		this.updateProjectSettings("packages", (settings) => {
-			settings.packages = packages;
-		});
+	/** Write raw project declarations; never pass the resolved overlay here. */
+	setProjectPackages(packages: PackageSource[], options?: { piBolt?: boolean }): void {
+		if (options?.piBolt) {
+			if (PIBOLT === undefined) throw new Error("Pi-Bolt packages require a Pi-Bolt build");
+			this.assertProjectTrustedForWrite();
+			const settings = this.getProjectSettings();
+			settings.piBolt = { ...settings.piBolt, packages: structuredClone(packages), packagesOverlay: true };
+			this.markProjectModified("piBolt", "packages");
+			this.markProjectModified("piBolt", "packagesOverlay");
+			this.saveProjectSettings(settings);
+		} else {
+			this.updateProjectSettings("packages", (settings) => {
+				settings.packages = structuredClone(packages);
+			});
+		}
 	}
 
 	getExtensionPaths(): string[] {
@@ -1456,10 +1762,11 @@ export class SettingsManager {
 	}
 
 	/** The resolved `defaultTools` selection, or undefined when no settings layer sets it. */
-	getDefaultTools(): string[] | undefined {
+	/** `base`: what a list of only `+name`/`-name` entries changes (Pi-Bolt: `defaultToolNamesFor()`, which knows the extensions). */
+	getDefaultTools(base: readonly string[] = DEFAULT_TOOL_NAMES): string[] | undefined {
 		const tools = this.settings.defaultTools;
 		if (tools === undefined) return undefined;
-		return resolveDefaultTools(Array.isArray(tools) ? tools.filter((tool) => typeof tool === "string") : []);
+		return resolveDefaultTools(Array.isArray(tools) ? tools.filter((tool) => typeof tool === "string") : [], base);
 	}
 
 	setEnabledModels(patterns: string[] | undefined): void {

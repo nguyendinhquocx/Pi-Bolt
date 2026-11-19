@@ -1,6 +1,11 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { lexMarkdownForTest, Markdown, setMarkdownCachingForTest } from "../src/components/markdown.ts";
+import {
+	lexMarkdownForTest,
+	Markdown,
+	setMarkdownCachingForTest,
+	setMarkdownFastPathsForTest,
+} from "../src/components/markdown.ts";
 import { defaultMarkdownTheme } from "./test-themes.ts";
 
 // A message that streams in is lexed again each time it grows, from the last block on. The tokens must be what lexing all of
@@ -155,6 +160,89 @@ describe("Markdown lexing of a growing source", () => {
 		});
 	}
 
+	it("one component given each chunk with setText(), rendered after some of them", () => {
+		// (With tabs too: a text with tabs is lexed from what replacing them gave the time before.)
+		const documents = Object.entries(DOCUMENTS).flatMap(([name, text]) => [
+			[name, text],
+			[`${name} with tabs`, text.replace(/^ {2}/gm, "\t").replace(/ {4}/g, "\t")],
+		]);
+		// (No transform, one that gives the text as it is, as the coding agent's when no extension adds one, and one that
+		// changes it.)
+		const transforms = [undefined, (markdown: string) => markdown, (markdown: string) => markdown.replace(/e/g, "E")];
+		for (const [name, text] of documents) {
+			for (let seed = 1; seed <= 3; seed++) {
+				const next = random(seed);
+				const document = `<!-- ${name} set ${Math.random()} -->\n\n${text}`;
+				const transform = transforms[seed - 1];
+				const options = transform === undefined ? undefined : { transform };
+				const component = new Markdown("", 1, 0, defaultMarkdownTheme, undefined, options);
+				let length = 0;
+				while (length < document.length) {
+					length = Math.min(document.length, length + 1 + Math.floor(next() * 40));
+					let source = document.slice(0, length);
+					// Now and then a text that is not the one before with text added (a message edited, or set again).
+					if (next() < 0.05) source = `${source.slice(0, Math.floor(source.length / 2))}\n\nchanged`;
+					component.setText(source);
+					// (Several chunks can come between two renders.)
+					if (next() < 0.4 && length < document.length) continue;
+					const rendered = component.render(72);
+					setMarkdownCachingForTest(false);
+					const fresh = new Markdown(source, 1, 0, defaultMarkdownTheme, undefined, options).render(72);
+					setMarkdownCachingForTest(true);
+					assert.deepStrictEqual(rendered, fresh, `${name}#${seed}: rendered lines differ at length ${length}`);
+				}
+			}
+		}
+	});
+
+	it("a text given with text added to it, white space only at first, with tabs and escape sequences later", () => {
+		// setText() finds whether the text has a character that is not white space, and a tab, from the text added only
+		// (and sanitises only that): what it renders must be what a component given all of the text renders.
+		const pieces = [
+			" ",
+			"\n",
+			"\n\n",
+			"\t",
+			"\u00a0",
+			"\u2028",
+			"\ufeff",
+			"a",
+			"**b** ",
+			"x\ty",
+			"\x1b[3",
+			"1m",
+			"\r",
+			"\r\n",
+		];
+		const blocks = ["```ts\nconst a = 1;\n", "```\n", "- item\n", "# h\n", "| a | b |\n|---|---|\n", "> q\n"];
+		for (let seed = 1; seed <= 30; seed++) {
+			const next = random(seed * 104729);
+			const transform = seed % 3 === 0 ? (markdown: string) => markdown : undefined;
+			const options = transform === undefined ? undefined : { transform };
+			const component = new Markdown("", 1, 0, defaultMarkdownTheme, undefined, options);
+			// (A prefix of its own, made of white space: nothing kept from another test is taken up.)
+			let text = " ".repeat(seed) + "\n".repeat(seed % 4);
+			for (let step = 0; step < 120; step++) {
+				const r = next();
+				const piece =
+					r < 0.25 && step > 10
+						? blocks[Math.floor(next() * blocks.length)]
+						: pieces[Math.floor(next() * (step < 15 ? 7 : pieces.length))];
+				text += piece;
+				// Now and then a text that is not the one before with text added.
+				if (next() < 0.03) text = text.slice(0, Math.floor(text.length / 2));
+				component.setText(text);
+				// (Several chunks can come between two renders.)
+				if (next() < 0.5) continue;
+				const rendered = component.render(48);
+				setMarkdownCachingForTest(false);
+				const fresh = new Markdown(text, 1, 0, defaultMarkdownTheme, undefined, options).render(48);
+				setMarkdownCachingForTest(true);
+				assert.deepStrictEqual(rendered, fresh, `seed ${seed} step ${step}: ${JSON.stringify(text.slice(-40))}`);
+			}
+		}
+	});
+
 	it("random documents made of blocks in random order", () => {
 		const blocks = Object.values(DOCUMENTS)
 			.join("\n\n")
@@ -270,6 +358,43 @@ describe("Markdown lexing of a growing source", () => {
 			previous = tokens;
 		}
 		assert.ok(reused > 500, `only ${reused} tokens were reused`);
+	});
+
+	it("a block that the last one settles, or that lexes to the same token again, is the token from before", () => {
+		for (const fastPaths of [true, false]) {
+			setMarkdownFastPathsForTest(fastPaths);
+			try {
+				// A list, then a paragraph that grows past its first line: the list is not lexed again. A code block, then
+				// a paragraph on its first line: the code block is lexed again, to the same token.
+				const cases = [
+					{ head: "- one\n- two\n\nA paragraph", grow: [" that grows", "\nand a second line", " that grows too"] },
+					{ head: "```ts\nconst a = 1;\n```\nA paragraph", grow: [" that", " grows", " on its first line"] },
+				];
+				for (const { head, grow } of cases) {
+					// (A first paragraph that no earlier test lexed. Not an HTML comment: those render no line, #11710.)
+					let source = `Settled ${Math.random()}\n\n${head}`;
+					let previous = lexMarkdownForTest(source);
+					const block = previous[2]!;
+					assert.ok(block.type === "list" || block.type === "code");
+					const lines = new Markdown(source, 1, 0, defaultMarkdownTheme).render(60);
+					for (const text of grow) {
+						source += text;
+						const tokens = lexMarkdownForTest(source);
+						assert.strictEqual(
+							tokens[2] === previous[2],
+							fastPaths,
+							`${JSON.stringify(source)}: ${tokens[2]!.type}`,
+						);
+						previous = tokens;
+					}
+					const grown = new Markdown(source, 1, 0, defaultMarkdownTheme).render(60);
+					// (The block's lines come first, after the first paragraph's.)
+					assert.deepStrictEqual(grown.slice(0, 4), lines.slice(0, 4));
+				}
+			} finally {
+				setMarkdownFastPathsForTest(true);
+			}
+		}
 	});
 
 	it("a source that is not the earlier one with text added is lexed whole", () => {

@@ -3,12 +3,14 @@ import { DEFAULT_MAX_AGENT_RETRY_DELAY_MS } from "@earendil-works/pi-ai/utils/re
 /** Runtime defaults shared by settings accessors and the published JSON Schema. */
 export const SETTINGS_DEFAULTS = {
 	transport: "auto",
+	sessionShareDestination: "auto",
 	steeringMode: "one-at-a-time",
 	followUpMode: "one-at-a-time",
 	compaction: {
 		enabled: true,
 		reserveTokens: 16384,
 		keepRecentTokens: 20000,
+		thresholdPercent: 90,
 	},
 	branchSummary: {
 		reserveTokens: 16384,
@@ -25,6 +27,7 @@ export const SETTINGS_DEFAULTS = {
 	},
 	hideThinkingBlock: false,
 	showCacheMissNotices: false,
+	shadedCodeBlocks: false,
 	quietStartup: false,
 	defaultProjectTrust: "ask",
 	collapseChangelog: false,
@@ -57,6 +60,7 @@ export const SETTINGS_DEFAULTS = {
 		mode: "on",
 		inlineBudget: 3000,
 	},
+	// Pi-Bolt: "idle" re-sends the session's last request while the user is away (billed), so it is opt-in.
 	cacheWarming: "streaming",
 	tuiMode: "fullscreen",
 	fullscreenExitOutput: "transcript",

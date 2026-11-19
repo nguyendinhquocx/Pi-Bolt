@@ -20,6 +20,7 @@ import type {
 	ProviderAuth,
 } from "./auth/types.ts";
 import { InMemoryModelsStore, type ModelsStore, type ModelsStoreEntry } from "./models-store.ts";
+import { observeModelRequest } from "./telemetry.ts";
 import type {
 	AnyModel,
 	Api,
@@ -55,6 +56,7 @@ import type {
 	Usage,
 } from "./types.ts";
 import { operationSignal, raceWithAbortSignal } from "./utils/abort.ts";
+import { type ClientIdentity, getOpenCodeSessionHeaders, mergeClientIdentity } from "./utils/identity.ts";
 import {
 	assertChatModel,
 	assertClassifierInputSupported,
@@ -68,6 +70,7 @@ import {
 import { normalizeContext } from "./utils/transcript.ts";
 
 export { ModelsError, type ModelsErrorCode } from "./auth/resolve.ts";
+export { AI_TELEMETRY_SCHEMA } from "./telemetry.ts";
 export { getModelType, isModelType } from "./utils/model-operations.ts";
 
 export interface ModelsPublication {
@@ -191,6 +194,14 @@ export interface Provider<TApi extends Api = Api> {
 	 * shared abort signal for blocking work.
 	 */
 	refreshModels?(context: RefreshModelsContext): Promise<void>;
+
+	/**
+	 * What the network phase of `refreshModels` needs. "credential" (the default) receives the
+	 * effective credential, so an expired OAuth token is refreshed first. "configured" is for catalogs
+	 * served by a source other than the provider, such as pi.dev: the phase still runs only when the
+	 * provider is configured, but OAuth is never refreshed for it and `context.credential` is undefined.
+	 */
+	readonly refreshModelsAuth?: "credential" | "configured";
 
 	/**
 	 * Optional provider policy for credential-specific model availability.
@@ -374,6 +385,13 @@ export interface CreateModelsOptions {
 	credentials?: CredentialStore;
 	modelsStore?: ModelsStore;
 	authContext?: AuthContext;
+	/** Default identity of every request; a request's `identity` overrides it field by field. */
+	identity?: ClientIdentity;
+}
+
+/** raceWithAbortSignal(), or the operation itself when there is no signal to race it against. */
+function raceIfAbortable<T>(operation: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+	return signal ? raceWithAbortSignal(operation, signal) : operation;
 }
 
 function mergeHeaders(
@@ -397,6 +415,7 @@ class ModelsImpl implements MutableModels {
 	private credentials: CredentialStore;
 	private modelsStore: ModelsStore;
 	private authContext: AuthContext;
+	private identity: ClientIdentity | undefined;
 	private refreshGenerations = new Map<string, number>();
 	private refreshControllers = new Map<string, AbortController>();
 	private publicationChains = new Map<string, Promise<unknown>>();
@@ -405,6 +424,7 @@ class ModelsImpl implements MutableModels {
 		this.credentials = options?.credentials ?? new InMemoryCredentialStore();
 		this.modelsStore = options?.modelsStore ?? new InMemoryModelsStore();
 		this.authContext = options?.authContext ?? defaultAuthContext();
+		this.identity = options?.identity;
 	}
 
 	setProvider(provider: Provider): void {
@@ -506,16 +526,17 @@ class ModelsImpl implements MutableModels {
 		return { generation, controller };
 	}
 
+	/** `signal` is undefined when nothing can abort the refresh publishing. */
 	private publishProviderModels(
 		providerId: string,
 		generation: number,
-		signal: AbortSignal,
+		signal: AbortSignal | undefined,
 		publication: ModelsPublication,
 	): Promise<boolean> {
 		const previous = this.publicationChains.get(providerId) ?? Promise.resolve();
 		const queued = (async () => {
 			await previous.catch(() => {});
-			if (signal.aborted || this.refreshGenerations.get(providerId) !== generation) return false;
+			if (signal?.aborted || this.refreshGenerations.get(providerId) !== generation) return false;
 
 			if (publication.persist === null) {
 				await this.modelsStore.delete(providerId, { signal });
@@ -523,7 +544,7 @@ class ModelsImpl implements MutableModels {
 				await this.modelsStore.write(providerId, structuredClone(publication.persist), { signal });
 			}
 
-			if (signal.aborted || this.refreshGenerations.get(providerId) !== generation) return false;
+			if (signal?.aborted || this.refreshGenerations.get(providerId) !== generation) return false;
 			publication.update?.();
 			return true;
 		})();
@@ -532,9 +553,10 @@ class ModelsImpl implements MutableModels {
 		void tail.then(() => {
 			if (this.publicationChains.get(providerId) === tail) this.publicationChains.delete(providerId);
 		});
-		return raceWithAbortSignal(queued, signal);
+		return raceIfAbortable(queued, signal);
 	}
 
+	/** `signal` is what the provider is given; `abortSignal` the same signal, or undefined when nothing can abort it. */
 	private async runProviderRefreshPhase(
 		provider: Provider & Required<Pick<Provider, "refreshModels">>,
 		credential: Credential | undefined,
@@ -542,12 +564,15 @@ class ModelsImpl implements MutableModels {
 		force: boolean | undefined,
 		generation: number,
 		signal: AbortSignal,
+		abortSignal: AbortSignal | undefined,
 	): Promise<void> {
-		const stored = await this.modelsStore.read(provider.id, { signal });
+		const stored = await this.modelsStore.read(provider.id, { signal: abortSignal });
 		await provider.refreshModels({
 			credential,
-			stored: stored ? withKnownModelTypes(structuredClone(stored)) : undefined,
-			publish: (publication) => this.publishProviderModels(provider.id, generation, signal, publication),
+			// Not copied: a store's read is a snapshot it does not change, and providers do not change `stored` either. Every
+			// start reads every provider's entry, and a provider keeps only the models it uses.
+			stored: stored ? withKnownModelTypes(stored) : undefined,
+			publish: (publication) => this.publishProviderModels(provider.id, generation, abortSignal, publication),
 			allowNetwork,
 			force: allowNetwork ? force : undefined,
 			signal,
@@ -568,8 +593,14 @@ class ModelsImpl implements MutableModels {
 
 		const refresh = Promise.all(
 			refreshable.map(async (provider) => {
-				const { generation, controller } = this.beginProviderRefresh(provider.id);
-				const signal = AbortSignal.any([callerSignal, controller.signal]);
+				// Offline, a refresh only restores the stored catalog: a superseding refresh stops it from publishing by its
+				// generation, with no signal of its own to abort (one for each provider at every start).
+				const { generation, controller } = allowNetwork
+					? this.beginProviderRefresh(provider.id)
+					: { generation: this.supersedeProviderRefresh(provider.id), controller: undefined };
+				// (Undefined when nothing can abort this provider's refresh: waiting for it is then not raced against one.)
+				const abortSignal = controller ? AbortSignal.any([callerSignal, controller.signal]) : options.signal;
+				const signal = abortSignal ?? callerSignal;
 				const operation = (async () => {
 					let storedCredential: Credential | undefined;
 					let credentialError: unknown;
@@ -580,19 +611,36 @@ class ModelsImpl implements MutableModels {
 					}
 
 					// Restore cached provider state before auth resolution or network access.
-					await this.runProviderRefreshPhase(provider, storedCredential, false, undefined, generation, signal);
+					await this.runProviderRefreshPhase(
+						provider,
+						storedCredential,
+						false,
+						undefined,
+						generation,
+						signal,
+						abortSignal,
+					);
 					if (credentialError !== undefined) throw credentialError;
 					if (!allowNetwork || signal.aborted) return;
 
-					const credential = await this.resolveRefreshCredential(provider, storedCredential, signal);
-					if (!credential) return;
-					await this.runProviderRefreshPhase(provider, credential, true, options.force, generation, signal);
+					const network = await this.resolveNetworkRefresh(provider, storedCredential, signal);
+					if (!network) return;
+					await this.runProviderRefreshPhase(
+						provider,
+						network.credential,
+						true,
+						options.force,
+						generation,
+						signal,
+						abortSignal,
+					);
 				})();
 
 				try {
-					await raceWithAbortSignal(operation, signal);
+					await raceIfAbortable(operation, abortSignal);
 				} catch (error) {
-					if (!signal.aborted) {
+					// (Not when a later refresh superseded this one: before, that aborted it.)
+					if (!signal.aborted && this.refreshGenerations.get(provider.id) === generation) {
 						errors.set(
 							provider.id,
 							error instanceof Error
@@ -601,7 +649,7 @@ class ModelsImpl implements MutableModels {
 						);
 					}
 				} finally {
-					if (this.refreshControllers.get(provider.id) === controller) {
+					if (controller && this.refreshControllers.get(provider.id) === controller) {
 						this.refreshControllers.delete(provider.id);
 					}
 				}
@@ -609,12 +657,25 @@ class ModelsImpl implements MutableModels {
 		);
 
 		try {
-			await raceWithAbortSignal(refresh, callerSignal);
+			await raceIfAbortable(refresh, options.signal);
 		} catch (error) {
 			if (!callerSignal.aborted) throw error;
 		}
 
 		return { aborted: callerSignal.aborted, errors: new Map(errors) };
+	}
+
+	/** The credential for the network refresh phase, or undefined when the provider is not configured. */
+	private async resolveNetworkRefresh(
+		provider: Provider,
+		stored: Credential | undefined,
+		signal: AbortSignal,
+	): Promise<{ credential?: Credential } | undefined> {
+		if (provider.refreshModelsAuth === "configured") {
+			return (await this.checkProviderAuth(provider, stored, signal)) ? {} : undefined;
+		}
+		const credential = await this.resolveRefreshCredential(provider, stored, signal);
+		return credential ? { credential } : undefined;
 	}
 
 	private async resolveRefreshCredential(
@@ -676,7 +737,18 @@ class ModelsImpl implements MutableModels {
 			}
 		}
 
-		const resolution = await resolveProviderAuth(provider, this.credentials, this.authContext, { signal });
+		// What resolveProviderAuth() does for an API key, with the credential already read rather than reading it again (an
+		// availability check asks this of every provider).
+		let resolution: AuthResult | undefined;
+		try {
+			resolution = await apiKey.resolve({
+				ctx: this.authContext,
+				credential: credential?.type === "api_key" ? credential : undefined,
+				signal,
+			});
+		} catch (error) {
+			throw new ModelsError("auth", `API key auth failed for provider ${provider.id}`, { cause: error });
+		}
 		return resolution ? { source: resolution.source, type: "api_key" } : undefined;
 	}
 
@@ -688,7 +760,8 @@ class ModelsImpl implements MutableModels {
 			if (!provider) return undefined;
 			return this.checkProviderAuth(provider, await this.readCredential(providerId, signal), signal);
 		})();
-		return raceWithAbortSignal(check, signal);
+		// (Raced only against a caller's signal: nothing can abort one made here. An availability check asks every provider.)
+		return options?.signal ? raceWithAbortSignal(check, signal) : check;
 	}
 
 	private async getAuthenticatedProviders(providerId: string | undefined, signal: AbortSignal) {
@@ -869,13 +942,24 @@ class ModelsImpl implements MutableModels {
 
 		// Explicit request options win per-field; the Models-only transform runs last.
 		const apiKey = options?.apiKey ?? auth.apiKey;
-		let headers = mergeHeaders(auth.headers, options?.headers);
+		const requestModel: TModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
+		const sessionId =
+			options && "sessionId" in options && typeof options.sessionId === "string" ? options.sessionId : undefined;
+		let headers = mergeHeaders(
+			mergeHeaders(getOpenCodeSessionHeaders(requestModel, sessionId), auth.headers),
+			options?.headers,
+		);
 		if (options?.transformHeaders) headers = await options.transformHeaders(headers ?? {});
 		const env = resolution.env || options?.env ? { ...(resolution.env ?? {}), ...(options?.env ?? {}) } : undefined;
-		const requestModel: TModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
+		const identity = mergeClientIdentity(this.identity, options?.identity);
 		const { transformHeaders: _transformHeaders, ...providerOptions } = options ?? {};
-		const requestOptions = { ...providerOptions, apiKey, headers, env } as Omit<TOptions, "transformHeaders"> &
-			ProviderRequestOptions<TModel>;
+		const requestOptions = {
+			...providerOptions,
+			apiKey,
+			headers,
+			env,
+			...(identity === undefined ? {} : { identity }),
+		} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
 
 		return { requestModel, requestOptions };
 	}
@@ -886,14 +970,19 @@ class ModelsImpl implements MutableModels {
 		options?: ModelsApiStreamOptions<TApi>,
 	): AssistantMessageEventStream {
 		const transcript = normalizeContext(context);
-		return lazyStream(model, async () => {
-			const provider = this.requireChatProvider(model);
-			const { requestModel, requestOptions } = await this.applyAuth(
-				model,
-				options as ModelsApiStreamOptions<Api> | undefined,
-			);
-			return provider.stream(requestModel, transcript, requestOptions as ApiStreamOptions<TApi>);
-		});
+		return lazyStream(
+			model,
+			async () => {
+				const provider = this.requireChatProvider(model);
+				const { requestModel, requestOptions } = await this.applyAuth(
+					model,
+					options as ModelsApiStreamOptions<Api> | undefined,
+				);
+				return provider.stream(requestModel, transcript, requestOptions as ApiStreamOptions<TApi>);
+			},
+			observeModelRequest(model, options, false),
+			options?.signal,
+		);
 	}
 
 	async complete<TApi extends Api>(
@@ -906,11 +995,16 @@ class ModelsImpl implements MutableModels {
 
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
 		const transcript = normalizeContext(context);
-		return lazyStream(model, async () => {
-			const provider = this.requireChatProvider(model);
-			const { requestModel, requestOptions } = await this.applyAuth(model, options);
-			return provider.streamSimple(requestModel, transcript, requestOptions as SimpleStreamOptions);
-		});
+		return lazyStream(
+			model,
+			async () => {
+				const provider = this.requireChatProvider(model);
+				const { requestModel, requestOptions } = await this.applyAuth(model, options);
+				return provider.streamSimple(requestModel, transcript, requestOptions as SimpleStreamOptions);
+			},
+			observeModelRequest(model, options, false),
+			options?.signal,
+		);
 	}
 
 	async completeSimple(
@@ -926,14 +1020,19 @@ class ModelsImpl implements MutableModels {
 		handle: DeferredHandle,
 		options?: ModelsDeferredFetchOptions,
 	): AssistantMessageEventStream {
-		return lazyStream(model, async () => {
-			const provider = this.requireChatProvider(model);
-			if (!provider.fetchDeferred) {
-				throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
-			}
-			const { requestModel, requestOptions } = await this.applyAuth(model, options);
-			return provider.fetchDeferred(requestModel, handle, requestOptions as DeferredFetchOptions);
-		});
+		return lazyStream(
+			model,
+			async () => {
+				const provider = this.requireChatProvider(model);
+				if (!provider.fetchDeferred) {
+					throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
+				}
+				const { requestModel, requestOptions } = await this.applyAuth(model, options);
+				return provider.fetchDeferred(requestModel, handle, requestOptions as DeferredFetchOptions);
+			},
+			observeModelRequest(model, options, true),
+			options?.signal,
+		);
 	}
 
 	async fetchDeferred(
@@ -1009,7 +1108,7 @@ export interface CreateProviderOptions<TApi extends Api = Api> {
 	auth: ProviderAuth;
 	/**
 	 * Static baseline models of every type (empty for purely dynamic providers).
-	 * Models without `type` are chat models.
+	 * Models without `type` are chat models. A getter is called when the models are first needed, once.
 	 */
 	models: readonly ProviderModel<TApi>[];
 	/**
@@ -1059,7 +1158,8 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 		throw new Error(`Provider ${input.id}: at least one of "api", "images", or "classifiers" is required.`);
 	}
 
-	const baselineModels = input.models;
+	// `models` given as a getter (the built-in providers' catalogs) is read when the models are first asked for.
+	let baselineModels = Object.getOwnPropertyDescriptor(input, "models")?.get ? undefined : input.models;
 	let dynamicModels: readonly ProviderModel<TApi>[] = [];
 	const fetchModels = input.fetchModels;
 	// The models as they are merged for the dynamic models of the moment: asked for hundreds of times as Pi starts (for every
@@ -1070,6 +1170,7 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 		| undefined;
 	const mergedModels = () => {
 		if (merged?.dynamic === dynamicModels) return merged;
+		baselineModels ??= input.models;
 		const all = [...baselineModels];
 		for (const model of dynamicModels) {
 			const index = all.findIndex((entry) => getModelType(entry) === getModelType(model) && entry.id === model.id);
@@ -1090,12 +1191,18 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 	const dispatch = (
 		model: Model<Api>,
 		run: (streams: ProviderStreams) => AssistantMessageEventStream,
+		signal?: AbortSignal,
 	): AssistantMessageEventStream => {
 		const streams = apiFor(model);
 		if (!streams) {
-			return lazyStream(model, async () => {
-				throw new ModelsError("stream", `Provider ${input.id} has no API implementation for "${model.api}"`);
-			});
+			return lazyStream(
+				model,
+				async () => {
+					throw new ModelsError("stream", `Provider ${input.id} has no API implementation for "${model.api}"`);
+				},
+				undefined,
+				signal,
+			);
 		}
 		return run(streams);
 	};
@@ -1138,23 +1245,29 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 			: undefined,
 		filterModels: input.filterModels,
 		filterAllModels: input.filterAllModels,
-		stream: (model, context, options) => dispatch(model, (streams) => streams.stream(model, context, options)),
+		stream: (model, context, options) =>
+			dispatch(model, (streams) => streams.stream(model, context, options), options?.signal),
 		streamSimple: (model, context, options) =>
-			dispatch(model, (streams) => streams.streamSimple(model, context, options)),
+			dispatch(model, (streams) => streams.streamSimple(model, context, options), options?.signal),
 	};
 
 	if (streams.some((entry) => entry.fetchDeferred !== undefined)) {
 		provider.fetchDeferred = (model, handle, options) =>
-			lazyStream(model, async () => {
-				const implementation = apiFor(model);
-				if (!implementation?.fetchDeferred) {
-					throw new ModelsError(
-						"provider",
-						`Provider ${input.id} does not support deferred responses for "${model.api}"`,
-					);
-				}
-				return implementation.fetchDeferred(model, handle, options);
-			});
+			lazyStream(
+				model,
+				async () => {
+					const implementation = apiFor(model);
+					if (!implementation?.fetchDeferred) {
+						throw new ModelsError(
+							"provider",
+							`Provider ${input.id} does not support deferred responses for "${model.api}"`,
+						);
+					}
+					return implementation.fetchDeferred(model, handle, options);
+				},
+				undefined,
+				options?.signal,
+			);
 	}
 	if (streams.some((entry) => entry.cancelDeferred !== undefined)) {
 		provider.cancelDeferred = async (model, handle, options) => {
@@ -1234,6 +1347,7 @@ export function calculateCost(model: AnyModel, usage: Usage): Usage["cost"] {
 	usage.cost.cacheRead = (rates.cacheRead / 1000000) * usage.cacheRead;
 	usage.cost.cacheWrite = (rates.cacheWrite * shortWrite + rates.input * 2 * longWrite) / 1000000;
 	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
+	usage.cost.totalFromProvider = false;
 	return usage.cost;
 }
 

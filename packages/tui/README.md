@@ -251,6 +251,7 @@ interface Component {
   render(width: number): string[];
   handleInput?(data: string): void;
   handleMouse?(event: TuiMouseEvent): TuiMouseEventResult | undefined;
+  capturesViewportInput?: boolean;
   invalidate(): void;
 }
 ```
@@ -260,6 +261,7 @@ interface Component {
 | `render(width)` | Returns an array of strings, one per line. Each line **must not exceed `width`** or the TUI will error. Use `truncateToWidth()` or manual wrapping to ensure this. |
 | `handleInput?(data)` | Called when the component has focus and receives keyboard input. The `data` string contains raw terminal input (may include ANSI escape sequences). |
 | `handleMouse?(event)` | Called by `TuiAltScreen` for normalized pointer input targeted at the component. |
+| `capturesViewportInput?` | If true while the component has focus, `TuiAltScreen` passes its viewport scrolling and prompt-jump keys (`tui.altScreen.*` except search) to it instead of scrolling the viewport, as it does for a focused overlay. Set by `SelectList`, `SettingsList`, and `Editor` while autocomplete is open, so PageUp/PageDown move the selection. Only the focused component is checked: a wrapper that forwards input to a list must expose the list's value itself. Use `getSelectPageIndex(keybindings, data, selectedIndex, itemCount, pageSize)` to compute the new selection. |
 | `invalidate()` | Required. Clear any cached render state so the next `render()` starts from scratch. Components without cached render state can use an empty implementation. |
 
 The TUI appends a full SGR reset and OSC 8 reset at the end of each rendered line. Styles do not carry across lines. If you emit multi-line text with styling, reapply styles per line or use `wrapTextWithAnsi()` so styles are preserved for each wrapped line.
@@ -502,6 +504,8 @@ interface MarkdownTheme {
   strikethrough: (text: string) => string;
   underline: (text: string) => string;
   highlightCode?: (code: string, lang?: string) => string[];
+  // Shaded code blocks: a background for code blocks, ending with SGR 49 (\x1b[49m), not SGR 0.
+  codeBlockBg?: (text: string) => string;
 }
 
 interface DefaultTextStyle {
@@ -527,6 +531,8 @@ md.setText("Updated markdown");
 - Headings, bold, italic, code blocks, lists, links, blockquotes
 - HTML tags rendered as plain text
 - Optional syntax highlighting via `highlightCode`
+- Optional shaded code blocks via `codeBlockBg`: each code line is drawn on that background up to the end of its text
+  (no trailing spaces when copied), with the language above it and no ``` fence lines; wrapped lines keep the indent
 - Padding support
 - Render caching for performance
 
@@ -913,6 +919,12 @@ class CachedComponent implements Component {
   }
 }
 ```
+
+#### Render ownership
+
+Change-reporting components notify the parents that rendered them, so an unchanged subtree can reuse its cached lines. These subscriptions hold parents through weak references. A cached child can therefore be shared or mounted in a new parent without keeping discarded parents and their rendered output alive.
+
+The component tree or application must retain parents that are still in use. Explicit removal alone cannot manage subscription lifetime: a parent may be discarded without clearing its children. Dead subscriptions are pruned during registration, notification, and removal; no teardown call is required for collection.
 
 ## Example
 

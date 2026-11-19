@@ -98,14 +98,12 @@
           }
         }
 
-        // Sort children by timestamp
-        function sortChildren(node) {
+        // Sort children by timestamp. Iterative: long sessions form chains deeper than the JS call stack.
+        for (const node of nodeMap.values()) {
           node.children.sort((a, b) =>
             new Date(a.entry.timestamp).getTime() - new Date(b.entry.timestamp).getTime()
           );
-          node.children.forEach(sortChildren);
         }
-        roots.forEach(sortChildren);
 
         return roots;
       }
@@ -134,14 +132,14 @@
         const path = [];
         let current = byId.get(targetId);
         while (current) {
-          path.unshift(current);
+          path.push(current);
           // Stop if no parent or self-referencing (root)
           if (!current.parentId || current.parentId === current.id) {
             break;
           }
           current = byId.get(current.parentId);
         }
-        return path;
+        return path.reverse();
       }
 
       // Tree node lookup for finding leaves
@@ -156,12 +154,12 @@
         // Build tree node map lazily
         if (!treeNodeMap) {
           treeNodeMap = new Map();
-          const tree = buildTree();
-          function mapNodes(node) {
+          const stack = [...buildTree()];
+          while (stack.length > 0) {
+            const node = stack.pop();
             treeNodeMap.set(node.entry.id, node);
-            node.children.forEach(mapNodes);
+            for (const child of node.children) stack.push(child);
           }
-          tree.forEach(mapNodes);
         }
 
         const node = treeNodeMap.get(nodeId);
@@ -185,16 +183,22 @@
         const multipleRoots = roots.length > 1;
 
         // Mark which subtrees contain the active leaf
+        // Iterative post-order: long sessions form chains deeper than the JS call stack.
         const containsActive = new Map();
-        function markActive(node) {
-          let has = activePathIds.has(node.entry.id);
-          for (const child of node.children) {
-            if (markActive(child)) has = true;
-          }
-          containsActive.set(node, has);
-          return has;
+        const postOrder = [];
+        const pending = [...roots];
+        while (pending.length > 0) {
+          const node = pending.pop();
+          postOrder.push(node);
+          for (const child of node.children) pending.push(child);
         }
-        roots.forEach(markActive);
+        for (let i = postOrder.length - 1; i >= 0; i--) {
+          const node = postOrder[i];
+          containsActive.set(
+            node,
+            activePathIds.has(node.entry.id) || node.children.some(child => containsActive.get(child))
+          );
+        }
 
         // Stack: [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild]
         const stack = [];
@@ -313,6 +317,76 @@
         return '';
       }
 
+      // ============================================================
+      // SYSTEM MESSAGES (pure data)
+      // ============================================================
+
+      function systemContentText(content) {
+        if (typeof content === 'string') return content;
+        if (Array.isArray(content)) {
+          return content.filter(c => c.type === 'text' && c.text).map(c => c.text).join('\n');
+        }
+        return '';
+      }
+
+      /** Full prompt text of a system message, mirroring getSystemMessageText() in pi-ai. */
+      function getSystemMessageText(msg) {
+        const parts = [systemContentText(msg.content)];
+        for (const value of Object.values(msg.sections || {})) {
+          if (value !== null) parts.push(value);
+        }
+        return parts.filter(part => part.length > 0).join('\n\n');
+      }
+
+      /** Text of a later system message, mirroring renderSystemMessageUpdate() in pi-ai. */
+      function renderSystemMessageUpdate(msg) {
+        const parts = [];
+        const text = systemContentText(msg.content);
+        if (text.length > 0) parts.push(text);
+        for (const [name, value] of Object.entries(msg.sections || {})) {
+          parts.push(value === null
+            ? `Removed system prompt section "${name}".`
+            : `Updated system prompt section "${name}":\n\n${value}`);
+        }
+        return parts.join('\n\n');
+      }
+
+      function carriesSystemState(entry) {
+        return (entry.type === 'message' && entry.message.role === 'system') ||
+          (entry.type === 'compaction' && entry.systemMessage);
+      }
+
+      /**
+       * Whether a system entry starts the prompt on its branch. Later system entries
+       * patch the prompt, so they render as updates instead of a full prompt.
+       */
+      function isLeadingSystemEntry(entry) {
+        let current = entry.parentId && entry.parentId !== entry.id ? byId.get(entry.parentId) : undefined;
+        while (current) {
+          if (carriesSystemState(current)) return false;
+          if (!current.parentId || current.parentId === current.id) break;
+          current = byId.get(current.parentId);
+        }
+        return true;
+      }
+
+      /** Short description of what a later system message changes, e.g. "project_context, -rules, tools +bash". */
+      function describeSystemUpdate(msg) {
+        const parts = [];
+        if (systemContentText(msg.content).length > 0) parts.push('instructions');
+        for (const [name, value] of Object.entries(msg.sections || {})) {
+          parts.push(value === null ? `-${name}` : name);
+        }
+        const toolChanges = [
+          ...(msg.toolsAdded || []).map(t => `+${t.name}`),
+          ...(msg.toolsRemoved || []).map(t => `-${t.name}`),
+        ];
+        if (toolChanges.length > 0) parts.push(`tools ${toolChanges.join(' ')}`);
+        return parts.join(', ');
+      }
+
+      const hasSystemEntries = entries.some(entry => entry.type === 'message' && entry.message.role === 'system');
+
       /**
        * Parse a skill block from message text.
        * Returns null if the text doesn't contain a skill block.
@@ -337,6 +411,13 @@
           case 'message': {
             const msg = entry.message;
             parts.push(msg.role);
+            if (msg.role === 'system') {
+              parts.push(isLeadingSystemEntry(entry) ? 'system prompt' : 'system update');
+              parts.push(getSystemMessageText(msg));
+              for (const name of Object.keys(msg.sections || {})) parts.push(name);
+              for (const tool of [...(msg.toolsAdded || []), ...(msg.toolsRemoved || [])]) parts.push(tool.name);
+              break;
+            }
             if (msg.content) parts.push(extractContent(msg.content));
             if (msg.role === 'bashExecution' && msg.command) parts.push(msg.command);
             break;
@@ -575,15 +656,7 @@
         switch (name) {
           case 'read': {
             const path = shortenPath(String(args.path || args.file_path || ''));
-            const offset = args.offset;
-            const limit = args.limit;
-            let display = path;
-            if (offset !== undefined || limit !== undefined) {
-              const start = offset ?? 1;
-              const end = limit !== undefined ? start + limit - 1 : '';
-              display += `:${start}${end ? `-${end}` : ''}`;
-            }
-            return `[read: ${display}]`;
+            return `[read: ${path}${formatReadLineRange(args.offset, args.limit)}]`;
           }
           case 'write':
             return `[write: ${shortenPath(String(args.path || args.file_path || ''))}]`;
@@ -614,6 +687,14 @@
           .replace(/>/g, '&gt;')
           .replace(/"/g, '&quot;')
           .replace(/'/g, '&#39;');
+      }
+
+      /**
+       * A count from the session file (Pi writes a number there) as page text. A hand-made session file can hold
+       * anything in its place, so it is read as a number and escaped.
+       */
+      function formatCount(value) {
+        return escapeHtml(Number(value).toLocaleString());
       }
 
       function sanitizeMarkdownUrl(value) {
@@ -683,10 +764,17 @@
               const cmd = truncate(normalize(msg.command || ''));
               return labelHtml + `<span class="tree-role-tool">[bash]:</span> ${escapeHtml(cmd)}`;
             }
+            if (msg.role === 'system') {
+              if (isLeadingSystemEntry(entry)) {
+                return labelHtml + `<span class="tree-muted">[system prompt]</span>`;
+              }
+              const changes = describeSystemUpdate(msg);
+              return labelHtml + `<span class="tree-muted">[system update${changes ? ': ' + escapeHtml(truncate(changes)) : ''}]</span>`;
+            }
             return labelHtml + `<span class="tree-muted">[${escapeHtml(msg.role)}]</span>`;
           }
           case 'compaction':
-            return labelHtml + `<span class="tree-compaction">[compaction: ${Math.round(entry.tokensBefore/1000)}k tokens]</span>`;
+            return labelHtml + `<span class="tree-compaction">[compaction: ${escapeHtml(Math.round(entry.tokensBefore/1000))}k tokens]</span>`;
           case 'branch_summary': {
             const summary = truncate(normalize(entry.summary || ''));
             return labelHtml + `<span class="tree-branch-summary">[branch summary]:</span> ${escapeHtml(summary)}`;
@@ -823,6 +911,23 @@
         if (typeof value === 'string') return value;
         if (value == null) return '';
         return null;
+      }
+
+      // Mirrors ../tools/render-utils.ts.
+      function parseLineNumber(value) {
+        if (typeof value === 'string' && value.trim() !== '') value = Number(value);
+        return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+      }
+
+      function formatReadLineRange(offset, limit) {
+        if (offset == null && limit == null) return '';
+        const start = offset == null ? 1 : parseLineNumber(offset);
+        if (start === undefined) return '';
+        if (limit == null) return `:${start}`;
+        const count = parseLineNumber(limit);
+        if (count === undefined) return '';
+        const end = start + count - 1;
+        return `:${start}${end ? `-${end}` : ''}`;
       }
 
       function getLanguageFromPath(filePath) {
@@ -965,14 +1070,10 @@
           }
           case 'read': {
             const filePath = str(args.file_path ?? args.path);
-            const offset = args.offset;
-            const limit = args.limit;
-
+            const readLineRange = formatReadLineRange(args.offset, args.limit);
             let pathHtml = filePath === null ? invalidArg : escapeHtml(shortenPath(filePath || ''));
-            if (filePath !== null && (offset !== undefined || limit !== undefined)) {
-              const startLine = offset ?? 1;
-              const endLine = limit !== undefined ? startLine + limit - 1 : '';
-              pathHtml += `<span class="line-numbers">:${startLine}${endLine ? '-' + endLine : ''}</span>`;
+            if (filePath !== null && readLineRange) {
+              pathHtml += `<span class="line-numbers">${escapeHtml(readLineRange)}</span>`;
             }
 
             html += `<div class="tool-header"><span class="tool-name">read</span> <span class="tool-path">${pathHtml}</span></div>`;
@@ -1299,13 +1400,31 @@
             if (msg.cancelled) {
               html += '<div style="color: var(--warning)">(cancelled)</div>';
             } else if (msg.exitCode !== 0 && msg.exitCode !== null) {
-              html += `<div style="color: var(--error)">(exit ${msg.exitCode})</div>`;
+              html += `<div style="color: var(--error)">(exit ${escapeHtml(msg.exitCode)})</div>`;
             }
             html += '</div>';
             return html;
           }
 
           if (msg.role === 'toolResult') return '';
+
+          if (msg.role === 'system') {
+            let html = '';
+            if (isLeadingSystemEntry(entry)) {
+              const text = getSystemMessageText(msg);
+              if (text) html += renderSystemPromptBlock('System Prompt', text);
+              html += renderToolsList('Available Tools', msg.toolsAdded);
+            } else {
+              const text = renderSystemMessageUpdate(msg);
+              const changes = describeSystemUpdate(msg);
+              if (text) html += renderSystemPromptBlock(`System Prompt Update${changes ? ': ' + changes : ''}`, text);
+              html += renderToolsList('Tools Added', msg.toolsAdded);
+              if (msg.toolsRemoved && msg.toolsRemoved.length > 0) {
+                html += `<div class="tools-list"><div class="tools-header">Tools Removed</div><div class="tools-content">${msg.toolsRemoved.map(t => `<div class="tool-item"><span class="tool-item-name">${escapeHtml(t.name)}</span></div>`).join('')}</div></div>`;
+              }
+            }
+            return html ? `<div class="system-entry" id="${entryDomId}">${tsHtml}${html}</div>` : '';
+          }
         }
 
         if (entry.type === 'model_change') {
@@ -1315,8 +1434,8 @@
         if (entry.type === 'compaction') {
           return `<div class="compaction" id="${entryDomId}" onclick="if(window.getSelection().toString())return;this.classList.toggle('expanded')">
             <div class="compaction-label">[compaction]</div>
-            <div class="compaction-collapsed">Compacted from ${entry.tokensBefore.toLocaleString()} tokens</div>
-            <div class="compaction-content"><strong>Compacted from ${entry.tokensBefore.toLocaleString()} tokens</strong>\n\n${escapeHtml(entry.summary)}</div>
+            <div class="compaction-collapsed">Compacted from ${formatCount(entry.tokensBefore)} tokens</div>
+            <div class="compaction-content"><strong>Compacted from ${formatCount(entry.tokensBefore)} tokens</strong>\n\n${escapeHtml(entry.summary)}</div>
           </div>`;
         }
 
@@ -1346,7 +1465,7 @@
         let userMessages = 0, assistantMessages = 0, toolResults = 0;
         let customMessages = 0, compactions = 0, branchSummaries = 0, toolCalls = 0;
         const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-        const cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+        const cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
         const models = new Set();
 
         for (const entry of entryList) {
@@ -1357,15 +1476,24 @@
               assistantMessages++;
               if (msg.model) models.add(msg.provider ? `${msg.provider}/${msg.model}` : msg.model);
               if (msg.usage) {
-                tokens.input += msg.usage.input || 0;
-                tokens.output += msg.usage.output || 0;
-                tokens.cacheRead += msg.usage.cacheRead || 0;
-                tokens.cacheWrite += msg.usage.cacheWrite || 0;
+                // (Numbers, as Pi writes them; read as numbers, as a session file can hold anything there.)
+                tokens.input += Number(msg.usage.input) || 0;
+                tokens.output += Number(msg.usage.output) || 0;
+                tokens.cacheRead += Number(msg.usage.cacheRead) || 0;
+                tokens.cacheWrite += Number(msg.usage.cacheWrite) || 0;
                 if (msg.usage.cost) {
-                  cost.input += msg.usage.cost.input || 0;
-                  cost.output += msg.usage.cost.output || 0;
-                  cost.cacheRead += msg.usage.cost.cacheRead || 0;
-                  cost.cacheWrite += msg.usage.cost.cacheWrite || 0;
+                  const componentTotal =
+                    (Number(msg.usage.cost.input) || 0) +
+                    (Number(msg.usage.cost.output) || 0) +
+                    (Number(msg.usage.cost.cacheRead) || 0) +
+                    (Number(msg.usage.cost.cacheWrite) || 0);
+                  cost.input += Number(msg.usage.cost.input) || 0;
+                  cost.output += Number(msg.usage.cost.output) || 0;
+                  cost.cacheRead += Number(msg.usage.cost.cacheRead) || 0;
+                  cost.cacheWrite += Number(msg.usage.cost.cacheWrite) || 0;
+                  // Provider-reported totals can intentionally differ from catalog-estimated components.
+                  // Fall back to the component sum for sessions written before cost.total was recorded.
+                  cost.total += typeof msg.usage.cost.total === 'number' ? msg.usage.cost.total : componentTotal;
                 }
               }
               toolCalls += msg.content.filter(c => c.type === 'toolCall').length;
@@ -1386,7 +1514,7 @@
       const globalStats = computeStats(entries);
 
       function renderHeader() {
-        const totalCost = globalStats.cost.input + globalStats.cost.output + globalStats.cost.cacheRead + globalStats.cost.cacheWrite;
+        const totalCost = globalStats.cost.total;
 
         const tokenParts = [];
         if (globalStats.tokens.input) tokenParts.push(`↑${formatTokens(globalStats.tokens.input)}`);
@@ -1424,30 +1552,39 @@
             </div>
           </div>`;
 
-        // Render system prompt (user's base prompt, applies to all providers)
-        if (systemPrompt) {
-          const lines = systemPrompt.split('\n');
-          const previewLines = 10;
-          if (lines.length > previewLines) {
-            const preview = lines.slice(0, previewLines).join('\n');
-            const remaining = lines.length - previewLines;
-            html += `<div class="system-prompt expandable" onclick="if(window.getSelection().toString())return;this.classList.toggle('expanded')">
-              <div class="system-prompt-header">System Prompt</div>
-              <div class="system-prompt-preview">${escapeHtml(preview)}</div>
-              <div class="system-prompt-expand-hint">... (${remaining} more lines, click to expand)</div>
-              <div class="system-prompt-full">${escapeHtml(systemPrompt)}</div>
-            </div>`;
-          } else {
-            html += `<div class="system-prompt">
-              <div class="system-prompt-header">System Prompt</div>
-              <div class="system-prompt-full" style="display: block">${escapeHtml(systemPrompt)}</div>
-            </div>`;
-          }
+        // Sessions with system entries render the prompt and tools in the transcript, where they
+        // occur. Older sessions have none, so fall back to the exporting agent's current state.
+        if (!hasSystemEntries) {
+          if (systemPrompt) html += renderSystemPromptBlock('System Prompt', systemPrompt);
+          html += renderToolsList('Available Tools', tools);
         }
 
-        if (tools && tools.length > 0) {
-          html += `<div class="tools-list">
-            <div class="tools-header">Available Tools</div>
+        return html;
+      }
+
+      function renderSystemPromptBlock(title, text) {
+        const lines = text.split('\n');
+        const previewLines = 10;
+        if (lines.length > previewLines) {
+          const preview = lines.slice(0, previewLines).join('\n');
+          const remaining = lines.length - previewLines;
+          return `<div class="system-prompt expandable" onclick="if(window.getSelection().toString())return;this.classList.toggle('expanded')">
+            <div class="system-prompt-header">${escapeHtml(title)}</div>
+            <div class="system-prompt-preview">${escapeHtml(preview)}</div>
+            <div class="system-prompt-expand-hint">... (${remaining} more lines, click to expand)</div>
+            <div class="system-prompt-full">${escapeHtml(text)}</div>
+          </div>`;
+        }
+        return `<div class="system-prompt">
+          <div class="system-prompt-header">${escapeHtml(title)}</div>
+          <div class="system-prompt-full" style="display: block">${escapeHtml(text)}</div>
+        </div>`;
+      }
+
+      function renderToolsList(title, tools) {
+        if (!tools || tools.length === 0) return '';
+        return `<div class="tools-list">
+            <div class="tools-header">${escapeHtml(title)}</div>
             <div class="tools-content">
               ${tools.map(t => {
                 const hasParams = t.parameters && typeof t.parameters === 'object' && t.parameters.properties && Object.keys(t.parameters.properties).length > 0;
@@ -1472,9 +1609,6 @@
               }).join('')}
             </div>
           </div>`;
-        }
-
-        return html;
       }
 
       // ============================================================
@@ -1609,7 +1743,8 @@
               text: match[2],
               tokens: this.lexer.inlineTokens(match[2])
             };
-          }
+          },
+          emStrong: markedCjkFriendly().tokenizer.emStrong
         },
         renderer: {
           // Sanitize link URLs with a scheme allow-list. Browsers strip C0
@@ -1617,7 +1752,11 @@
           link(token) {
             const href = sanitizeMarkdownUrl(token.href);
             if (href === null) {
-              return this.parser.parseInline(token.tokens);
+              // Not a link (a local file, another scheme): its text, and where it goes as text, as the terminal shows it.
+              const label = this.parser.parseInline(token.tokens);
+              return token.text === token.href
+                ? label
+                : label + ' <span class="markdown-link-url">(' + escapeHtml(token.href) + ')</span>';
             }
             let out = '<a href="' + escapeHtml(href) + '"';
             if (token.title) {
@@ -1626,17 +1765,19 @@
             out += '>' + this.parser.parseInline(token.tokens) + '</a>';
             return out;
           },
-          // Sanitize image src URLs with the same scheme allow-list.
+          // Images are shown as links to them, not loaded: opening the page must not fetch anything, as an image URL
+          // can carry text from the session out to its server. Sanitized with the same scheme allow-list as links.
           image(token) {
             const href = sanitizeMarkdownUrl(token.href);
-            if (href === null) {
-              return escapeHtml(token.text || '');
+            const text = escapeHtml(token.text || token.href || '');
+            if (!href) {
+              return text;
             }
-            let out = '<img src="' + escapeHtml(href) + '" alt="' + escapeHtml(token.text || '') + '"';
+            let out = '<a href="' + escapeHtml(href) + '" class="markdown-image-link"';
             if (token.title) {
               out += ' title="' + escapeHtml(token.title) + '"';
             }
-            out += '>';
+            out += '>' + text + '</a>';
             return out;
           },
           // Code blocks: syntax highlight, no HTML escaping

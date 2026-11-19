@@ -2,13 +2,23 @@
  * CLI argument parsing and help display
  */
 
+import { existsSync } from "node:fs";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import chalk from "chalk";
-import { COMMAND_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR, PRODUCT_NAME } from "../config.ts";
+import {
+	COMMAND_NAME,
+	CONFIG_DIR_NAME,
+	ENV_AGENT_DIR,
+	ENV_SESSION_DIR,
+	expandTildePath,
+	PRODUCT_NAME,
+} from "../config.ts";
 import type { ExtensionFlag } from "../core/extensions/types.ts";
 import { getToolListError, type TuiMode } from "../core/settings-manager.ts";
+import { PIBOLT } from "../pi-bolt.ts";
+import { chalk } from "../utils/lazy-packages.ts";
+import { isLocalPath } from "../utils/paths.ts";
 
-export type Mode = "text" | "json" | "rpc";
+export type Mode = "text" | "json" | "rpc" | "acp" | "mcp";
 
 export interface Args {
 	provider?: string;
@@ -51,6 +61,8 @@ export interface Args {
 	tuiMode?: TuiMode;
 	verbose?: boolean;
 	projectTrustOverride?: boolean;
+	/** Pi-Bolt, Herdr: report as Herdr's official Pi integration and re-exec under the name `pi` (herdr/pi-name.ts). */
+	herdrPi?: boolean;
 	messages: string[];
 	fileArgs: string[];
 	/** Unknown flags (potentially extension flags) - map of flag name to value */
@@ -67,6 +79,14 @@ export function isValidThinkingLevel(level: string): level is ThinkingLevel {
 export function normalizeSessionName(value: string): string | undefined {
 	const name = value.trim();
 	return name.length > 0 ? name : undefined;
+}
+
+/**
+ * The local `-e` paths that do not exist. `--version` prints and exits before any extension loads, so without this a
+ * mistyped path reads as a valid one; `builtin:` names and package sources are left to the loader, which owns them.
+ */
+export function missingExtensionPaths(paths: string[] | undefined): string[] {
+	return (paths ?? []).filter((value) => isLocalPath(value) && !existsSync(expandTildePath(value)));
 }
 
 export function parseArgs(args: string[]): Args {
@@ -96,18 +116,22 @@ export function parseArgs(args: string[]): Args {
 		} else if (arg === "--mode") {
 			const mode = args[i + 1];
 			if (mode === undefined || mode.startsWith("-")) {
-				result.diagnostics.push({ type: "error", message: "--mode requires text, json, or rpc" });
+				result.diagnostics.push({ type: "error", message: "--mode requires text, json, rpc, acp, or mcp" });
 				continue;
 			}
 			i++;
-			if (mode !== "text" && mode !== "json" && mode !== "rpc") {
+			if (mode !== "text" && mode !== "json" && mode !== "rpc" && mode !== "acp" && mode !== "mcp") {
 				result.diagnostics.push({
 					type: "error",
-					message: `Invalid mode "${mode}". Valid values: text, json, rpc`,
+					message: `Invalid mode "${mode}". Valid values: text, json, rpc, acp, mcp`,
 				});
 				continue;
 			}
 			result.mode = mode;
+		} else if (arg === "--acp") {
+			result.mode = "acp";
+		} else if (arg === "--mcp") {
+			result.mode = "mcp";
 		} else if (arg === "--continue" || arg === "-c") {
 			result.continue = true;
 		} else if (arg === "--resume" || arg === "-r") {
@@ -244,6 +268,8 @@ export function parseArgs(args: string[]): Args {
 			result.projectTrustOverride = false;
 		} else if (arg === "--offline") {
 			result.offline = true;
+		} else if (arg === "--herdr-pi") {
+			result.herdrPi = true;
 		} else if (arg.startsWith("@")) {
 			result.fileArgs.push(arg.slice(1)); // Remove @ prefix
 		} else if (arg.startsWith("--")) {
@@ -293,9 +319,11 @@ ${chalk.bold("Commands:")}
   ${COMMAND_NAME} update [source|self|pi]   Update ${PRODUCT_NAME}, extensions, or model catalogs
   ${COMMAND_NAME} list                      List installed extensions from settings
   ${COMMAND_NAME} config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
-  ${COMMAND_NAME} auth <command>            Print credentials or check provider readiness
-  ${COMMAND_NAME} mcp <command>             Check MCP servers, sign in to or out of OAuth servers
-  ${COMMAND_NAME} <command> --help          Show help for install/remove/uninstall/update/list/config/auth/mcp
+  ${COMMAND_NAME} auth <command>            Log in or out, print credentials, or check provider readiness
+  ${COMMAND_NAME} mcp <command>             Manage MCP servers
+  ${COMMAND_NAME} service <command>         Remote control for paired phones at login: install/uninstall/status/pair/logs
+  ${COMMAND_NAME} remote-control <command>  Turn remote control (the Pi-Bolt phone app) on or off: enable/disable/status
+${PIBOLT ? `  ${COMMAND_NAME} doctor                    Print a report of this installation, to paste into an issue\n  ${COMMAND_NAME} compile [options]         Compile the installed extensions into ${PRODUCT_NAME}\n` : ""}  ${COMMAND_NAME} <command> --help          Show help for install/remove/uninstall/update/list/config/auth/mcp
 
 ${chalk.bold("Options:")}
   --provider <name>              Provider to search for --model (requires --model)
@@ -303,13 +331,15 @@ ${chalk.bold("Options:")}
   --api-key <key>                API key (defaults to env vars)
   --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
-  --mode <mode>                  Output mode: text (default), json, or rpc
+  --mode <mode>                  Output mode: text (default), json, rpc, acp, or mcp
+  --acp                          Agent Client Protocol server on stdin/stdout, for editors (same as --mode acp)
+  --mcp                          Model Context Protocol server on stdin/stdout, for other agents (same as --mode mcp)
   --print, -p                    Non-interactive mode: process prompt and exit
-  --continue, -c                 Continue previous session
-  --resume, -r                   Select a session to resume
-  --session <path|id>            Use specific session file or partial UUID
-  --session-id <id>              Use exact project session ID, creating it if missing
-  --fork <path|id>               Fork specific session file or partial UUID into a new session
+  --continue, -c                 Continue the most recent session for the current directory
+  --resume, -r                   Pick a session to resume
+  --session <path|id>            Open a session by file path or full/partial ID
+  --session-id <id>              Use the current directory's existing session with the ID, creating it otherwise
+  --fork <path|id>               Fork a session by file path or full/partial ID into the current directory
   --session-dir <dir>            Directory for session storage and lookup
   --no-session                   Don't save session (ephemeral)
   --name, -n <name>              Set session display name
@@ -334,14 +364,14 @@ ${chalk.bold("Options:")}
   --use-theme <name[/name]>      Set the initial interactive theme for this run
   --no-themes                    Disable theme discovery and loading
   --no-context-files, -nc        Disable AGENTS.md and CLAUDE.md discovery and loading
-  --export <file>                Export session file to HTML and exit
+  --export <file> [output]       Export session file to HTML and exit
   --list-models [search]         List available models (with optional fuzzy search)
   --verbose                      Force verbose startup (overrides quietStartup setting)
   --tui-mode <mode>              TUI mode: fullscreen (default) or regular
   --approve, -a                  Trust project-local files for this run
   --no-approve, -na              Ignore project-local files for this run
   --offline                      Disable startup network operations (same as PI_OFFLINE=1)
-  --                             End option parsing; treat remaining arguments as messages/files
+${PIBOLT ? "  --herdr-pi                     Herdr: report as its official Pi integration (restores with `pi-bolt --herdr-pi`)\n" : ""}  --                             End option parsing; treat remaining arguments as messages/files
   --help, -h                     Show this help
   --version, -v                  Show version number
 
@@ -463,6 +493,7 @@ ${chalk.bold("Environment Variables:")}
   ${ENV_SESSION_DIR.padEnd(32)} - Session storage directory (overridden by --session-dir)
   PI_PACKAGE_DIR                   - Override package directory (for Nix/Guix store paths)
   PI_OFFLINE                       - Disable startup network operations when set to 1/true/yes
+  PI_SELF_UPDATE_COMMAND           - Command pi update runs to update pi itself ({packageName}, {version}, {installSpec})
   PI_TELEMETRY                     - Override install telemetry when set to 1/true/yes or 0/false/no
   PI_SHARE_VIEWER_URL              - Base URL for /share command (default: https://pi.dev/session/)
 

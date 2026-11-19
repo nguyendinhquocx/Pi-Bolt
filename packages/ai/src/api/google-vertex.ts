@@ -25,8 +25,9 @@ import type {
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { providerHeadersToRecord } from "../utils/headers.ts";
-import { getPiUserAgent } from "../utils/pi-user-agent.ts";
+import { type ClientIdentity, getIdentityHeaders } from "../utils/identity.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
+import { beginRequestCache, type RequestCacheRun } from "../utils/request-cache.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getSystemMessageText } from "../utils/text.ts";
 import { collapseSystemMessages, getCurrentTools, getInitialSystemMessage } from "../utils/transcript.ts";
@@ -92,6 +93,7 @@ export const stream: StreamFunction<"google-vertex", GoogleVertexOptions> = (
 			timestamp: Date.now(),
 		};
 
+		let cache: RequestCacheRun | undefined;
 		try {
 			if (options?.fetch && options.fetch !== globalThis.fetch) {
 				throw new Error("Custom fetch is not supported by the Google Vertex adapter");
@@ -99,14 +101,23 @@ export const stream: StreamFunction<"google-vertex", GoogleVertexOptions> = (
 			const apiKey = resolveApiKey(options);
 			// Create the client using either a Vertex API key, if provided, or ADC with project and location
 			const client = apiKey
-				? createClientWithApiKey(model, apiKey, options?.headers)
-				: createClient(model, resolveProject(options), resolveLocation(options), options?.headers, options?.env);
-			let params = buildParams(model, normalizedContext, options);
+				? createClientWithApiKey(model, apiKey, options?.headers, options?.identity)
+				: createClient(
+						model,
+						resolveProject(options),
+						resolveLocation(options),
+						options?.headers,
+						options?.env,
+						options?.identity,
+					);
+			cache = beginRequestCache("google-vertex", options, [model.id, model.provider, model.api, model.input]);
+			let params = buildParams(model, normalizedContext, options, cache);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
 				params = nextParams as GenerateContentParameters;
 			}
 			const googleStream = await retryGoogleRequest(() => client.models.generateContentStream(params), options);
+			cache?.end();
 
 			stream.push({ type: "start", partial: output });
 			let currentBlock: TextContent | ThinkingContent | null = null;
@@ -294,12 +305,7 @@ export const stream: StreamFunction<"google-vertex", GoogleVertexOptions> = (
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
-			// Remove internal index property used during streaming
-			for (const block of output.content) {
-				if ("index" in block) {
-					delete (block as { index?: number }).index;
-				}
-			}
+			cache?.end();
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = formatProviderError(normalizeProviderError(error));
 			stream.push({ type: "error", reason: output.stopReason, error: output });
@@ -360,6 +366,7 @@ function createClient(
 	location: string,
 	optionsHeaders?: ProviderHeaders,
 	env?: ProviderEnv,
+	identity?: ClientIdentity,
 ): GoogleGenAI {
 	const googleAuthOptions = buildGoogleAuthOptions(env);
 	return new GoogleGenAI({
@@ -368,7 +375,7 @@ function createClient(
 		location,
 		apiVersion: API_VERSION,
 		...(googleAuthOptions ? { googleAuthOptions } : {}),
-		httpOptions: buildHttpOptions(model, optionsHeaders),
+		httpOptions: buildHttpOptions(model, optionsHeaders, identity),
 	});
 }
 
@@ -376,16 +383,21 @@ function createClientWithApiKey(
 	model: Model<"google-vertex">,
 	apiKey: string,
 	optionsHeaders?: ProviderHeaders,
+	identity?: ClientIdentity,
 ): GoogleGenAI {
 	return new GoogleGenAI({
 		vertexai: true,
 		apiKey,
 		apiVersion: API_VERSION,
-		httpOptions: buildHttpOptions(model, optionsHeaders),
+		httpOptions: buildHttpOptions(model, optionsHeaders, identity),
 	});
 }
 
-function buildHttpOptions(model: Model<"google-vertex">, optionsHeaders?: ProviderHeaders): HttpOptions | undefined {
+function buildHttpOptions(
+	model: Model<"google-vertex">,
+	optionsHeaders?: ProviderHeaders,
+	identity?: ClientIdentity,
+): HttpOptions | undefined {
 	const httpOptions: HttpOptions = {};
 	const baseUrl = resolveCustomBaseUrl(model.baseUrl);
 	if (baseUrl) {
@@ -396,7 +408,7 @@ function buildHttpOptions(model: Model<"google-vertex">, optionsHeaders?: Provid
 		}
 	}
 
-	const headers = providerHeadersToRecord({ "User-Agent": getPiUserAgent(), ...model.headers, ...optionsHeaders });
+	const headers = providerHeadersToRecord(getIdentityHeaders(model, identity), model.headers, optionsHeaders);
 	if (headers) {
 		httpOptions.headers = headers;
 	}
@@ -463,8 +475,9 @@ function buildParams(
 	model: Model<"google-vertex">,
 	context: TranscriptContext,
 	options: GoogleVertexOptions = {},
+	cache?: RequestCacheRun,
 ): GenerateContentParameters {
-	const contents = convertMessages(model, context);
+	const contents = convertMessages(model, context, cache);
 	const initialSystemMessage = getInitialSystemMessage(context.messages);
 	const currentTools = getCurrentTools(context.messages);
 

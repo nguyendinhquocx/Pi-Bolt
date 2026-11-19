@@ -4,27 +4,39 @@
 #   curl -fsSL https://pi-bolt.opensec.in/install.sh | sh
 #
 # Downloads a release, verifies its SHA-256 checksum, installs it to ~/.pi-bolt and links `pi-bolt` into ~/.local/bin. Run
-# it again to reinstall, update or uninstall. The executable comes from the npm registry (a CDN, fast in most places) and
+# it again to reinstall, update or uninstall. In Termux (Android) it also installs Termux's glibc, which runs Pi-Bolt, and links
+# `pi-bolt` into $PREFIX/bin. The executable comes from the npm registry (a CDN, fast in most places) and
 # falls back to GitHub; the checksums always come from the GitHub release, so a download from npm is checked against them.
 #
 # Environment:
 #   PIBOLT_VERSION   a release tag such as bolt-v0.2.0 (default: the latest release)
-#   PIBOLT_VARIANT   on Linux x64, x64-baseline or x64-jit (default: x64 on CPUs with AVX2, x64-baseline otherwise); on macOS
-#                    arm64 or arm64-jit (Apple silicon; default arm64)
+#   PIBOLT_CHANNEL   stable (the latest release; the default) or beta (the newest release, pre-releases included), for this
+#                    installation and its updates (`pi-bolt update --channel` changes it)
+#   PIBOLT_VARIANT   on Linux x86-64, x64, x64-baseline or x64-jit (default: x64 on CPUs with AVX2, x64-baseline otherwise);
+#                    with musl (Alpine), x64-musl, x64-musl-baseline or x64-musl-jit (the same default);
+#                    on Linux ARM64 and in Termux, arm64 or arm64-jit (default arm64); on macOS arm64 or arm64-jit (Apple
+#                    silicon; default arm64)
 #   PIBOLT_INSTALL   where to install (default: ~/.pi-bolt)
-#   PIBOLT_BIN_DIR   where to link the `pi-bolt` command (default: ~/.local/bin)
+#   PIBOLT_BIN_DIR   where to link the `pi-bolt` command (default: ~/.local/bin; in Termux $PREFIX/bin)
 #   PIBOLT_YES=1     do not ask: take the default action and do not offer to start Pi-Bolt
 #   PIBOLT_LAUNCHER=1  used by the npm package's first run: download only, no menu, link or prompts
 #   PIBOLT_CONNECTIONS  connections to download over at once (default: 4; 1 for a single connection)
 #   PIBOLT_SOURCE    where to download the executable from: auto (npm, then GitHub; the default), npm or github
 #   PIBOLT_NPM_REGISTRY  the npm registry or mirror to use (default: https://registry.npmjs.org)
+#   PIBOLT_UNVERIFIED  the SHA-256 of a release's SHA256SUMS (the installer shows it), to install that download without a
+#                    check of its signature: where nothing here can check it (no OpenSSL 3, OpenSSH 8.1 or Pi-Bolt installed
+#                    before), or for a release from before 0.6.0, which has none. It matches those checksums only, so a value
+#                    left in the environment does nothing for another download; the npm package's first run ignores it. The
+#                    checksum is still checked, and a signature that does not verify always stops the install.
+#   PIBOLT_DOWNLOAD_BASE  a mirror of a release to download everything from (its signatures too); needs PIBOLT_VERSION when
+#                    which release is the latest cannot be found out
 #   PIBOLT_EXTENSIONS  yes or no: whether to install OpenSec's optional extensions (opensec-pi-subagents, opensec-pi-todo, opensec-pi-fff)
 #                    without asking. Without it the installer asks when it can; a run that cannot ask, or PIBOLT_YES=1,
 #                    installs none. They are installed at the versions the release pins (its extensions.txt, covered by the
 #                    signed checksums), and only if the registry's tarball has the pinned integrity.
 
 # The public key that releases are signed with (keys/release.pub in the repository; scripts/sign-release.sh), from 0.6.0. A
-# release from before has no signature, which is said.
+# release from before has no signature: it is installed only with PIBOLT_UNVERIFIED.
 RELEASE_KEY="-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAoLboJqtKaoISPqffk03vHZr+1sRBG3uIRIWeKOew+aY=
 -----END PUBLIC KEY-----"
@@ -33,6 +45,7 @@ ESC=$(printf '\033')
 CR=$(printf '\r')
 ETX=$(printf '\003')
 REPO="https://github.com/opensec-git/Pi-Bolt"
+API="https://api.github.com/repos/opensec-git/Pi-Bolt"
 NPM_REGISTRY="${PIBOLT_NPM_REGISTRY:-https://registry.npmjs.org}"
 
 main() {
@@ -40,9 +53,33 @@ main() {
 	if [ "$(uname -s)" = Darwin ]; then PLATFORM=darwin; else PLATFORM=linux; fi
 	VERSION="${PIBOLT_VERSION:-latest}"
 	INSTALL="${PIBOLT_INSTALL:-$HOME/.pi-bolt}"
-	BIN_DIR="${PIBOLT_BIN_DIR:-$HOME/.local/bin}"
+	TERMUX=""
+	if is_termux; then TERMUX=1; fi
+	# "-musl" on a musl-based Linux such as Alpine: its builds are named so (pi-bolt-linux-x64-musl). Not in Termux, which runs
+	# the glibc builds with Termux's glibc.
+	MUSL=""
+	if [ "$PLATFORM" = linux ] && [ -z "$TERMUX" ] && is_musl; then MUSL=-musl; fi
+	if [ -n "$TERMUX" ]; then BIN_DIR="${PIBOLT_BIN_DIR:-$PREFIX/bin}"; else BIN_DIR="${PIBOLT_BIN_DIR:-$HOME/.local/bin}"; fi
 	LAUNCHER="${PIBOLT_LAUNCHER:-0}"
 	setup_style
+	# (The npm package's first run is not asked for by the user: nothing is installed there without a signature check.)
+	[ "$LAUNCHER" != 1 ] || unset PIBOLT_UNVERIFIED
+	case "$VERSION" in
+	latest) ;;
+	bolt-v[0-9]*.[0-9]*.[0-9]*) case "${VERSION#bolt-v}" in *[!0-9.]*) fail "PIBOLT_VERSION must be a release tag such as bolt-v1.0.3" ;; esac ;;
+	*) fail "PIBOLT_VERSION must be a release tag such as bolt-v1.0.3" ;;
+	esac
+	case "${PIBOLT_CHANNEL:-}" in
+	"" | stable) ;;
+	beta)
+		# (The newest release is looked up once, and everything is downloaded from that tag.)
+		if [ "$VERSION" = latest ] && [ -z "${PIBOLT_DOWNLOAD_BASE:-}" ]; then
+			tag=$(newest_release) && [ -n "$tag" ] || fail "could not find the newest release ($API/releases): try again, or set PIBOLT_VERSION"
+			VERSION="bolt-v$tag"
+		fi
+		;;
+	*) fail "PIBOLT_CHANNEL must be stable or beta" ;;
+	esac
 
 	check_file="$(mktemp)"
 	preflight >"$check_file" 2>&1 &
@@ -65,17 +102,33 @@ main() {
 	SHOWN_VERSION=$(cat "$version_file")
 	rm -f "$version_file"
 	[ -n "$SHOWN_VERSION" ] || SHOWN_VERSION="$VERSION"
+	# A mirror's checksums are taken for the release asked for only: without knowing which one that is, an older release (signed
+	# all the same) could be served as the latest.
+	if [ -n "${PIBOLT_DOWNLOAD_BASE:-}" ]; then
+		case "$SHOWN_VERSION" in
+		[0-9]*.[0-9]*.[0-9]*) ;;
+		*) fail "which release is the latest could not be found out ($REPO/releases/latest), and a mirror (PIBOLT_DOWNLOAD_BASE) is taken for the release asked for only: set PIBOLT_VERSION to the release it serves, such as bolt-v1.0.3" ;;
+		esac
+	fi
 
 	VARIANT="${PIBOLT_VARIANT:-}"
 	if [ -z "$VARIANT" ]; then
-		if [ "$PLATFORM" = darwin ]; then VARIANT=arm64
-		elif grep -qw avx2 /proc/cpuinfo 2>/dev/null; then VARIANT=x64; else VARIANT=x64-baseline; fi
+		if [ "$PLATFORM" = darwin ] || is_arm64; then VARIANT=arm64
+		elif grep -qw avx2 /proc/cpuinfo 2>/dev/null; then VARIANT=x64$MUSL; else VARIANT=x64$MUSL-baseline; fi
 	fi
 	case "$PLATFORM-$VARIANT" in
-	linux-x64 | linux-x64-baseline | linux-x64-jit | darwin-arm64 | darwin-arm64-jit) ;;
+	darwin-arm64 | darwin-arm64-jit) ;;
 	darwin-*) fail "PIBOLT_VARIANT must be arm64 or arm64-jit on macOS" ;;
-	*) fail "PIBOLT_VARIANT must be x64, x64-baseline or x64-jit" ;;
+	linux-arm64 | linux-arm64-jit) is_arm64 || fail "PIBOLT_VARIANT must be x64$MUSL, x64$MUSL-baseline or x64$MUSL-jit on x86-64" ;;
+	# (A musl build needs musl's loader, a glibc build glibc's: neither runs on the other.)
+	linux-x64 | linux-x64-baseline | linux-x64-jit | linux-x64-musl | linux-x64-musl-baseline | linux-x64-musl-jit)
+		! is_arm64 || fail "PIBOLT_VARIANT must be arm64 or arm64-jit on ARM64"
+		case "$VARIANT" in x64-musl*) [ -n "$MUSL" ] || fail "PIBOLT_VARIANT $VARIANT is for musl systems such as Alpine: this one has glibc (x64, x64-baseline or x64-jit)" ;;
+		*) [ -z "$MUSL" ] || fail "PIBOLT_VARIANT must be x64-musl, x64-musl-baseline or x64-musl-jit on a musl system such as this one" ;;
+		esac ;;
+	*) if is_arm64; then fail "PIBOLT_VARIANT must be arm64 or arm64-jit on ARM64"; else fail "PIBOLT_VARIANT must be x64$MUSL, x64$MUSL-baseline or x64$MUSL-jit"; fi ;;
 	esac
+	[ -z "$TERMUX" ] || setup_termux
 	case "${PIBOLT_SOURCE:-auto}" in
 	auto | npm | github) ;;
 	*) fail "PIBOLT_SOURCE must be auto, npm or github" ;;
@@ -91,6 +144,8 @@ main() {
 
 	EXISTING=""
 	if [ -x "$INSTALL/$NAME/pi" ]; then EXISTING="$INSTALL/$NAME"; fi
+	COMPILED_BEFORE=""
+	if [ -n "$EXISTING" ] && has_compiled_extensions "$EXISTING"; then COMPILED_BEFORE=1; fi
 	choose_action
 	case "$ACTION" in
 	none) exit 0 ;;
@@ -102,15 +157,23 @@ main() {
 	esac
 
 	install_release
+	# The channel this installation's updates take (Pi-Bolt reads <install>/channel; stable, the default, is no file).
+	case "${PIBOLT_CHANNEL:-}" in
+	beta) printf 'beta\n' >"$INSTALL/channel" ;;
+	stable) rm -f "$INSTALL/channel" ;;
+	esac
 	mkdir -p "$BIN_DIR"
-	ln -sfn "$INSTALL/$NAME/pi" "$BIN_DIR/pi-bolt"
+	ln -sfn "$INSTALL/$NAME/$(command_of_build)" "$BIN_DIR/pi-bolt"
 	# Pi-Bolt keeps the packages only it runs (OpenSec's extensions) out of Pi's list, which it does as it starts: once now, so
 	# that Pi, if it is started before Pi-Bolt, does not find them (an earlier installer put them there).
 	(cd "$INSTALL" && "$INSTALL/$NAME/pi" list >/dev/null 2>&1) || true
+	# A remote control service that runs (an earlier version's) is restarted, so it runs this version; nothing when none runs.
+	(cd "$INSTALL" && "$INSTALL/$NAME/pi" service restart >/dev/null 2>&1) || true
 	if [ "$ACTION" = reinstall ] && [ -n "${installed:-}" ] && [ "${installed:-}" != "$SHOWN_VERSION" ]; then word=updated
 	elif [ "$ACTION" = reinstall ]; then word=reinstalled
 	else word=installed; fi
 	printf '\nPi-Bolt %s was %s successfully %s(Pi %s)%s.\n' "$SHOWN_VERSION" "$word" "$dim" "$("$INSTALL/$NAME/pi" --version)" "$reset"
+	compiled_extensions_note "$COMPILED_BEFORE"
 	offer_extensions
 	if [ "$(command -v pi-bolt 2>/dev/null || true)" = "$BIN_DIR/pi-bolt" ]; then
 		printf '\nRun it with: %spi-bolt%s\n' "$bold" "$reset"
@@ -118,6 +181,20 @@ main() {
 		path_hint
 	fi
 	offer_start
+}
+
+# has_compiled_extensions DIR: whether the build in DIR has extensions `pi-bolt compile` compiled in (its pi-bolt.txt names them).
+has_compiled_extensions() {
+	grep -q '^Extensions compiled in' "$1/pi-bolt.txt" 2>/dev/null
+}
+
+# compiled_extensions_note COMPILED_BEFORE: after an install that replaced a build with extensions compiled in (COMPILED_BEFORE
+# is 1), says they load from their files now: this build, the release's, has none, and an install compiles nothing. Not when
+# compile.json is gone: `pi-bolt compile --off` sets it aside while it installs the release again, to have none.
+compiled_extensions_note() {
+	if [ "$1" = 1 ] && [ -f "$INSTALL/compile.json" ]; then
+		printf 'Extensions were compiled into the build this replaced: they load from their files now; run %spi-bolt compile%s to compile them into this one.\n' "$bold" "$reset"
+	fi
 }
 
 # --- Look -------------------------------------------------------------------------------------------------------------
@@ -274,6 +351,14 @@ resolve_version() {
 	net_curl -fsSIL -o /dev/null -w '%{url_effective}' "$REPO/releases/latest" | sed -n 's#.*/tag/bolt-v##p'
 }
 
+# The newest release, pre-releases included (the beta channel), as a version: the highest bolt-vX.Y.Z tag GitHub lists (it
+# lists no drafts to anyone without write access).
+newest_release() {
+	net_curl -fsSL -H 'Accept: application/vnd.github+json' "$API/releases?per_page=30" |
+		sed -n 's/^ *"tag_name": *"bolt-v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' |
+		sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1
+}
+
 mb() { awk -v b="$1" 'BEGIN { printf "%.1f", b / 1048576 }'; }
 
 # --- Steps ------------------------------------------------------------------------------------------------------------
@@ -289,7 +374,7 @@ preflight() {
 	case "$(uname -s)" in
 	Linux) preflight_linux ;;
 	Darwin) preflight_macos ;;
-	*) printf 'error: Pi-Bolt runs on Linux (x86-64) and macOS (Apple silicon) only (this is %s).\n' "$(uname -s)"; status=1 ;;
+	*) printf 'error: Pi-Bolt runs on Linux (x86-64, ARM64), Android (Termux) and macOS (Apple silicon) only (this is %s).\n' "$(uname -s)"; status=1 ;;
 	esac
 	command -v tar >/dev/null 2>&1 || { printf 'error: tar is required.\n'; status=1; }
 	if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
@@ -318,17 +403,31 @@ preflight_macos() {
 }
 
 preflight_linux() {
-	[ "$(uname -m)" = x86_64 ] || { printf 'error: Pi-Bolt runs on x86-64 only (this is %s).\n' "$(uname -m)"; status=1; }
-	if ldd --version 2>&1 | grep -qi musl; then
-		printf 'error: Pi-Bolt needs glibc; musl-based systems such as Alpine are not supported.\n'
-		status=1
+	case "$(uname -m)" in
+	x86_64 | aarch64 | arm64) ;;
+	*) printf 'error: Pi-Bolt runs on x86-64 and ARM64 only (this is %s).\n' "$(uname -m)"; status=1 ;;
+	esac
+	# (Termux: Android's libc is not glibc. setup_termux() installs Termux's glibc, which runs Pi-Bolt.)
+	if [ -n "$TERMUX" ]; then
+		is_arm64 || { printf 'error: in Termux, Pi-Bolt runs on 64-bit ARM only (this is %s).\n' "$(uname -m)"; status=1; }
+		command -v pkg >/dev/null 2>&1 || [ -e "$PREFIX/glibc/lib/ld-linux-aarch64.so.1" ] ||
+			{ printf "error: Termux's glibc is needed, and there is no pkg to install it with.\n"; status=1; }
+		return 0
+	fi
+	if [ -n "$MUSL" ]; then
+		# The musl builds are for x86-64, and link libstdc++ and libgcc (apk add libstdc++, which brings libgcc).
+		if is_arm64; then printf 'error: on musl-based systems such as Alpine, Pi-Bolt runs on x86-64 only (this is %s).\n' "$(uname -m)"; status=1; fi
+		if [ ! -e /usr/lib/libstdc++.so.6 ] && [ ! -e /lib/libstdc++.so.6 ]; then
+			printf 'error: Pi-Bolt needs libstdc++ (on Alpine: apk add libstdc++).\n'
+			status=1
+		fi
 	fi
 	glibc=$(ldd --version 2>/dev/null | sed -n '1s/.* \([0-9][0-9]*\)\.\([0-9][0-9]*\)$/\1 \2/p')
 	if [ -n "$glibc" ] && [ "$(echo "$glibc" | awk '{ print ($1 < 2 || ($1 == 2 && $2 < 17)) }')" = 1 ]; then
 		printf 'error: Pi-Bolt needs glibc 2.17 or later (this system has %s).\n' "$(echo "$glibc" | tr ' ' .)"
 		status=1
 	fi
-	# Every build needs SSE4.2 (the runtime itself does): without it the executable stops with "Illegal instruction".
+	# Every x86-64 build needs SSE4.2 (the runtime itself does): without it the executable stops with "Illegal instruction".
 	if [ -r /proc/cpuinfo ] && grep -q '^flags' /proc/cpuinfo && ! grep -qw sse4_2 /proc/cpuinfo; then
 		printf 'error: Pi-Bolt needs a CPU with SSE4.2: Intel Nehalem (2008) or later, AMD Bulldozer (2011) or later.\n'
 		status=1
@@ -341,7 +440,8 @@ preflight_linux() {
 check_sum() {
 	line=$(grep " $1\$" SHA256SUMS) && [ -n "$line" ] || return 1
 	if command -v sha256sum >/dev/null 2>&1; then
-		printf '%s\n' "$line" | sha256sum -c --quiet - >/dev/null 2>&1
+		# (Not --quiet: BusyBox's sha256sum (Alpine) has no such option. The status is all that counts.)
+		printf '%s\n' "$line" | sha256sum -c - >/dev/null 2>&1
 	else
 		printf '%s\n' "$line" | shasum -a 256 -c --status - 2>/dev/null
 	fi
@@ -469,9 +569,26 @@ rate_and_eta() {
 
 # The checksums are signed by Pi-Bolt's release key, from 0.6.0 on. For those releases the signature is required: one that
 # cannot be downloaded, or that does not verify, stops the install, whatever the download base. It is checked with OpenSSL 3
-# (LibreSSL, macOS's own openssl, cannot check Ed25519), or else with the Pi-Bolt already installed here; with neither, the
-# checksums alone are checked, and that is said. The signature is fetched in the background while the release downloads.
-fetch_signature() { fetch "$TMP/SHA256SUMS.sig.part" "$BASE/SHA256SUMS.sig" 2>/dev/null && mv "$TMP/SHA256SUMS.sig.part" "$TMP/SHA256SUMS.sig"; }
+# (LibreSSL, macOS's own openssl, cannot check Ed25519), or else with ssh-keygen against SHA256SUMS.sshsig, the same key's
+# signature in OpenSSH's format (published for releases after 0.9.9; macOS has OpenSSH), or else with the Pi-Bolt installed
+# here before. Where none of them can, or for a release from before 0.6.0 (which has no signature), nothing is installed
+# unless PIBOLT_UNVERIFIED is the SHA-256 of these checksums (unverified_allowed): the checksums come from the same place as
+# the files, so they alone do not show that a release is Pi-Bolt's. Both signatures are fetched in the background while the
+# release downloads.
+fetch_signature() {
+	if fetch "$TMP/SHA256SUMS.sig.part" "$BASE/SHA256SUMS.sig" 2>/dev/null; then mv "$TMP/SHA256SUMS.sig.part" "$TMP/SHA256SUMS.sig"; fi
+	if fetch "$TMP/SHA256SUMS.sshsig.part" "$BASE/SHA256SUMS.sshsig" 2>/dev/null; then mv "$TMP/SHA256SUMS.sshsig.part" "$TMP/SHA256SUMS.sshsig"; fi
+	return 0
+}
+
+# The release key in OpenSSH's form, for SHA256SUMS.sshsig (node scripts/lib/sshsig.mjs pubkey keys/release.pub).
+RELEASE_SSH_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKC26CarSmqCEj6n35NN7x2a/tbEQRt7iESFnijnsPmm"
+
+# Whether ssh-keygen can verify signatures (-Y, OpenSSH 8.1 and later).
+ssh_keygen_verifies() {
+	command -v ssh-keygen >/dev/null 2>&1 || return 1
+	case "$(ssh-keygen -Y find-principals 2>&1)" in *"illegal option"* | *"unknown option"* | *"invalid option"*) return 1 ;; esac
+}
 
 # Whether this release is from after signing began; one whose version is not known counts as one.
 signed_release() {
@@ -495,9 +612,16 @@ openssl3() {
 	return 1
 }
 
-# A Pi-Bolt executable installed here before, which checks the signature with its own crypto (BUN_BE_BUN=1 runs a script).
+# The SHA-256 of FILE, in lower case.
+sha256_of() {
+	if command -v sha256sum >/dev/null 2>&1; then sha256sum <"$1"; else shasum -a 256 <"$1"; fi | cut -c1-64 | tr 'A-F' 'a-f'
+}
+
+# A Pi-Bolt executable installed here before, which checks the signature with its own crypto (BUN_BE_BUN=1 runs a script):
+# a build in its own folder (not one kept for a rollback, nor one left by an update that stopped).
 installed_pibolt() {
 	for candidate in "$INSTALL/$NAME/pi-bin" "$INSTALL/$NAME/pi" "$INSTALL"/pi-bolt-"$PLATFORM"-*/pi-bin "$INSTALL"/pi-bolt-"$PLATFORM"-*/pi; do
+		case "${candidate#"$INSTALL"/}" in *.*/*) continue ;; esac
 		if [ -f "$candidate" ] && [ -x "$candidate" ]; then
 			printf '%s' "$candidate"
 			return 0
@@ -505,24 +629,54 @@ installed_pibolt() {
 	done
 	return 1
 }
+# (It says what it checked: the SHA-256 of the checksums whose signature verified. An exit status alone is not taken for a
+# check: a program that does not run the script, or runs it otherwise, can end with 0 too.)
 VERIFY_SCRIPT='const c = require("node:crypto"), f = require("node:fs");
-let ok;
-try { ok = c.verify(null, f.readFileSync(process.argv[2]), f.readFileSync(process.argv[3], "utf8"), f.readFileSync(process.argv[4])); } catch { process.exit(4); }
-process.exit(ok ? 0 : 3);'
+let ok, sums;
+try { sums = f.readFileSync(process.argv[2]); ok = c.verify(null, sums, f.readFileSync(process.argv[3], "utf8"), f.readFileSync(process.argv[4])); } catch { process.exit(4); }
+if (!ok) process.exit(3);
+process.stdout.write("verified " + c.createHash("sha256").update(sums).digest("hex") + "\n");'
+
+# Whether the user let this download be installed without a signature check: PIBOLT_UNVERIFIED is the SHA-256 of its
+# SHA256SUMS, which no other download has (a value kept in a profile does not let another release in).
+unverified_allowed() {
+	[ -n "${PIBOLT_UNVERIFIED:-}" ] && [ "$(printf '%s' "$PIBOLT_UNVERIFIED" | tr 'A-F' 'a-f')" = "$SUMS_SHA256" ]
+}
+
+# fail_unverified WHY: stops, saying how to install this download all the same.
+fail_unverified() {
+	if [ "$LAUNCHER" = 1 ]; then
+		fail "$1 Nothing was installed. Install Pi-Bolt with its installer instead (curl -fsSL https://pi-bolt.opensec.in/install.sh | sh), which says how to go on."
+	fi
+	case "$SHOWN_VERSION" in [0-9]*.[0-9]*.[0-9]*) page="$REPO/releases/tag/bolt-v$SHOWN_VERSION" ;; *) page="$REPO/releases/latest" ;; esac
+	stale=""
+	if [ -n "${PIBOLT_UNVERIFIED:-}" ]; then stale=" (PIBOLT_UNVERIFIED is set, but not to this download's SHA-256: it applies to one download only)"; fi
+	fail "$1 Nothing was installed$stale. To install this download without the check, compare the SHA-256 of its SHA256SUMS, $SUMS_SHA256, with the one GitHub shows for SHA256SUMS on $page from a device you trust, and run the installer again with PIBOLT_UNVERIFIED=$SUMS_SHA256."
+}
 
 verify_signature() {
 	[ -n "$RELEASE_KEY" ] || return 0
 	# (Whether it worked is whether the file is there: under set -e a failed wait would end the script without a word.)
 	if [ -n "$SIG_PID" ]; then wait "$SIG_PID" 2>/dev/null || true; fi
+	SUMS_SHA256=$(sha256_of "$TMP/SHA256SUMS")
+	bad="the release's signature does not verify: the download is not Pi-Bolt's. Nothing was installed."
 	if [ ! -f "$TMP/SHA256SUMS.sig" ]; then
 		signed_release && fail "could not download the release's signature from $BASE/SHA256SUMS.sig. Pi-Bolt $SHOWN_VERSION is signed, so nothing was installed: try again."
+		unverified_allowed || fail_unverified "Pi-Bolt $SHOWN_VERSION is from before Pi-Bolt signed its releases: nothing shows that this download is Pi-Bolt's."
 		UNSIGNED=1
 		return 0
 	fi
+	# (An Ed25519 signature is 64 bytes: anything else, such as a page of HTML served in its place, is not one.)
+	[ "$(wc -c <"$TMP/SHA256SUMS.sig" | tr -d ' ')" = 64 ] || fail "$bad"
 	printf '%s\n' "$RELEASE_KEY" >"$TMP/release.pub"
 	if ssl=$(openssl3) && "$ssl" pkey -pubin -in "$TMP/release.pub" -noout >/dev/null 2>&1; then
-		"$ssl" pkeyutl -verify -pubin -inkey "$TMP/release.pub" -rawin -in "$TMP/SHA256SUMS" -sigfile "$TMP/SHA256SUMS.sig" >/dev/null 2>&1 ||
-			fail "the release's signature does not verify: the download is not Pi-Bolt's. Nothing was installed."
+		"$ssl" pkeyutl -verify -pubin -inkey "$TMP/release.pub" -rawin -in "$TMP/SHA256SUMS" -sigfile "$TMP/SHA256SUMS.sig" >/dev/null 2>&1 || fail "$bad"
+		SIGNED=1
+		return 0
+	fi
+	if [ -f "$TMP/SHA256SUMS.sshsig" ] && ssh_keygen_verifies; then
+		printf 'pi-bolt namespaces="pi-bolt-release" %s\n' "$RELEASE_SSH_KEY" >"$TMP/allowed_signers"
+		ssh-keygen -Y verify -f "$TMP/allowed_signers" -I pi-bolt -n pi-bolt-release -s "$TMP/SHA256SUMS.sshsig" <"$TMP/SHA256SUMS" >/dev/null 2>&1 || fail "$bad"
 		SIGNED=1
 		return 0
 	fi
@@ -532,12 +686,16 @@ verify_signature() {
 		printf '%s\n' "$VERIFY_SCRIPT" >"$TMP/verify.js"
 		status=0
 		# (Run in the download's own folder, which holds only the release's files.)
-		(cd "$TMP" && BUN_BE_BUN=1 "$exe" ./verify.js SHA256SUMS release.pub SHA256SUMS.sig) >/dev/null 2>&1 || status=$?
-		[ "$status" != 3 ] || fail "the release's signature does not verify: the download is not Pi-Bolt's. Nothing was installed."
-		if [ "$status" = 0 ]; then
+		said=$(cd "$TMP" && BUN_BE_BUN=1 "$exe" ./verify.js SHA256SUMS release.pub SHA256SUMS.sig 2>/dev/null) || status=$?
+		[ "$status" != 3 ] || fail "$bad"
+		if [ "$status" = 0 ] && [ "$said" = "verified $SUMS_SHA256" ]; then
 			SIGNED=1
 			return 0
 		fi
+	fi
+	if ! unverified_allowed; then
+		if [ "$(uname -s)" = Darwin ]; then how='OpenSSL 3 (brew install openssl@3)'; else how='OpenSSL 3, or openssh-client (OpenSSH 8.1 or later), from your package manager'; fi
+		fail_unverified "nothing here can check the release's signature (OpenSSL 3, or OpenSSH 8.1 for releases after 0.9.9). Install $how and run the installer again."
 	fi
 	NOVERIFY=1
 }
@@ -689,23 +847,43 @@ install_release() {
 	done
 	all_succeeded || fail "could not extract $NAME.$ext"
 	draw_progress "$((step + 2))" 10000 "${dim}checking the executable$reset"
+	if [ -n "$TERMUX" ]; then
+		set_interpreter "$TMP/$NAME/pi" "$LOADER" || fail "could not set the executable's loader to $LOADER"
+		write_termux_launcher "$TMP/$NAME/pi-termux" "$INSTALL/$NAME"
+	fi
 	"$TMP/$NAME/pi" --version >/dev/null 2>&1 || fail "the downloaded executable does not run on this system"
 	mkdir -p "$INSTALL"
 	rm -rf "$INSTALL/$NAME.old"
-	if [ -d "$INSTALL/$NAME" ]; then mv "$INSTALL/$NAME" "$INSTALL/$NAME.old"; fi
+	# The build this replaces is kept as $NAME.previous, for `pi-bolt update --rollback`; the same build installed again
+	# (the same pi-bolt.txt) is not, and the one kept before stays.
+	if [ -d "$INSTALL/$NAME" ]; then
+		if [ "$LAUNCHER" != 1 ] && ! cmp -s "$INSTALL/$NAME/pi-bolt.txt" "$TMP/$NAME/pi-bolt.txt"; then
+			rm -rf "$INSTALL/$NAME.previous"
+			mv "$INSTALL/$NAME" "$INSTALL/$NAME.previous"
+		else
+			mv "$INSTALL/$NAME" "$INSTALL/$NAME.old"
+		fi
+	fi
 	mv "$TMP/$NAME" "$INSTALL/$NAME"
 	rm -rf "$INSTALL/$NAME.old" "$TMP"
 	trap - EXIT INT TERM
 	finish_progress
 	printf '  %s%s%s install complete %s(%s, %s MB from %s%s)%s\n' "$green" "$CHECK" "$reset" "$dim" "$PLATFORM-$VARIANT" "$(mb "${total:-0}")" "$FROM" "${SIGNED:+, signature verified}" "$reset"
-	[ -z "$UNSIGNED" ] || printf '  %snote: this release is not signed (it is from before Pi-Bolt signed releases); its checksum was verified%s\n' "$dim" "$reset"
-	[ -z "$NOVERIFY" ] || printf '  %snote: there is no OpenSSL 3 here to check the release'"'"'s signature (install it to have it checked); its checksum was verified%s\n' "$dim" "$reset"
+	if [ -n "$UNSIGNED$NOVERIFY" ]; then
+		if [ -n "$UNSIGNED" ]; then why="this release has no signature (it is from before Pi-Bolt signed releases)"; else why="the release's signature was not checked (nothing here can)"; fi
+		printf '  %s%sWARNING:%s %s. It was installed because PIBOLT_UNVERIFIED is the SHA-256 of its SHA256SUMS: that checksum is all that shows what it is.\n' "$bold" "$red" "$reset" "$why" >&2
+	fi
 }
 
 uninstall() {
+	# (The builds kept for a rollback too: pi-bolt-<platform>-<variant>.previous.)
 	for dir in "$INSTALL"/pi-bolt-linux-* "$INSTALL"/pi-bolt-darwin-*; do
 		[ -d "$dir" ] && rm -rf "$dir"
 	done
+	# (And what `pi-bolt compile` keeps or leaves here: compile.log from a failed build, and the work folder of one killed; and
+	# what automatic updates keep: when the last one ran, its output, and its lock.)
+	rm -rf "$INSTALL/cache" "$INSTALL/compile.json" "$INSTALL/compile.log" "$INSTALL/channel" "$INSTALL"/.compile-* \
+		"$INSTALL/auto-update.json" "$INSTALL/auto-update.log" "$INSTALL/auto-update.lock"
 	target=$(readlink "$BIN_DIR/pi-bolt" 2>/dev/null || true)
 	case "$target" in
 	"$INSTALL"/*) rm -f "$BIN_DIR/pi-bolt" ;;
@@ -725,6 +903,29 @@ read_key() {
 	printf '%s' "$key"
 }
 
+# drop_typeahead: drops what was typed at the terminal before a question. read_key takes one key, so the Enter typed after
+# it stays in the terminal's input, and would answer the next question with its default (#103).
+drop_typeahead() {
+	old=$(stty -g </dev/tty 2>/dev/null || true)
+	if [ -n "$old" ] && stty -icanon min 0 time 0 </dev/tty 2>/dev/null; then
+		# (With min 0 and time 0 a read returns at once, with nothing once the input is empty.)
+		drained=0
+		while [ "$drained" -lt 64 ] && [ "$(dd bs=256 count=1 2>/dev/null </dev/tty | wc -c | tr -d ' ')" != 0 ]; do
+			drained=$((drained + 1))
+		done
+		stty "$old" </dev/tty 2>/dev/null || true
+	fi
+}
+
+# ask FORMAT [ARG...]: asks a question (printf arguments) and sets `answer` to the line typed after it. What was typed before
+# is dropped before the question is shown, so an answer typed as soon as it appears is kept.
+ask() {
+	drop_typeahead
+	# shellcheck disable=SC2059
+	printf "$@"
+	answer=$(head -n 1 </dev/tty || true)
+}
+
 choose_action() {
 	if [ -n "$EXISTING" ]; then default=reinstall; else default=install; fi
 	if [ -n "$EXISTING" ]; then
@@ -738,8 +939,9 @@ choose_action() {
 	fi
 	case "$VARIANT" in
 	x64) cpu="for CPUs with AVX2" ;;
-	x64-baseline) cpu="for any x86-64 CPU" ;;
-	arm64) cpu="for Apple silicon" ;;
+	x64-baseline | x64-musl-baseline) cpu="for any x86-64 CPU" ;;
+	x64-musl) cpu="for CPUs with AVX2" ;;
+	arm64) if [ "$PLATFORM" = darwin ]; then cpu="for Apple silicon"; else cpu="for any ARM64 CPU"; fi ;;
 	*) cpu="with the JIT on" ;;
 	esac
 	printf '%sInstallation:%s\n\n' "$bold" "$reset"
@@ -803,8 +1005,7 @@ path_hint() {
 		return 0
 	fi
 	if has_tty; then
-		printf 'Add it to your PATH in %s now? [Y/n] ' "$(tilde "$config")"
-		answer=$(head -n 1 </dev/tty || true)
+		ask 'Add it to your PATH in %s now? [Y/n] ' "$(tilde "$config")"
 		case "$answer" in
 		n | N | no | NO) ;;
 		*)
@@ -895,11 +1096,10 @@ offer_extensions() {
 			case " $wanted " in *" $package "*) printf '  %s%-22s%s %s\n' "$cyan" "$package" "$reset" "${rest%:*}" ;; esac
 		done
 		IFS=$old_ifs
-		printf '\nInstall them? [Y/n] '
-		answer=$(head -n 1 </dev/tty || true)
+		ask '\nInstall them? [Y/n] '
 		case "$answer" in
 		n | N | no | NO)
-			printf '%sYou can install them later with: pi-bolt install npm:<name>%s\n' "$dim" "$reset"
+			printf '%sYou can install them later with: pi-bolt install --pi-bolt npm:<name>%s\n' "$dim" "$reset"
 			return 0
 			;;
 		esac
@@ -914,11 +1114,11 @@ offer_extensions() {
 		fi
 		# (From the registry that was checked, and without the package's install scripts: nothing of it runs before its lockfile
 		# entry is compared with the pin, below, and an extension of Pi needs none.)
-		if out=$(NPM_CONFIG_REGISTRY="$NPM_REGISTRY" NPM_CONFIG_IGNORE_SCRIPTS=true "$INSTALL/$NAME/pi" install "npm:$package@$version" 2>&1); then
+		if out=$(NPM_CONFIG_REGISTRY="$NPM_REGISTRY" NPM_CONFIG_IGNORE_SCRIPTS=true "$INSTALL/$NAME/pi" install --pi-bolt "npm:$package@$version" 2>&1); then
 			# What the package manager installed is a download of its own: its lockfile says what it got.
 			case $(installed_matches "$package" "$integrity") in
 			different)
-				"$INSTALL/$NAME/pi" remove "npm:$package@$version" >/dev/null 2>&1 || true
+				"$INSTALL/$NAME/pi" remove --pi-bolt "npm:$package@$version" >/dev/null 2>&1 || true
 				printf '  %sremoved %s@%s again: what the package manager installed is not the one this release pins%s\n' "$red" "$package" "$version" "$reset"
 				continue
 				;;
@@ -927,15 +1127,14 @@ offer_extensions() {
 			printf '  %s%s%s %s@%s installed\n' "$green" "$CHECK" "$reset" "$package" "$version"
 		else
 			printf '  %scould not install %s (Pi-Bolt itself is installed): %s%s\n' "$red" "$package" "$(printf '%s' "$out" | tail -1)" "$reset"
-			printf '  %sInstall it later with: pi-bolt install npm:%s%s\n' "$dim" "$package" "$reset"
+			printf '  %sInstall it later with: pi-bolt install --pi-bolt npm:%s%s\n' "$dim" "$package" "$reset"
 		fi
 	done
 }
 
 offer_start() {
 	[ -t 1 ] && has_tty && [ "${PIBOLT_NO_START:-0}" != 1 ] || return 0
-	printf '\nStart pi-bolt now? [Y/n] '
-	answer=$(head -n 1 </dev/tty || true)
+	ask '\nStart pi-bolt now? [Y/n] '
 	case "$answer" in
 	n | N | no | NO) return 0 ;;
 	esac
@@ -945,7 +1144,103 @@ offer_start() {
 	terminal=/dev/tty
 	name=$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ')
 	case "$name" in "" | "?" | "??") ;; *) [ -c "/dev/$name" ] && terminal="/dev/$name" ;; esac
-	exec "$INSTALL/$NAME/pi" <"$terminal"
+	exec "$INSTALL/$NAME/$(command_of_build)" <"$terminal"
+}
+
+# --- Linux on ARM64, and Termux ---------------------------------------------------------------------------------------
+
+is_arm64() { case "$(uname -m)" in aarch64 | arm64) return 0 ;; *) return 1 ;; esac; }
+# (ldd is musl's own on a musl system, and says so; glibc's prints its version.)
+is_musl() { case "$(ldd --version 2>&1 || true)" in *musl*) return 0 ;; *) return 1 ;; esac; }
+
+# Termux, the Linux environment of Android: TERMUX_VERSION is set in its shells, and its prefix is where it always is.
+is_termux() {
+	[ "$(uname -s)" = Linux ] && [ -n "${PREFIX:-}" ] || return 1
+	[ -n "${TERMUX_VERSION:-}" ] && return 0
+	case "${PREFIX:-}" in */com.termux/files/usr) return 0 ;; esac
+	return 1
+}
+
+# What `pi-bolt` runs: in Termux the launcher beside pi (write_termux_launcher), elsewhere pi itself.
+command_of_build() { if [ -n "$TERMUX" ]; then printf pi-termux; else printf pi; fi; }
+
+# Pi-Bolt is a glibc program. Android's libc is another (bionic), so in Termux it runs with Termux's glibc (the packages of
+# glibc-repo): its loader is set as the executable's (set_interpreter), and what Termux's glibc reads from $PREFIX/glibc/etc
+# that no package puts there is copied from Termux's own (the name servers and hosts). Termux's LD_PRELOAD is a library of
+# Android's libc, which glibc's loader cannot load: the Pi-Bolt this installs is started without it (and so is every check of
+# it below), and gives it back to the programs it starts.
+setup_termux() {
+	LOADER="$PREFIX/glibc/lib/ld-linux-aarch64.so.1"
+	if [ ! -e "$LOADER" ]; then
+		printf "%sTermux's glibc is needed.%s Pi-Bolt is a glibc program, and Termux runs it with its glibc packages:\n\n" "$bold" "$reset"
+		printf '  pkg install glibc-repo && pkg install glibc\n\n'
+		if has_tty; then
+			ask 'Install them now? [Y/n] '
+			case "$answer" in n | N | no | NO) fail "Pi-Bolt needs Termux's glibc: install it with the command above, then run this again" ;; esac
+		fi
+		# (A package list fetched before glibc-repo was added, or never, does not have it: fetched again first.)
+		apt-get update >/dev/null 2>&1 || true
+		if ! apt-cache show glibc-repo >/dev/null 2>&1; then
+			# Termux from Google Play installs from termux.net, which has no glibc packages.
+			if [ "${TERMUX_APK_RELEASE:-}" = GOOGLE_PLAY_STORE ] ||
+				grep -qs 'termux\.net' "$PREFIX/etc/apt/sources.list" "$PREFIX"/etc/apt/sources.list.d/*.list; then
+				fail "Termux from Google Play has no glibc packages, which Pi-Bolt needs. Install Termux from F-Droid (https://f-droid.org/packages/com.termux/) or from GitHub (https://github.com/termux/termux-app/releases), then run this again"
+			fi
+			fail "Termux's package repository has no glibc-repo: choose another mirror with termux-change-repo, then run this again"
+		fi
+		{ pkg install -y glibc-repo && pkg install -y glibc; } || fail "could not install Termux's glibc"
+		[ -e "$LOADER" ] || fail "Termux's glibc is installed, but $LOADER is not there"
+		printf '\n'
+	fi
+	for file in resolv.conf hosts; do
+		if [ ! -e "$PREFIX/glibc/etc/$file" ] && [ -e "$PREFIX/etc/$file" ]; then
+			{ mkdir -p "$PREFIX/glibc/etc" && cp "$PREFIX/etc/$file" "$PREFIX/glibc/etc/$file"; } ||
+				fail "could not copy $PREFIX/etc/$file to $PREFIX/glibc/etc"
+		fi
+	done
+	if [ -n "${LD_PRELOAD+x}" ]; then
+		export PIBOLT_TERMUX_LD_PRELOAD="$LD_PRELOAD"
+		unset LD_PRELOAD
+	fi
+}
+
+# set_interpreter FILE LOADER: writes LOADER over the path of FILE's loader (its ELF PT_INTERP), which the Linux ARM64 build has
+# room for: nothing else in the file changes or moves.
+set_interpreter() {
+	# (A 64-bit little-endian ELF file: e_phnum (byte 56) program headers of e_phentsize (54) bytes each at e_phoff (32). PT_INTERP
+	# is type 3, with its p_offset at byte 8 of its header and its p_filesz at 32.)
+	where=$(od -An -v -tu1 -N 4096 "$1" | awk '
+		function le(at, size,   value, i) { value = 0; for (i = size - 1; i >= 0; i--) value = value * 256 + b[at + i]; return value }
+		{ for (i = 1; i <= NF; i++) b[n++] = $i }
+		END {
+			if (b[0] != 127 || b[1] != 69 || b[2] != 76 || b[3] != 70 || b[4] != 2 || b[5] != 1) exit 1
+			phoff = le(32, 8); size = le(54, 2); count = le(56, 2)
+			for (k = 0; k < count; k++) {
+				at = phoff + k * size
+				if (at + 40 > n) exit 1
+				if (le(at, 4) == 3) { print le(at + 8, 8), le(at + 32, 8); exit 0 }
+			}
+			exit 1
+		}') || return 1
+	offset=${where% *} room=${where#* }
+	length=$(printf '%s' "$2" | wc -c | tr -d ' ')
+	[ "$length" -lt "$room" ] || return 1
+	{ printf '%s' "$2"; head -c "$((room - length))" /dev/zero; } | dd of="$1" bs=1 seek="$offset" conv=notrunc 2>/dev/null
+}
+
+# write_termux_launcher FILE DIR: the command that starts DIR/pi in Termux: without Termux's LD_PRELOAD (kept for the programs Pi
+# starts, in PIBOLT_TERMUX_LD_PRELOAD), and in Android's time zone, which glibc does not find by itself.
+write_termux_launcher() {
+	# (The folder in single quotes, each of its own as '\'': it is the user's choice, and may have any character.)
+	dir=$(printf '%s' "$2" | sed "s/'/'\\\\''/g")
+	cat >"$1" <<EOF
+#!$PREFIX/bin/sh
+# Pi-Bolt in Termux, written by its installer (install.sh).
+if [ -n "\${LD_PRELOAD+x}" ]; then export PIBOLT_TERMUX_LD_PRELOAD="\$LD_PRELOAD"; unset LD_PRELOAD; fi
+if [ -z "\${TZ:-}" ]; then TZ=\$(getprop persist.sys.timezone 2>/dev/null) || TZ=""; if [ -n "\$TZ" ]; then export TZ; else unset TZ; fi; fi
+exec '$dir/pi' "\$@"
+EOF
+	chmod 755 "$1"
 }
 
 main "$@"

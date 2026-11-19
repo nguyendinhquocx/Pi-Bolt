@@ -5,11 +5,15 @@
 
 import {
 	type AssistantMessage,
+	type AssistantMessageEvent,
+	type ClientIdentity,
 	EventStream,
-	getCurrentTools,
-	getToolStateChanges,
+	type JsonObject,
+	mergeClientIdentity,
 	normalizeContext,
+	PI_ATTRIBUTION,
 	type SystemMessage,
+	type Tool,
 	type ToolResultMessage,
 	type ToolStateChanges,
 	toToolDeclaration,
@@ -25,11 +29,18 @@ import type {
 	AgentToolCall,
 	AgentToolCallOutcome,
 	AgentToolResult,
+	EarlyToolExecution,
 	PrepareNextTurnContext,
 	StreamFn,
 } from "./types.ts";
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
+
+/**
+ * Request identity of agent loops: pi-ai's defaults with provider attribution to pi. `AgentLoopConfig.identity`
+ * overrides it field by field.
+ */
+export const DEFAULT_AGENT_IDENTITY: ClientIdentity = { attribution: PI_ATTRIBUTION };
 
 /**
  * Start an agent loop with a new prompt message.
@@ -239,10 +250,28 @@ async function runLoop(
 			}
 
 			// Stream assistant response
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
+			const earlyToolCalls =
+				config.earlyToolExecution && currentContext.tools?.length
+					? new EarlyToolCalls(currentContext.tools, config.earlyToolExecution, signal)
+					: undefined;
+			let message: AssistantMessage;
+			try {
+				message = await streamAssistantResponse(
+					currentContext,
+					config,
+					signal,
+					emit,
+					streamFunction,
+					earlyToolCalls,
+				);
+			} catch (error) {
+				earlyToolCalls?.discard();
+				throw error;
+			}
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				earlyToolCalls?.discard();
 				lastCompletedTurn = {
 					message,
 					toolResults: [],
@@ -264,10 +293,15 @@ async function runLoop(
 				// A "length" stop means the output was cut off by the token limit, so
 				// every tool call in the message may carry truncated arguments. Fail
 				// them all instead of executing potentially borked calls.
-				const executedToolBatch =
-					message.stopReason === "length"
-						? await failToolCallsFromTruncatedMessage(toolCalls, emit)
-						: await executeToolCalls(currentContext, message, config, signal, emit);
+				let executedToolBatch: ExecutedToolCallBatch;
+				try {
+					executedToolBatch =
+						message.stopReason === "length"
+							? await failToolCallsFromTruncatedMessage(toolCalls, emit)
+							: await executeToolCalls(currentContext, message, config, signal, emit, earlyToolCalls);
+				} finally {
+					earlyToolCalls?.discard();
+				}
 				toolResults.push(...executedToolBatch.messages);
 				hasMoreToolCalls = !executedToolBatch.terminate;
 
@@ -275,6 +309,8 @@ async function runLoop(
 					currentContext.messages.push(result);
 					newMessages.push(result);
 				}
+			} else {
+				earlyToolCalls?.discard();
 			}
 
 			lastCompletedTurn = {
@@ -344,10 +380,7 @@ function declareToolChanges(context: AgentContext, pendingMessages: AgentMessage
 				index === systemIndex ? withToolChanges(pending, NO_CHANGES) : message,
 			)
 		: pendingMessages;
-	const changes = getToolStateChanges(
-		getCurrentTools([...context.messages, ...baseline]),
-		(context.tools ?? []).map(toToolDeclaration),
-	);
+	const changes = getToolChanges(getDeclaredTools(context.messages, baseline), context.tools ?? []);
 	const unchanged = changes.toolsAdded.length === 0 && changes.toolsRemoved.length === 0;
 
 	if (pending) {
@@ -363,6 +396,76 @@ function declareToolChanges(context: AgentContext, pendingMessages: AgentMessage
 }
 
 const NO_CHANGES: ToolStateChanges = { toolsAdded: [], toolsRemoved: [] };
+
+/** `getCurrentTools([...transcript, ...pending])` without copying the transcript: the tools its system messages declare. */
+function getDeclaredTools(transcript: readonly AgentMessage[], pending: readonly AgentMessage[]): Tool[] {
+	const tools = new Map<string, Tool>();
+	for (const messages of [transcript, pending]) {
+		for (const message of messages) {
+			if (message.role !== "system") continue;
+			for (const tool of (message as SystemMessage).toolsRemoved ?? []) tools.delete(tool.name);
+			for (const tool of (message as SystemMessage).toolsAdded ?? []) tools.set(tool.name, tool);
+		}
+	}
+	return [...tools.values()];
+}
+
+/**
+ * `JSON.stringify(toToolDeclaration(tool))`, which is what `declarationsEqual` compares, with one serialization instead of
+ * a JSON round-trip and a serialization: serializing the parsed copy of `parameters` gives the same text as serializing
+ * `parameters`. Computed again on every request, so a schema changed in place is seen. Parameters that do not serialize to
+ * JSON text (undefined, a function, or a `toJSON` method) take the original path, which throws the same errors.
+ */
+function declarationKey(tool: Tool): string {
+	const parameters: unknown = tool.parameters;
+	if (
+		parameters === undefined ||
+		typeof parameters === "function" ||
+		typeof parameters === "symbol" ||
+		typeof (parameters as { toJSON?: unknown } | null)?.toJSON === "function"
+	) {
+		return JSON.stringify(toToolDeclaration(tool));
+	}
+	return JSON.stringify({
+		name: tool.name,
+		description: tool.description,
+		parameters,
+		...(tool.constrainedSampling === undefined ? {} : { constrainedSampling: tool.constrainedSampling }),
+	});
+}
+
+/**
+ * `getToolStateChanges(previous, current.map(toToolDeclaration))`, serializing each declaration once instead of round-tripping
+ * and serializing both sides of every comparison again (about nine JSON passes per tool per request).
+ */
+function getToolChanges(previous: readonly Tool[], current: readonly Tool[]): ToolStateChanges {
+	const currentKeys = current.map(declarationKey);
+	const previousKeys = new Map<Tool, string>();
+	const previousKey = (tool: Tool): string => {
+		let key = previousKeys.get(tool);
+		if (key === undefined) {
+			key = declarationKey(tool);
+			previousKeys.set(tool, key);
+		}
+		return key;
+	};
+	const previousTools = new Map(previous.map((tool) => [tool.name, tool]));
+	const currentIndexes = new Map(current.map((tool, index) => [tool.name, index]));
+	return {
+		toolsAdded: current
+			.filter((tool, index) => {
+				const previousTool = previousTools.get(tool.name);
+				return previousTool === undefined || previousKey(previousTool) !== currentKeys[index];
+			})
+			.map(toToolDeclaration),
+		toolsRemoved: previous
+			.filter((tool) => {
+				const currentIndex = currentIndexes.get(tool.name);
+				return currentIndex === undefined || previousKey(tool) !== currentKeys[currentIndex];
+			})
+			.map((tool) => ({ name: tool.name })),
+	};
+}
 
 /** Copy a system message with its tool fields replaced by `changes`; empty lists omit the field. */
 function withToolChanges(message: SystemMessage, { toolsAdded, toolsRemoved }: ToolStateChanges): SystemMessage {
@@ -384,6 +487,7 @@ async function streamAssistantResponse(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 	streamFunction: StreamFn,
+	earlyToolCalls: EarlyToolCalls | undefined,
 ): Promise<AssistantMessage> {
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
@@ -403,6 +507,7 @@ async function streamAssistantResponse(
 	const response = await streamFunction(config.model, llmContext, {
 		...config,
 		apiKey: resolvedApiKey,
+		identity: mergeClientIdentity(DEFAULT_AGENT_IDENTITY, config.identity),
 		signal,
 	});
 	// Record the requested level, whichever stream function answered.
@@ -432,11 +537,19 @@ async function streamAssistantResponse(
 				if (partialMessage) {
 					partialMessage = event.partial;
 					context.messages[context.messages.length - 1] = partialMessage;
-					await emit({
+					if (
+						earlyToolCalls &&
+						(event.type === "toolcall_start" || event.type === "toolcall_delta" || event.type === "toolcall_end")
+					) {
+						earlyToolCalls.observe(event);
+					}
+					// One event per delta: await only a sink that returned a promise.
+					const pending = emit({
 						type: "message_update",
 						assistantMessageEvent: event,
 						message: { ...partialMessage },
-					});
+					}) as Promise<void> | undefined;
+					if (pending) await pending;
 				}
 				break;
 
@@ -511,15 +624,24 @@ async function executeToolCalls(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	earlyToolCalls: EarlyToolCalls | undefined,
 ): Promise<ExecutedToolCallBatch> {
 	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
 	const hasSequentialToolCall = toolCalls.some(
 		(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
 	);
 	if (config.toolExecution === "sequential" || hasSequentialToolCall) {
-		return executeToolCallsSequential(currentContext, assistantMessage, toolCalls, config, signal, emit);
+		return executeToolCallsSequential(
+			currentContext,
+			assistantMessage,
+			toolCalls,
+			config,
+			signal,
+			emit,
+			earlyToolCalls,
+		);
 	}
-	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit);
+	return executeToolCallsParallel(currentContext, assistantMessage, toolCalls, config, signal, emit, earlyToolCalls);
 }
 
 type ExecutedToolCallBatch = {
@@ -534,6 +656,7 @@ async function executeToolCallsSequential(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	earlyToolCalls: EarlyToolCalls | undefined,
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallOutcome[] = [];
 	const messages: ToolResultMessage[] = [];
@@ -549,13 +672,16 @@ async function executeToolCallsSequential(
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
 		let finalized: FinalizedToolCallOutcome;
 		if (preparation.kind === "immediate") {
+			earlyToolCalls?.drop(toolCall.id);
 			finalized = {
 				toolCall,
 				result: preparation.result,
 				isError: preparation.isError,
 			};
 		} else {
-			const executed = await executePreparedToolCall(preparation, signal, emitToolExecutionUpdate(toolCall, emit));
+			const onUpdate = emitToolExecutionUpdate(toolCall, emit);
+			const early = earlyToolCalls?.take(preparation, onUpdate);
+			const executed = early ? await early : await executePreparedToolCall(preparation, signal, onUpdate);
 			finalized = await finalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
@@ -590,6 +716,7 @@ async function executeToolCallsParallel(
 	config: AgentLoopConfig,
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
+	earlyToolCalls: EarlyToolCalls | undefined,
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallEntry[] = [];
 
@@ -603,6 +730,7 @@ async function executeToolCallsParallel(
 
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
 		if (preparation.kind === "immediate") {
+			earlyToolCalls?.drop(toolCall.id);
 			const finalized = {
 				toolCall,
 				result: preparation.result,
@@ -626,7 +754,9 @@ async function executeToolCallsParallel(
 				await emitToolExecutionEnd(finalized, emit);
 				return finalized;
 			}
-			const executed = await executePreparedToolCall(preparation, signal, emitToolExecutionUpdate(toolCall, emit));
+			const onUpdate = emitToolExecutionUpdate(toolCall, emit);
+			const early = earlyToolCalls?.take(preparation, onUpdate);
+			const executed = early ? await early : await executePreparedToolCall(preparation, signal, onUpdate);
 			const finalized = await finalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
@@ -946,4 +1076,236 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 async function emitToolResultMessage(toolResultMessage: ToolResultMessage, emit: AgentEventSink): Promise<void> {
 	await emit({ type: "message_start", message: toolResultMessage });
 	await emit({ type: "message_end", message: toolResultMessage });
+}
+
+type ToolCallStreamEvent = Extract<
+	AssistantMessageEvent,
+	{ type: "toolcall_start" } | { type: "toolcall_delta" } | { type: "toolcall_end" }
+>;
+
+/** A tool call started before its assistant message ended. */
+type EarlyToolCall = {
+	id: string;
+	name: string;
+	tool: AgentTool<any>;
+	/** The call's arguments as JSON, to see whether the provider's final arguments are the ones it started with. */
+	argumentsJson: string;
+	/** The validated arguments it runs with, as JSON. */
+	argsJson: string;
+	stillValid: () => boolean;
+	controller: AbortController;
+	outcome: Promise<ExecutedToolCallOutcome>;
+	/** Where updates go once the loop reaches the call (`sink`); until then they are kept (`buffered`). */
+	updates: { sink: ToolUpdateSink | undefined; buffered: AgentToolResult<any>[] };
+};
+
+/**
+ * The tool calls of one assistant message that start while the message is still streaming (see
+ * {@link EarlyToolExecution}). A call starts once its arguments are complete and every tool call before it in the
+ * message has started; the first call that cannot start early ends early starts for the rest of the message.
+ */
+class EarlyToolCalls {
+	private readonly tools: readonly AgentTool<any>[];
+	private readonly decide: EarlyToolExecution;
+	private readonly signal: AbortSignal | undefined;
+	/** Streamed JSON arguments of calls whose arguments are not complete yet, by content index. */
+	private readonly streamedArguments = new Map<number, { json: string; endsWithBrace: boolean }>();
+	/** Calls with complete arguments, waiting for the calls before them to start, by content index. */
+	private readonly complete = new Map<number, AgentToolCall>();
+	/** Started calls by content index. */
+	private readonly started = new Map<number, EarlyToolCall>();
+	/** Started calls the loop has not reached yet, by tool call id. */
+	private readonly runs = new Map<string, EarlyToolCall>();
+	/** Content indexes of calls seen to be candidates (their tool may start early). */
+	private readonly candidates = new Set<number>();
+	/** Controllers of the runs that have not settled, taken or not: an abort of the agent run aborts them all. */
+	private readonly unsettled = new Set<AbortController>();
+	private closed = false;
+	private listening = false;
+	private readonly onAbort = () => {
+		for (const controller of this.unsettled) controller.abort();
+		this.discard();
+	};
+
+	constructor(tools: readonly AgentTool<any>[], decide: EarlyToolExecution, signal: AbortSignal | undefined) {
+		this.tools = tools;
+		this.decide = decide;
+		this.signal = signal;
+	}
+
+	/** Follow a tool call event of the streaming message. */
+	observe(event: ToolCallStreamEvent): void {
+		if (this.closed) return;
+		const index = event.contentIndex;
+		if (event.type === "toolcall_end") {
+			this.streamedArguments.delete(index);
+			const toolCall: AgentToolCall = { ...event.toolCall, arguments: cloneJson(event.toolCall.arguments) };
+			const started = this.started.get(index);
+			if (started) {
+				// Started from its streamed arguments: keep it if the provider's final arguments are the same.
+				if (started.id === toolCall.id && started.argumentsJson === JSON.stringify(toolCall.arguments)) return;
+				this.started.delete(index);
+				this.drop(started.id);
+			}
+			this.complete.set(index, toolCall);
+			this.startReady(event.partial);
+			return;
+		}
+		if (this.started.has(index) || this.complete.has(index)) return;
+		const block = event.partial.content[index];
+		if (block?.type !== "toolCall") return;
+		let streamed = this.streamedArguments.get(index);
+		if (event.type === "toolcall_delta") {
+			streamed ??= { json: "", endsWithBrace: false };
+			streamed.json += event.delta;
+			const delta = event.delta.trimEnd();
+			if (delta) streamed.endsWithBrace = delta.endsWith("}");
+			this.streamedArguments.set(index, streamed);
+		}
+		if (!block.name) return;
+		if (!this.candidates.has(index)) {
+			// A call that cannot start early means no later call may, so stop following the message.
+			const tool = this.tools.find((t) => t.name === block.name);
+			if (!tool || !this.decide(block, tool)) {
+				this.close();
+				return;
+			}
+			this.candidates.add(index);
+		}
+		// A complete JSON object cannot be continued: these are the call's arguments, unless the provider changes them.
+		if (!streamed?.endsWithBrace || !block.id) return;
+		let args: unknown;
+		try {
+			args = JSON.parse(streamed.json);
+		} catch {
+			return;
+		}
+		if (typeof args !== "object" || args === null || Array.isArray(args)) return;
+		this.streamedArguments.delete(index);
+		this.complete.set(index, { type: "toolCall", id: block.id, name: block.name, arguments: args as JsonObject });
+		this.startReady(event.partial);
+	}
+
+	/**
+	 * The early run of `prepared` in place of executing it, or undefined to execute it as usual. Updates the run
+	 * reported so far go to `onUpdate` now, later ones as they come.
+	 */
+	take(prepared: PreparedToolCall, onUpdate: ToolUpdateSink): Promise<ExecutedToolCallOutcome> | undefined {
+		const run = this.runs.get(prepared.toolCall.id);
+		if (!run) return undefined;
+		this.runs.delete(run.id);
+		if (
+			run.tool !== prepared.tool ||
+			run.name !== prepared.toolCall.name ||
+			this.signal?.aborted ||
+			run.controller.signal.aborted ||
+			run.argsJson !== JSON.stringify(prepared.args) ||
+			!run.stillValid()
+		) {
+			run.controller.abort();
+			return undefined;
+		}
+		run.updates.sink = onUpdate;
+		const flushed = run.updates.buffered.map((partialResult) => Promise.resolve(onUpdate(partialResult)));
+		run.updates.buffered = [];
+		return flushed.length === 0
+			? run.outcome
+			: run.outcome.then(async (outcome) => {
+					await Promise.all(flushed);
+					return outcome;
+				});
+	}
+
+	/** Abort the early run of a call that will not execute. */
+	drop(toolCallId: string): void {
+		const run = this.runs.get(toolCallId);
+		if (!run) return;
+		this.runs.delete(toolCallId);
+		run.controller.abort();
+	}
+
+	/**
+	 * Abort every early run the loop has not taken. Called when the message's tool calls are done (taken runs have
+	 * settled then) or will not run.
+	 */
+	discard(): void {
+		this.close();
+		for (const run of this.runs.values()) run.controller.abort();
+		this.runs.clear();
+		if (this.listening) {
+			this.listening = false;
+			this.signal?.removeEventListener("abort", this.onAbort);
+		}
+	}
+
+	private close(): void {
+		this.closed = true;
+		this.streamedArguments.clear();
+		this.complete.clear();
+	}
+
+	/** Start the calls with complete arguments whose earlier calls have all started, in message order. */
+	private startReady(partial: AssistantMessage): void {
+		const content = partial.content;
+		for (let index = 0; index < content.length; index++) {
+			if (content[index].type !== "toolCall" || this.started.has(index)) continue;
+			const toolCall = this.complete.get(index);
+			if (!toolCall) return;
+			this.complete.delete(index);
+			const run = this.start(toolCall);
+			if (!run) {
+				this.close();
+				return;
+			}
+			this.started.set(index, run);
+		}
+	}
+
+	private start(toolCall: AgentToolCall): EarlyToolCall | undefined {
+		if (!toolCall.id || this.runs.has(toolCall.id) || this.signal?.aborted) return undefined;
+		const tool = this.tools.find((t) => t.name === toolCall.name);
+		if (!tool) return undefined;
+		const stillValid = this.decide(toolCall, tool);
+		if (!stillValid) return undefined;
+		let args: unknown;
+		try {
+			args = validateToolArguments(tool, prepareToolCallArguments(tool, toolCall));
+		} catch {
+			return undefined;
+		}
+		if (this.signal && !this.listening) {
+			this.listening = true;
+			this.signal.addEventListener("abort", this.onAbort, { once: true });
+		}
+		const controller = new AbortController();
+		const updates: EarlyToolCall["updates"] = { sink: undefined, buffered: [] };
+		const argsJson = JSON.stringify(args);
+		this.unsettled.add(controller);
+		const outcome = executePreparedToolCall(
+			{ kind: "prepared", toolCall, tool, args },
+			controller.signal,
+			(partial) => {
+				if (updates.sink) return updates.sink(partial);
+				updates.buffered.push(partial);
+			},
+		);
+		void outcome.then(() => this.unsettled.delete(controller));
+		const run: EarlyToolCall = {
+			id: toolCall.id,
+			name: toolCall.name,
+			tool,
+			argumentsJson: JSON.stringify(toolCall.arguments),
+			argsJson,
+			stillValid,
+			controller,
+			outcome,
+			updates,
+		};
+		this.runs.set(run.id, run);
+		return run;
+	}
+}
+
+function cloneJson<T>(value: T): T {
+	return value === undefined ? value : JSON.parse(JSON.stringify(value));
 }

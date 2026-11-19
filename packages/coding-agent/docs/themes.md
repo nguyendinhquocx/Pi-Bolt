@@ -1,6 +1,6 @@
 # Customize Pi with themes
 
-Themes control the colors Pi uses in interactive mode and HTML exports. Pi includes the `system`, `dark`, and `light` themes. You can select one theme, follow your terminal's light or dark appearance, or create your own palette.
+Themes control the colors Pi uses in interactive mode and HTML exports. Pi includes the `system`, `dark`, and `light` themes, plus tokyo-night (also `-storm` and `-day`), catppuccin (`-mocha`, `-macchiato`, `-frappe`, `-latte`), dracula, nord, gruvbox (`-dark`, `-light`), solarized (`-dark`, `-light`), one-dark, rose-pine, and monokai. Switch with `/theme` or `/theme <name>`. You can select one theme, follow your terminal's light or dark appearance, or create your own palette.
 
 ## Use your terminal's colors
 
@@ -117,7 +117,7 @@ Theme colors describe interface roles rather than individual components. Use the
 
 The schema is the format reference. The built-in themes provide complete values that you can copy and adjust.
 
-Five colors are optional and inherit another color when omitted:
+Six colors are optional and inherit another color when omitted:
 
 | Optional color | Fallback |
 |---|---|
@@ -126,6 +126,7 @@ Five colors are optional and inherit another color when omitted:
 | `searchMatchBg` | `selectedBg` |
 | `searchMatchText` | `text` |
 | `thinkingMax` | `thinkingXhigh` |
+| `mdCodeBlockBg` | `toolPendingBg` (the background of code blocks with the `shadedCodeBlocks` setting on) |
 
 If `export` colors are omitted, Pi derives HTML page and panel backgrounds from `userMessageBg`.
 

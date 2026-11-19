@@ -48,6 +48,10 @@
               "path": "llama-cpp.md"
             },
             {
+              "title": "Run Local Models on NVIDIA RTX",
+              "path": "nvidia-rtx-llama-cpp.md"
+            },
+            {
               "title": "Configure Your Terminal",
               "path": "terminal-setup.md"
             },
@@ -66,6 +70,10 @@
             {
               "title": "Run Pi on Android",
               "path": "termux.md"
+            },
+            {
+              "title": "Control Pi from your phone",
+              "path": "remote-control.md"
             }
           ]
         },
@@ -118,6 +126,10 @@
               "path": "tui.md"
             },
             {
+              "title": "Build Mobile UI for Extensions",
+              "path": "mobile-ui.md"
+            },
+            {
               "title": "Integrate with the CLI",
               "path": "cli-integration.md"
             },
@@ -147,6 +159,10 @@
         {
           "title": "Settings",
           "path": "settings.md"
+        },
+        {
+          "title": "Models Configuration",
+          "path": "models-configuration.md"
         },
         {
           "title": "Environment Variables",

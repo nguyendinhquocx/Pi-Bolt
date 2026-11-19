@@ -1,4 +1,4 @@
-import { PRODUCT_NAME } from "../config.ts";
+import { COMMAND_NAME, PRODUCT_NAME } from "../config.ts";
 import type { SourceInfo } from "./source-info.ts";
 
 export type SlashCommandSource = "extension" | "prompt" | "skill";
@@ -23,12 +23,18 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "thinking", description: "Set thinking level", argumentHint: "<level>" },
 	{ name: "scoped-models", description: "Enable/disable models for Ctrl+P cycling" },
 	{ name: "export", description: "Export session (HTML default, or specify path: .html/.jsonl)" },
-	{ name: "import", description: "Import and resume a session from a JSONL file" },
-	{ name: "share", description: "Share session as a secret GitHub gist" },
+	{ name: "import", description: "Import a JSONL session, preserving its ID and working directory" },
+	{ name: "share", description: "Share session via a Radius artifact or a GitHub gist" },
+	{
+		name: "remote-control",
+		description: "Control this session from the Pi-Bolt Android app (QR pairing)",
+		argumentHint: "[lan|tunnel|copy|stop|devices]",
+	},
 	{ name: "bug", description: "Report a bug to the Pi developers", argumentHint: "<description>" },
 	{ name: "copy", description: "Copy last agent message to clipboard" },
 	{ name: "name", description: "Set session display name" },
 	{ name: "session", description: "Show session info and stats" },
+	{ name: "theme", description: "Switch color theme", argumentHint: "<name>" },
 	{ name: "changelog", description: "Show changelog entries" },
 	{ name: "hotkeys", description: "Show all keyboard shortcuts" },
 	{ name: "fork", description: "Create a new fork from a previous user message" },
@@ -38,7 +44,20 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "logout", description: "Remove provider authentication" },
 	{ name: "new", description: "Start a new session" },
 	{ name: "compact", description: "Manually compact the session context" },
-	{ name: "resume", description: "Resume a different session" },
+	{ name: "resume", description: "Resume another session" },
 	{ name: "reload", description: "Reload keybindings, extensions, skills, prompts, themes, and context files" },
 	{ name: "quit", description: `Quit ${PRODUCT_NAME}` },
 ];
+
+/** What `/remote-control` and the `pi-bolt service` commands that start it answer while `remoteControl.enabled` is off. */
+export const REMOTE_CONTROL_OFF_MESSAGE = `Remote control is off. Turn it on with: ${COMMAND_NAME} remote-control enable`;
+
+/** What a session prints when it stops its running `/remote-control` because remote control was turned off. */
+export const REMOTE_CONTROL_STOPPED_MESSAGE = "Remote control is off: this session stopped serving phones";
+
+/** The built-in commands to list (autocomplete): `/remote-control` only while remote control is on. */
+export function listedBuiltinSlashCommands(remoteControlEnabled: boolean): ReadonlyArray<BuiltinSlashCommand> {
+	return remoteControlEnabled
+		? BUILTIN_SLASH_COMMANDS
+		: BUILTIN_SLASH_COMMANDS.filter((command) => command.name !== "remote-control");
+}

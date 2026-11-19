@@ -8,29 +8,43 @@ import { createRequire } from "node:module";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Provider } from "@earendil-works/pi-ai";
+import { mcpNamespace } from "@earendil-works/pi-mcp";
 import type { KeyId } from "@earendil-works/pi-tui";
 import type { createJiti } from "jiti";
 import { CONFIG_DIR_NAME, getAgentDir, isBunBinary, isBundledNode } from "../../config.ts";
 import { isHerdrPiIntegration } from "../../extensions/herdr/integration-file.ts";
 import { PIBOLT } from "../../pi-bolt.ts";
-import { resolvePath } from "../../utils/paths.ts";
+import { canonicalizePath, pathsEqual, resolvePath } from "../../utils/paths.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
 import { execCommand } from "../exec.ts";
-import { type McpServerConfig, McpServerRegistry, mcpNamespace, validateMcpServerConfig } from "../mcp-servers.ts";
+import { type McpServerConfig, McpServerRegistry, validateMcpServerConfig } from "../mcp-servers.ts";
+import {
+	MOBILE_VIEW_ICONS,
+	MOBILE_VIEW_ID_PATTERN,
+	type MobilePageDefinition,
+	type MobileTileDefinition,
+} from "../mobile-ui/types.ts";
 import { readPiManifest } from "../pi-manifest.ts";
 import { createSyntheticSourceInfo, getSyntheticPathSource, isSyntheticPath } from "../source-info.ts";
 import { time } from "../timings.ts";
 import type { ModelRouteRequest, VirtualModelDefinition } from "../virtual-models.ts";
+import { compiledExtensionFor, firstLineOf } from "./compiled.ts";
+import { PI_MODULE_NAMES, provideModulesToFiles } from "./compiled-modules.ts";
+import { extensionDisplayName, withJitHint } from "./jit-hint.ts";
+import { loadJitiBunLoader } from "./jiti-bun-loader.lazy.ts";
 import type {
 	EntryRenderer,
 	Extension,
 	ExtensionAPI,
+	ExtensionContext,
 	ExtensionFactory,
 	ExtensionRuntime,
 	ExtensionVirtualModel,
 	LoadExtensionsResult,
+	MarkdownMessageType,
 	MarkdownTransformer,
+	MarkdownTransformerOptions,
 	MessageRenderer,
 	ProviderConfig,
 	RegisteredCommand,
@@ -49,9 +63,14 @@ const usesEmbeddedModules = isBunBinary || isNodeSeaBinary || isBundledNode;
 let createJitiPromise: Promise<typeof createJiti> | undefined;
 
 function getCreateJiti(): Promise<typeof createJiti> {
-	createJitiPromise ??= (usesEmbeddedModules ? import("./jiti-static-loader.ts") : import("./jiti-loader.ts")).then(
-		(module) => module.createJiti,
-	);
+	// (A compiled Bun binary evaluates jiti's embedded Babel only when jiti has a file to transform: jiti-bun-loader.ts.)
+	createJitiPromise ??= (
+		isBunBinary
+			? loadJitiBunLoader()
+			: usesEmbeddedModules
+				? import("./jiti-static-loader.ts")
+				: import("./jiti-loader.ts")
+	).then((module) => module.createJiti);
 	return createJitiPromise;
 }
 
@@ -70,7 +89,7 @@ function getVirtualModules(): Promise<Record<string, unknown>> {
  * these fails, so that the extension takes its alternative: pi-fff, which tries @ff-labs/fff-bun first, then uses
  * @ff-labs/fff-node (the same native library, through ffi-rs, a Node-API module).
  */
-const JIT_ONLY_PACKAGES = ["@ff-labs/fff-bun"];
+export const JIT_ONLY_PACKAGES = ["@ff-labs/fff-bun"];
 
 function withoutJitOnlyPackages(modules: Record<string, unknown>): Record<string, unknown> {
 	const result = { ...modules };
@@ -115,10 +134,12 @@ function getAliases(): Record<string, string> {
 	const piCodingAgentEntry = packageIndex;
 	const piAgentCoreEntry = resolveWorkspaceOrImport("agent/dist/index.js", "@earendil-works/pi-agent-core");
 	const piTuiEntry = resolveWorkspaceOrImport("tui/dist/index.js", "@earendil-works/pi-tui");
-	// Extensions resolve the pi-ai root to the compat entrypoint (a strict
-	// superset of the core entrypoint): existing extensions using the old
-	// global API keep working at runtime until compat is removed.
-	const piAiCompatEntry = resolveWorkspaceOrImport("ai/dist/compat.js", "@earendil-works/pi-ai/compat");
+	// Extensions resolve the pi-ai root to the extension view: the compat
+	// entrypoint (a strict superset of the core entrypoint) plus TypeBox's Type,
+	// Static and TSchema, so extensions using the old global API and pi-ai's
+	// former TypeBox re-exports keep working.
+	const piAiCompatEntry = path.resolve(__dirname, "pi-ai-extension-view.js");
+	const piAiModelsEntry = resolveWorkspaceOrImport("ai/dist/models.js", "@earendil-works/pi-ai/models");
 	const piAiOauthEntry = resolveWorkspaceOrImport("ai/dist/oauth.js", "@earendil-works/pi-ai/oauth");
 	const piAiProvidersEntry = resolveWorkspaceOrImport(
 		"ai/dist/providers/all.js",
@@ -131,6 +152,7 @@ function getAliases(): Record<string, string> {
 		"@earendil-works/pi-tui": piTuiEntry,
 		"@earendil-works/pi-ai/providers/all": piAiProvidersEntry,
 		"@earendil-works/pi-ai/compat": piAiCompatEntry,
+		"@earendil-works/pi-ai/models": piAiModelsEntry,
 		"@earendil-works/pi-ai/oauth": piAiOauthEntry,
 		"@earendil-works/pi-ai": piAiCompatEntry,
 		"@mariozechner/pi-coding-agent": piCodingAgentEntry,
@@ -138,6 +160,7 @@ function getAliases(): Record<string, string> {
 		"@mariozechner/pi-tui": piTuiEntry,
 		"@mariozechner/pi-ai/providers/all": piAiProvidersEntry,
 		"@mariozechner/pi-ai/compat": piAiCompatEntry,
+		"@mariozechner/pi-ai/models": piAiModelsEntry,
 		"@mariozechner/pi-ai/oauth": piAiOauthEntry,
 		"@mariozechner/pi-ai": piAiCompatEntry,
 		typebox: typeboxEntry,
@@ -170,7 +193,7 @@ export function clearExtensionCache(): void {
 
 function useExtensionCacheCwd(cwd: string): ExtensionCacheToken {
 	const resolvedCwd = resolvePath(cwd);
-	if (extensionCacheCwd !== undefined && extensionCacheCwd !== resolvedCwd) {
+	if (extensionCacheCwd !== undefined && !pathsEqual(extensionCacheCwd, resolvedCwd)) {
 		clearExtensionCache();
 	}
 	extensionCacheCwd = resolvedCwd;
@@ -268,6 +291,8 @@ export function createExtensionRuntime(): ExtensionRuntime {
  * Registration methods write to the extension object.
  * Action methods delegate to the shared runtime.
  */
+const DEFAULT_MARKDOWN_MESSAGE_TYPES: readonly MarkdownMessageType[] = ["user", "assistant", "assistant-thinking"];
+
 function createExtensionAPI(
 	extension: Extension,
 	runtime: ExtensionRuntime,
@@ -344,6 +369,16 @@ function createExtensionAPI(
 			});
 		},
 
+		registerPage(key: string, page: MobilePageDefinition<ExtensionContext>): void {
+			assertActive();
+			registerPage(extension, key, "page", page);
+		},
+
+		registerTile(key: string, tile: MobileTileDefinition<ExtensionContext>): void {
+			assertActive();
+			registerPage(extension, key, "tile", tile);
+		},
+
 		registerShortcut(
 			shortcut: KeyId,
 			options: {
@@ -380,9 +415,12 @@ function createExtensionAPI(
 			extension.messageRenderers.set(customType, renderer as MessageRenderer);
 		},
 
-		registerMarkdownTransformer(transformer: MarkdownTransformer): void {
+		registerMarkdownTransformer(transformer: MarkdownTransformer, options?: MarkdownTransformerOptions): void {
 			assertActive();
-			extension.markdownTransformer = transformer;
+			extension.markdownTransformer = {
+				transformer,
+				messageTypes: new Set(options?.messageTypes ?? DEFAULT_MARKDOWN_MESSAGE_TYPES),
+			};
 		},
 
 		registerEntryRenderer<T>(customType: string, renderer: EntryRenderer<T>): void {
@@ -620,7 +658,7 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 		...extensionTransformCache(),
 	});
 
-	const module = await jiti.import(extensionPath, { default: true });
+	const module = await jiti.import(canonicalizePath(extensionPath), { default: true });
 	const factory = module as ExtensionFactory;
 	if (typeof factory !== "function") {
 		return undefined;
@@ -629,6 +667,48 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 		extensionCache.set(extensionPath, factory);
 	}
 	return factory;
+}
+
+/** Checks and stores a `registerPage` / `registerTile`. */
+function registerPage(
+	extension: Extension,
+	key: string,
+	kind: "page" | "tile",
+	definition: MobileTileDefinition<ExtensionContext>,
+): void {
+	const what = kind === "page" ? "Page" : "Tile";
+	if (typeof key !== "string" || !MOBILE_VIEW_ID_PATTERN.test(key)) {
+		throw new Error(
+			`${what} registered by extension "${extension.path}" needs a key of 1 to 64 of A-Z a-z 0-9 _ . : -`,
+		);
+	}
+	if (typeof definition?.title !== "string" || definition.title.trim() === "" || definition.title.length > 200) {
+		throw new Error(
+			`${what} "${key}" registered by extension "${extension.path}" needs a title of at most 200 characters`,
+		);
+	}
+	if (typeof definition.open !== "function") {
+		throw new Error(`${what} "${key}" registered by extension "${extension.path}" must define open()`);
+	}
+	if (definition.icon !== undefined && !(MOBILE_VIEW_ICONS as readonly string[]).includes(definition.icon)) {
+		throw new Error(
+			`${what} "${key}" registered by extension "${extension.path}": unknown icon "${definition.icon}"`,
+		);
+	}
+	if (
+		definition.description !== undefined &&
+		(typeof definition.description !== "string" || definition.description.length > 200)
+	) {
+		throw new Error(
+			`${what} "${key}" registered by extension "${extension.path}": description: at most 200 characters`,
+		);
+	}
+	const page = (definition as { page?: unknown }).page;
+	if (kind === "tile" && page !== undefined && (typeof page !== "string" || !MOBILE_VIEW_ID_PATTERN.test(page))) {
+		throw new Error(`Tile "${key}" registered by extension "${extension.path}": page: expected a page key`);
+	}
+	extension.pages ??= new Map();
+	extension.pages.set(key, { key, kind, definition, sourceInfo: extension.sourceInfo });
 }
 
 /**
@@ -679,8 +759,35 @@ async function loadExtension(
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
 	cacheToken?: ExtensionCacheToken,
-): Promise<{ extension: Extension | null; error: string | null }> {
+): Promise<{ extension: Extension | null; error: string | null; warning?: string }> {
 	const resolvedPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
+
+	// Pi-Bolt: an extension `pi-bolt compile` built in, while its files are as they were then (core/extensions/compiled.ts).
+	const compiled = PIBOLT ? compiledExtensionFor(resolvedPath) : undefined;
+	let failedCompiledIn: string | undefined;
+	if (compiled && "factory" in compiled) {
+		time(`${extensionPath} module import`, "extensions");
+		// (What it loads from disk as it runs gets Pi's modules, as from jiti: core/extensions/compiled-modules.ts.)
+		provideModulesToFiles(
+			PIBOLT?.jit ? PI_MODULE_NAMES : [...PI_MODULE_NAMES, ...JIT_ONLY_PACKAGES],
+			getVirtualModules,
+		);
+		try {
+			const extension = await initializeExtension(
+				compiled.factory,
+				extensionPath,
+				resolvedPath,
+				cwd,
+				eventBus,
+				runtime,
+			);
+			compiled.extension.loaded = true;
+			return { extension, error: null };
+		} catch (err) {
+			// Compiled in, its module or factory threw: it is loaded from its files, as Pi loads it, and works or fails there.
+			failedCompiledIn = firstLineOf(err);
+		}
+	}
 
 	try {
 		const factory = await loadExtensionModule(resolvedPath, cacheToken);
@@ -691,10 +798,24 @@ async function loadExtension(
 
 		const extension = await initializeExtension(factory, extensionPath, resolvedPath, cwd, eventBus, runtime);
 
+		if (compiled && "changed" in compiled) {
+			const warning = `changed since it was compiled in, so it was loaded from its files: run \`pi-bolt compile\` to compile it in again`;
+			return { extension, error: null, warning };
+		}
+		if (failedCompiledIn !== undefined && compiled && "extension" in compiled)
+			compiled.extension.failed = failedCompiledIn;
+		const failed = compiled && "failed" in compiled ? compiled.failed.failed : failedCompiledIn;
+		if (failed !== undefined) {
+			const warning = `it failed compiled in (${failed}), so it was loaded from its files: \`pi-bolt compile\` builds without it`;
+			return { extension, error: null, warning };
+		}
 		return { extension, error: null };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		return { extension: null, error: `Failed to load extension: ${message}` };
+		return {
+			extension: null,
+			error: `Failed to load extension: ${withJitHint(message, () => extensionDisplayName(resolvedPath))}`,
+		};
 	}
 }
 
@@ -733,13 +854,14 @@ async function loadExtensionsInternal(
 	for (const extPath of paths) {
 		// Pi-Bolt's built-in Herdr extension takes the place of Herdr's Pi integration.
 		if (PIBOLT && isHerdrPiIntegration(resolvePath(extPath, resolvedCwd))) continue;
-		const { extension, error } = await loadExtension(
+		const { extension, error, warning } = await loadExtension(
 			extPath,
 			resolvedCwd,
 			resolvedEventBus,
 			resolvedRuntime,
 			cacheToken,
 		);
+		if (warning) warnings.push({ path: extPath, warning });
 
 		if (error) {
 			errors.push({ path: extPath, error });

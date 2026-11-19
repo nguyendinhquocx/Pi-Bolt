@@ -4,26 +4,27 @@ import type { ModelsSimpleStreamOptions } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
-import { AgentSession } from "./agent-session.ts";
+import { AgentSession, markRuntimeStreamFunction } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { CacheWarmer } from "./cache-warmer.ts";
+import { getClientIdentity } from "./client-identity.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
 import { createToolNameMatcher } from "./mcp-servers.ts";
 import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
-import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
 import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
 import {
 	applyToolModifiers,
-	DEFAULT_TOOL_NAMES,
+	defaultToolNamesFor,
 	getToolListError,
 	isToolModifier,
 	SettingsManager,
 } from "./settings-manager.ts";
+import { BUILTIN_PATH_PREFIX } from "./source-info.ts";
 import { time } from "./timings.ts";
 import {
 	createBashTool,
@@ -279,7 +280,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const toolListError = options.tools ? getToolListError(options.tools) : undefined;
 	if (toolListError) throw new Error(`Invalid tools option: ${toolListError}`);
-	const defaultToolNames = options.noTools ? [] : (settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES);
+	const builtInDefaultTools = defaultToolNamesFor(
+		resourceLoader.getExtensions().extensions.map((extension) => extension.path),
+	);
+	const defaultToolNames = options.noTools
+		? []
+		: (settingsManager.getDefaultTools(builtInDefaultTools) ?? builtInDefaultTools);
 	// A `tools` list of only `+name`/`-name` entries changes the default selection instead of
 	// replacing it, like the `defaultTools` setting.
 	const toolModifiers = options.tools?.some(isToolModifier) ? options.tools : undefined;
@@ -337,10 +343,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		() => settingsManager.getCacheWarmingMode(),
 		async (event) => extensionRunnerRef.current?.emitCacheWarmingDecision(event) ?? event.action,
 	);
-	const buildRequestOptions = (
-		requestModel: Model<any>,
-		options: ModelsSimpleStreamOptions = {},
-	): ModelsSimpleStreamOptions => {
+	const buildRequestOptions = (options: ModelsSimpleStreamOptions = {}): ModelsSimpleStreamOptions => {
 		const providerRetrySettings = settingsManager.getProviderRetrySettings();
 		const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
 		const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
@@ -351,17 +354,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			websocketConnectTimeoutMs: options.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs(),
 			maxRetries: options.maxRetries ?? providerRetrySettings.maxRetries,
 			maxRetryDelayMs: options.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-			transformHeaders: async (requestHeaders) => {
-				const headers = mergeProviderAttributionHeaders(
-					requestModel,
-					settingsManager,
-					options.sessionId,
-					requestHeaders,
-				);
-				return headerRunner?.hasHandlers("before_provider_headers")
-					? headerRunner.emitBeforeProviderHeaders(headers ?? {})
-					: (headers ?? {});
-			},
+			// Replaces the agent loop's default identity; read per request so telemetry changes apply at once.
+			identity: getClientIdentity(settingsManager),
+			transformHeaders: async (headers) =>
+				headerRunner?.hasHandlers("before_provider_headers")
+					? headerRunner.emitBeforeProviderHeaders(headers)
+					: headers,
 		};
 	};
 	// Warm only requests for the selected model. Requests a virtual selection routed, or that an
@@ -418,7 +416,33 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
-			const requestOptions = buildRequestOptions(model, options);
+			const requestOptions = buildRequestOptions(options);
+			if (requestOptions.onPayload === transformProviderPayload) {
+				// The payload hook only while an extension handles before_provider_request, read when the request is
+				// built (a cache-warming replay builds it later). Without a hook the providers may reuse the request
+				// objects of unchanged messages between requests (pi-ai request-cache.ts); the hook alone returns the
+				// payload as it is.
+				Object.defineProperty(requestOptions, "onPayload", {
+					get: () =>
+						extensionRunnerRef.current?.hasHandlers("before_provider_request")
+							? transformProviderPayload
+							: undefined,
+					enumerable: true,
+					configurable: true,
+				});
+				// The session's messages are never changed in place: entries are only appended, and compaction,
+				// branches, edits and `context` handlers make new objects. An extension that is not Pi's own could still
+				// change a message it was handed (events, ctx.sessionManager), so the providers may reuse conversions
+				// only while none is loaded. Read when the request is built, like the hook.
+				Object.defineProperty(requestOptions, "immutableMessages", {
+					get: () =>
+						extensionRunnerRef.current
+							?.getExtensionPaths()
+							.every((path) => path.startsWith(BUILTIN_PATH_PREFIX)) ?? true,
+					enumerable: true,
+					configurable: true,
+				});
+			}
 			// Compaction and summaries use their own routing ids; only session requests
 			// replace the cache entry, so warming restarts from them. Keep warming while
 			// the current transcript still extends the request's prefix. Agent state may
@@ -444,6 +468,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		thinkingBudgets: settingsManager.getThinkingBudgets(),
 		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 	});
+	// This stream resolves auth through modelRuntime, so summaries must not pre-resolve it (#11520).
+	markRuntimeStreamFunction(agent.streamFunction, modelRuntime);
 
 	// Restore missing settings metadata for older sessions.
 	if (hasExistingSession) {

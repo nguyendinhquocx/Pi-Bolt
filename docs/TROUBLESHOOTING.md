@@ -82,14 +82,20 @@ To rule a compiler optimization in or out of a problem, build with it off (each 
 **`pi-bolt: command not found` after installing.** `~/.local/bin` is not on your `PATH`. Add
 `export PATH="$HOME/.local/bin:$PATH"` to your shell profile.
 
-**`GLIBC_2.xx not found` or `No such file or directory` when starting.** The system is musl-based (Alpine), or older than
-glibc 2.17. Pi-Bolt needs glibc 2.17 or later (CentOS 7, Debian 8, Ubuntu 14.04 and anything newer).
+**`GLIBC_2.xx not found` or `No such file or directory` when starting.** The system is older than glibc 2.17, or a glibc
+build is on a musl system (Alpine). Pi-Bolt needs glibc 2.17 or later (CentOS 7, Debian 8, Ubuntu 14.04 and anything newer),
+or on musl its musl builds (`PIBOLT_VARIANT` x64-musl, x64-musl-baseline or x64-musl-jit, which the installer picks there by
+itself) and `libstdc++` (`apk add libstdc++`). Alpine on ARM64 is not supported.
 
 **`Illegal instruction` when starting.** The CPU has no SSE4.2 (older than Intel Nehalem, 2008, or AMD Bulldozer, 2011). No
 build runs on it; the installer says so.
 
 **A theme, the HTML export or image tools are missing.** The executable was moved away from the files around it. Keep the whole
 folder together, and link or alias the executable instead of copying it.
+
+**`bun:ffi requires the JIT`.** The extension calls into a native library through `bun:ffi`, which works only on the JIT build.
+The message names the extension and gives the command that installs the JIT build
+([README](../README.md#jit-build-for-heavy-plugins)); `pi-bolt doctor` lists every extension that uses `bun:ffi`.
 
 **A plugin works with stock Pi but not when compiled in.** See the [compatibility checklist](PLUGINS.md#compatibility-checklist):
 usually a dynamic import, or a file read from next to the plugin's source.
@@ -98,6 +104,53 @@ usually a dynamic import, or a file read from next to the plugin's source.
 function that is not compiled cannot be relied on to run. The message names the function and says why; the usual way out is to
 change that function. `BUN_JSC_allowAOTDeclinedFunctions=1` builds anyway: the function then runs from bytecode if it uses no
 variables from outside itself, and stops the program when it is called if it does.
+
+**`pi-bolt compile` says an extension is "not compiled in".** It could not build that extension (a static `import` or
+`require()` that does not resolve: the line names it and the installed file), a function of it is too big for the compiler
+(below), or it fails in the new build as it starts and not from its files (it reads the copy the build was made from, which is
+gone). The others are compiled in, and that one loads from its files as Pi loads it: it works there, or fails with
+Pi's own error. Nothing to do; to compile it in, install what it imports, or fix what it reads.
+
+**`pi-bolt compile` stops with "is bigger than maximumAOTCandidateBytecodeSize".** When `pi-bolt compile` can tell which
+extension the function is of, it leaves that one out (above) and goes on. Otherwise: one function of the program holds more than
+256 KB of bytecode. Each extension, with the modules only it imports, is a file of its own, compiled apart from Pi's code and
+from the other extensions, so the limit is one extension's. Below the compiler's line, `pi-bolt compile` says which it is:
+- `(a function)`: one very large function of an extension, or a CommonJS module (a package's prebuilt, bundled `dist/`). The
+  message names the file and the extension.
+- `(the top-level code of a module)`: the top-level code of one extension, usually one large literal (embedded data). The
+  message names the extension.
+
+Leave that extension out with `pi-bolt compile --exclude <name>`, by the name `pi-bolt compile` prints for it: it still loads
+from its files at run time, and later compiles leave it out too (`--include <name>` takes it back). Or compile
+it anyway with `BUN_JSC_maximumAOTCandidateBytecodeSize=<n> pi-bolt compile`, `<n>` being at least the size the message gives.
+compile.json keeps that limit: a later `pi-bolt compile` without the variable builds with it too, and
+`BUN_JSC_maximumAOTCandidateBytecodeSize=262144 pi-bolt compile` takes it back. The compiler warns that a big function can take
+minutes and tens of GB; one of a few hundred KB has taken seconds. The message's third remedy,
+`BUN_JSC_omitBytecodeFromStaticHeap=0`, does not apply to `pi-bolt compile`: the build keeps the release's setting.
+
+Pi-Bolt 1.0.1 and earlier added the top-level code of every extension to the program's, about 200 KB of which is Pi's: there a
+few extensions together passed the limit, and leaving out any one of them did not help (#129). Pi-Bolt 1.0.2 compiled each
+module on its own, but stopped at an extension with an `await` at its top level (#142). Pi-Bolt 1.0.3 compiles each
+extension on its own, `await` or not.
+
+**`pi-bolt compile` says an `import()` "does not resolve: left to run time".** The extension loads a package it does not
+declare with `import()`, usually for a feature that needs that package (#160). The build goes on, and when that code runs the
+`import()` finds the package from where the extension is installed, or fails as it does without Pi-Bolt. Nothing to do unless
+you want that feature: then install the package where the extension finds it. An extension with a static `import` of a package
+that is not there is left out of the build (above).
+
+**Every `pi-bolt` command stops with an extension's error (Pi-Bolt 1.0.4 and earlier, after `pi-bolt compile`).** Those builds
+ran every compiled-in extension's top-level code before Pi started, so one that threw stopped every command, `pi-bolt update
+--rollback` included. Put the build before back by hand: in the installation folder (`~/.pi-bolt`), replace the build folder
+(`pi-bolt-<platform>`) with `pi-bolt-<platform>.previous`, or run the installer again. Pi-Bolt 1.0.5 runs an extension's code only
+when Pi loads it.
+
+**`pi-bolt compile` stops with `Could not resolve` or another error of the bundler in an extension.** Below the bundler's
+error, `pi-bolt compile` names the extension it is in and gives the `pi-bolt compile --exclude <name>` that leaves it out: it
+then loads from its files, as it does without `pi-bolt compile`. `--exclude` takes the names `pi-bolt compile --list` gives,
+such as `pi-system-prompt` in `pi-system-prompt (package): compiling`, or the package's name or the extension's file, not a
+package the extension imports: one that names no extension stops the compile and lists the names there are. Pi-Bolt 1.0.4 and earlier also stopped at Pi's older names for its modules, such as
+`@mariozechner/pi-tui` (#174); later releases compile those in ([what it copies](PLUGINS.md#what-it-copies)).
 
 **A run-time plugin is slow.** On the default build, plugins loaded at run time are interpreted. Compile them in
 ([PLUGINS.md](PLUGINS.md)) or use the `linux-x64-jit` build.
@@ -110,6 +163,16 @@ with pauses of a second; 256 MB or more leaves it alone. A CPU limit (`--cpus`) 
 **A Herdr restart does not reopen the Pi-Bolt session.** Herdr runs the restore command with its server's `PATH`, which must
 include `pi-bolt`: start Herdr from a terminal, not with `brew services`. Agents that pi-herdr starts in other panes run stock
 Pi (`pi`), which must be installed.
+
+**`herdr agent list` shows the Pi-Bolt pane without a session.** Herdr stores an agent's session (`agent_session`) only for
+the integrations it ships, and Pi-Bolt is not one of them. The pane's state and its resume command are stored anyway, so the
+sidebar and a Herdr restart work; what is missing is the session, which automation reading `herdr agent list` or
+`herdr pane get` does not find. Start Pi-Bolt in the pane with `pi-bolt --herdr-pi`, which reports as Herdr's own Pi
+integration so the session is stored ([README](../README.md#herdr)). The flag needs the running process to be named `pi`: on
+Linux and macOS Pi-Bolt re-executes itself with `pi` as its command name, and on Windows the process has to start from a
+file named `pi.exe`, a hardlink or a copy. When that did not happen, a startup warning says so and Pi-Bolt reports as
+`pi-bolt` after all. On Windows the session is stored only for the run started as `pi.exe`: the reported resume command
+starts `pi-bolt`, so a restored pane reports as `pi-bolt` again.
 
 **Startup is slower than expected.** Check that the compiled code is used (above). Check `PI_TIMING=1` for slow extension
 factories. A cold page cache (the first start after boot or install) adds the time to read the executable from disk.
@@ -181,10 +244,9 @@ remove anything private from it before you post it.
 
 Please [open an issue](https://github.com/opensec-git/Pi-Bolt/issues/new) with:
 
-- the output of `BUN_STATIC_HEAP_VERBOSE=1 pi-bolt --version`;
-- your distribution, `ldd --version | head -1`, and the CPU model (`grep -m1 "model name" /proc/cpuinfo`); on macOS, `sw_vers` and
-  `sysctl -n machdep.cpu.brand_string`; on Windows, `winver`'s version and build, the terminal (Windows Terminal, the console
-  window, VS Code), and the CPU (`Get-CimInstance Win32_Processor | Select-Object Name` in PowerShell);
+- the output of `pi-bolt doctor` (the build, installation, extensions and packages, and the problems it finds; no keys or
+  tokens, and your home folder shown as `~`);
+- on Linux, `ldd --version | head -1`; on Windows, the terminal (Windows Terminal, the console window, VS Code);
 - whether the problem also happens with `BUN_AOT=0 pi-bolt`, and with stock Pi.
 
 If it only happens with the compiled code, it is a Pi-Bolt bug. If it also happens with stock Pi, report it to

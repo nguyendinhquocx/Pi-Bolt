@@ -1,12 +1,13 @@
 import type { ChildProcess, ChildProcessByStdio } from "node:child_process";
-import { createHash } from "node:crypto";
 import {
 	chmodSync,
+	type Dirent,
 	existsSync,
 	globSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	rmSync,
 	statSync,
 	writeFileSync,
@@ -32,25 +33,30 @@ function getEnv(): NodeJS.ProcessEnv {
 	}
 }
 
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Readable } from "node:stream";
 import ignore from "ignore";
 import { minimatch } from "minimatch";
-import { gt, maxSatisfying, rcompare, satisfies, valid, validRange } from "semver";
 import { CONFIG_DIR_NAME, isBunBinary } from "../config.ts";
+import { PIBOLT } from "../pi-bolt.ts";
 import { findExecutableOnPath, spawnProcess, spawnProcessSync } from "../utils/child-process.ts";
 import { type GitSource, parseGitUrl } from "../utils/git.ts";
+import { semver } from "../utils/lazy-packages.ts";
 import {
 	canonicalizePath,
+	getPathComparisonKey,
 	isLocalPath,
 	markPathIgnoredByCloudSync,
 	normalizePath,
+	pathsEqual,
 	resolvePath,
 } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { isStdoutTakenOver } from "./output-guard.ts";
+import { getPackageIdentity } from "./package-source.ts";
 import { type PiManifest, readPiManifest } from "./pi-manifest.ts";
-import type { PackageSource, SettingsManager } from "./settings-manager.ts";
+import { ResourcePathKeys } from "./resource-path-keys.ts";
+import type { PackageSource, Settings, SettingsManager } from "./settings-manager.ts";
 import { BUILTIN_PATH_PREFIX } from "./source-info.ts";
 
 /** How package installs run: argv-style, plus environment for the package manager process. */
@@ -66,18 +72,19 @@ const NETWORK_TIMEOUT_MS = 10000;
 const UPDATE_CHECK_CONCURRENCY = 4;
 const GIT_UPDATE_CONCURRENCY = 4;
 
-function isOfflineModeEnabled(): boolean {
+/** Whether PI_OFFLINE is set; package installs and updates then skip all network access. */
+export function isOfflineModeEnabled(): boolean {
 	const value = process.env.PI_OFFLINE;
 	if (!value) return false;
 	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
 }
 
 function isExactNpmVersion(version: string | undefined): boolean {
-	return valid(version ?? "") !== null;
+	return semver().valid(version ?? "") !== null;
 }
 
 function getNpmVersionRange(version: string | undefined): string | undefined {
-	return version ? (validRange(version) ?? undefined) : undefined;
+	return version ? (semver().validRange(version) ?? undefined) : undefined;
 }
 
 export interface PathMetadata {
@@ -85,6 +92,7 @@ export interface PathMetadata {
 	scope: SourceScope;
 	origin: "package" | "top-level";
 	baseDir?: string;
+	changelogPath?: string;
 	packageRoot?: string;
 }
 
@@ -99,12 +107,27 @@ export interface ResolvedPaths {
 	skills: ResolvedResource[];
 	prompts: ResolvedResource[];
 	themes: ResolvedResource[];
+	/** Configured packages that were skipped because installing them failed. */
+	installFailures?: PackageInstallFailure[];
+}
+
+/** A configured package that could not be installed while resolving resources. */
+export interface PackageInstallFailure {
+	source: string;
+	scope: SourceScope;
+	message: string;
 }
 
 export type MissingSourceAction = "install" | "skip" | "error";
 
 export interface ProgressEvent {
-	type: "start" | "progress" | "complete" | "error";
+	/**
+	 * `start` is followed by exactly one `complete` or `error` for the same source.
+	 * `progress` carries an intermediate message or warning.
+	 * `result` reports an outcome outside that pairing, e.g. one changed package
+	 * after update(): `npm:foo 1.2.0 -> 1.3.0`.
+	 */
+	type: "start" | "progress" | "complete" | "error" | "result";
 	action: "install" | "remove" | "update" | "clone" | "pull";
 	source: string;
 	message?: string;
@@ -126,20 +149,26 @@ export interface ConfiguredPackage {
 	installedPath?: string;
 }
 
+export interface PackageMutationOptions {
+	local?: boolean;
+	/** Select raw Pi-Bolt declarations instead of shared packages. Does not isolate installed files. */
+	piBolt?: boolean;
+}
+
 export interface PackageManager {
 	resolve(onMissing?: (source: string) => Promise<MissingSourceAction>): Promise<ResolvedPaths>;
-	install(source: string, options?: { local?: boolean }): Promise<void>;
-	installAndPersist(source: string, options?: { local?: boolean }): Promise<void>;
-	remove(source: string, options?: { local?: boolean }): Promise<void>;
-	removeAndPersist(source: string, options?: { local?: boolean }): Promise<boolean>;
+	install(source: string, options?: PackageMutationOptions): Promise<void>;
+	installAndPersist(source: string, options?: PackageMutationOptions): Promise<void>;
+	remove(source: string, options?: PackageMutationOptions): Promise<void>;
+	removeAndPersist(source: string, options?: PackageMutationOptions): Promise<boolean>;
 	update(source?: string): Promise<void>;
 	listConfiguredPackages(): ConfiguredPackage[];
 	resolveExtensionSources(
 		sources: string[],
 		options?: { local?: boolean; temporary?: boolean },
 	): Promise<ResolvedPaths>;
-	addSourceToSettings(source: string, options?: { local?: boolean }): boolean;
-	removeSourceFromSettings(source: string, options?: { local?: boolean }): boolean;
+	addSourceToSettings(source: string, options?: PackageMutationOptions): boolean;
+	removeSourceFromSettings(source: string, options?: PackageMutationOptions): boolean;
 	setProgressCallback(callback: ProgressCallback | undefined): void;
 	getInstalledPath(source: string, scope: "user" | "project"): string | undefined;
 }
@@ -172,6 +201,21 @@ type ParsedSource = NpmSource | GitSource | LocalSource;
 
 type InstalledSourceScope = Exclude<SourceScope, "temporary">;
 
+/** One installed copy of a package in an npm install root. */
+type InstalledNpmCopy = {
+	name: string;
+	path: string;
+	topLevel: boolean;
+	dependencies: string[];
+};
+
+/** Top-level packages in an npm install root that no dependency saved in the root package.json reaches. */
+type UnsavedNpmPackages = {
+	packages: InstalledNpmCopy[];
+	/** Unsaved packages that no other unsaved package depends on, such as a package installed with `--no-save`. */
+	roots: string[];
+};
+
 interface ConfiguredUpdateSource {
 	source: string;
 	scope: InstalledSourceScope;
@@ -179,10 +223,23 @@ interface ConfiguredUpdateSource {
 
 interface NpmUpdateTarget extends ConfiguredUpdateSource {
 	parsed: NpmSource;
+	/** Version installed before the update, if any. */
+	installedVersion?: string;
+	/** Newer version reported by the registry, if the lookup succeeded. */
+	targetVersion?: string;
 }
 
 interface GitUpdateTarget extends ConfiguredUpdateSource {
 	parsed: GitSource;
+}
+
+/** A configured package whose installed npm version or git commit changed during update(). */
+interface UpdatedPackage extends ConfiguredUpdateSource {
+	type: "npm" | "git";
+	/** npm version or git commit before the update; undefined if it was not installed. */
+	from?: string;
+	/** npm version or git commit after the update. */
+	to?: string;
 }
 
 interface ResourceAccumulator {
@@ -273,11 +330,19 @@ function prefixIgnorePattern(line: string, prefix: string): string | null {
 	return negated ? `!${prefixed}` : prefixed;
 }
 
-function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string): void {
+// Matchers that hold a rule: one that holds none ignores nothing, so it is not asked (isIgnored), which saves the path
+// work of every entry.
+const matchersWithRules = new WeakSet<IgnoreMatcher>();
+
+/** Adds the rules of `dir`'s ignore files to `ig`, looking up only names that `entries` (dir's listing) has. */
+function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string, entries: Dirent[]): void {
 	const relativeDir = relative(rootDir, dir);
 	const prefix = relativeDir ? `${toPosixPath(relativeDir)}/` : "";
+	// In any case: existsSync finds a name in another case where the file system ignores case.
+	const names = new Set(entries.map((entry) => entry.name.toLowerCase()));
 
 	for (const filename of IGNORE_FILE_NAMES) {
+		if (!names.has(filename)) continue;
 		const ignorePath = join(dir, filename);
 		if (!existsSync(ignorePath)) continue;
 		try {
@@ -288,9 +353,34 @@ function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string): void {
 				.filter((line): line is string => Boolean(line));
 			if (patterns.length > 0) {
 				ig.add(patterns);
+				matchersWithRules.add(ig);
 			}
 		} catch {}
 	}
+}
+
+/**
+ * The entries of `dir` after adding its ignore rules to `ig`, or undefined when it cannot be listed (then its rules
+ * would apply to nothing). Listing first spares an existsSync for each ignore file name the folder does not have.
+ */
+function listWithIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string): Dirent[] | undefined {
+	// (A missing folder is common, and the error readdirSync would throw costs more than the existsSync.)
+	if (!existsSync(dir)) return undefined;
+	let entries: Dirent[];
+	try {
+		entries = readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return undefined;
+	}
+	addIgnoreRules(ig, dir, rootDir, entries);
+	return entries;
+}
+
+/** Whether `ig` ignores `fullPath` (as a folder when `isDir`), taken relative to `root`. */
+function isIgnored(ig: IgnoreMatcher, root: string, fullPath: string, isDir: boolean): boolean {
+	if (!matchersWithRules.has(ig)) return false;
+	const relPath = toPosixPath(relative(root, fullPath));
+	return ig.ignores(isDir ? `${relPath}/` : relPath);
 }
 
 function isPattern(s: string): boolean {
@@ -338,14 +428,12 @@ function collectFiles(
 	rootDir?: string,
 ): string[] {
 	const files: string[] = [];
-	if (!existsSync(dir)) return files;
-
 	const root = rootDir ?? dir;
 	const ig = ignoreMatcher ?? ignore();
-	addIgnoreRules(ig, dir, root);
+	const entries = listWithIgnoreRules(ig, dir, root);
+	if (!entries) return files;
 
 	try {
-		const entries = readdirSync(dir, { withFileTypes: true });
 		for (const entry of entries) {
 			if (entry.name.startsWith(".")) continue;
 			if (skipNodeModules && entry.name === "node_modules") continue;
@@ -364,9 +452,7 @@ function collectFiles(
 				}
 			}
 
-			const relPath = toPosixPath(relative(root, fullPath));
-			const ignorePath = isDir ? `${relPath}/` : relPath;
-			if (ig.ignores(ignorePath)) continue;
+			if (isIgnored(ig, root, fullPath, isDir)) continue;
 
 			if (isDir) {
 				files.push(...collectFiles(fullPath, filePattern, skipNodeModules, ig, root));
@@ -383,22 +469,25 @@ function collectFiles(
 
 type SkillDiscoveryMode = "pi" | "agents";
 
+/**
+ * `pathKeys` learns the entries reached from the root through no symbolic link (`plainPath`: so far, none), whose real
+ * paths follow from the root's.
+ */
 function collectSkillEntries(
 	dir: string,
 	mode: SkillDiscoveryMode,
 	ignoreMatcher?: IgnoreMatcher,
 	rootDir?: string,
+	pathKeys?: ResourcePathKeys,
+	plainPath = true,
 ): string[] {
 	const entries: string[] = [];
-	if (!existsSync(dir)) return entries;
-
 	const root = rootDir ?? dir;
 	const ig = ignoreMatcher ?? ignore();
-	addIgnoreRules(ig, dir, root);
+	const dirEntries = listWithIgnoreRules(ig, dir, root);
+	if (!dirEntries) return entries;
 
 	try {
-		const dirEntries = readdirSync(dir, { withFileTypes: true });
-
 		for (const entry of dirEntries) {
 			if (entry.name !== "SKILL.md") {
 				continue;
@@ -414,9 +503,9 @@ function collectSkillEntries(
 				}
 			}
 
-			const relPath = toPosixPath(relative(root, fullPath));
-			if (isFile && !ig.ignores(relPath)) {
+			if (isFile && !isIgnored(ig, root, fullPath, false)) {
 				entries.push(fullPath);
+				if (plainPath && !entry.isSymbolicLink()) pathKeys?.notePlainEntry(root, fullPath);
 				return entries;
 			}
 		}
@@ -439,21 +528,21 @@ function collectSkillEntries(
 				}
 			}
 
-			const relPath = toPosixPath(relative(root, fullPath));
 			const shouldIncludeMarkdownFile =
 				isFile &&
 				entry.name.endsWith(".md") &&
-				!ig.ignores(relPath) &&
+				!isIgnored(ig, root, fullPath, false) &&
 				((mode === "pi" && dir === root) || (mode === "agents" && dir !== root));
 			if (shouldIncludeMarkdownFile) {
 				entries.push(fullPath);
+				if (plainPath && !entry.isSymbolicLink()) pathKeys?.notePlainEntry(root, fullPath);
 				continue;
 			}
 
 			if (!isDir) continue;
-			if (ig.ignores(`${relPath}/`)) continue;
+			if (isIgnored(ig, root, fullPath, true)) continue;
 
-			entries.push(...collectSkillEntries(fullPath, mode, ig, root));
+			entries.push(...collectSkillEntries(fullPath, mode, ig, root, pathKeys, plainPath && !entry.isSymbolicLink()));
 		}
 	} catch {
 		// Ignore errors
@@ -462,8 +551,8 @@ function collectSkillEntries(
 	return entries;
 }
 
-function collectAutoSkillEntries(dir: string, mode: SkillDiscoveryMode): string[] {
-	return collectSkillEntries(dir, mode);
+function collectAutoSkillEntries(dir: string, mode: SkillDiscoveryMode, pathKeys: ResourcePathKeys): string[] {
+	return collectSkillEntries(dir, mode, undefined, undefined, pathKeys);
 }
 
 function findGitRepoRoot(startDir: string): string | null {
@@ -501,15 +590,14 @@ function collectAncestorAgentsSkillDirs(startDir: string): string[] {
 	return skillDirs;
 }
 
-function collectAutoPromptEntries(dir: string): string[] {
+/** `pathKeys` learns the entries that are not symbolic links, whose real paths follow from the folder's. */
+function collectAutoPromptEntries(dir: string, pathKeys: ResourcePathKeys): string[] {
 	const entries: string[] = [];
-	if (!existsSync(dir)) return entries;
-
 	const ig = ignore();
-	addIgnoreRules(ig, dir, dir);
+	const dirEntries = listWithIgnoreRules(ig, dir, dir);
+	if (!dirEntries) return entries;
 
 	try {
-		const dirEntries = readdirSync(dir, { withFileTypes: true });
 		for (const entry of dirEntries) {
 			if (entry.name.startsWith(".")) continue;
 			if (entry.name === "node_modules") continue;
@@ -524,11 +612,11 @@ function collectAutoPromptEntries(dir: string): string[] {
 				}
 			}
 
-			const relPath = toPosixPath(relative(dir, fullPath));
-			if (ig.ignores(relPath)) continue;
+			if (isIgnored(ig, dir, fullPath, false)) continue;
 
 			if (isFile && entry.name.endsWith(".md")) {
 				entries.push(fullPath);
+				if (!entry.isSymbolicLink()) pathKeys.notePlainEntry(dir, fullPath);
 			}
 		}
 	} catch {
@@ -538,15 +626,14 @@ function collectAutoPromptEntries(dir: string): string[] {
 	return entries;
 }
 
-function collectAutoThemeEntries(dir: string): string[] {
+/** `pathKeys` learns the entries that are not symbolic links, whose real paths follow from the folder's. */
+function collectAutoThemeEntries(dir: string, pathKeys: ResourcePathKeys): string[] {
 	const entries: string[] = [];
-	if (!existsSync(dir)) return entries;
-
 	const ig = ignore();
-	addIgnoreRules(ig, dir, dir);
+	const dirEntries = listWithIgnoreRules(ig, dir, dir);
+	if (!dirEntries) return entries;
 
 	try {
-		const dirEntries = readdirSync(dir, { withFileTypes: true });
 		for (const entry of dirEntries) {
 			if (entry.name.startsWith(".")) continue;
 			if (entry.name === "node_modules") continue;
@@ -561,11 +648,11 @@ function collectAutoThemeEntries(dir: string): string[] {
 				}
 			}
 
-			const relPath = toPosixPath(relative(dir, fullPath));
-			if (ig.ignores(relPath)) continue;
+			if (isIgnored(ig, dir, fullPath, false)) continue;
 
 			if (isFile && entry.name.endsWith(".json")) {
 				entries.push(fullPath);
+				if (!entry.isSymbolicLink()) pathKeys.notePlainEntry(dir, fullPath);
 			}
 		}
 	} catch {
@@ -605,7 +692,7 @@ function resolveExtensionEntries(dir: string): string[] | null {
 	return null;
 }
 
-function collectAutoExtensionEntries(dir: string): string[] {
+export function collectAutoExtensionEntries(dir: string): string[] {
 	const entries: string[] = [];
 	if (!existsSync(dir)) return entries;
 
@@ -617,10 +704,10 @@ function collectAutoExtensionEntries(dir: string): string[] {
 
 	// Otherwise, discover extensions from directory contents
 	const ig = ignore();
-	addIgnoreRules(ig, dir, dir);
+	const dirEntries = listWithIgnoreRules(ig, dir, dir);
+	if (!dirEntries) return entries;
 
 	try {
-		const dirEntries = readdirSync(dir, { withFileTypes: true });
 		for (const entry of dirEntries) {
 			if (entry.name.startsWith(".")) continue;
 			if (entry.name === "node_modules") continue;
@@ -639,9 +726,7 @@ function collectAutoExtensionEntries(dir: string): string[] {
 				}
 			}
 
-			const relPath = toPosixPath(relative(dir, fullPath));
-			const ignorePath = isDir ? `${relPath}/` : relPath;
-			if (ig.ignores(ignorePath)) continue;
+			if (isIgnored(ig, dir, fullPath, isDir)) continue;
 
 			if (isFile && (entry.name.endsWith(".ts") || entry.name.endsWith(".js"))) {
 				entries.push(fullPath);
@@ -671,6 +756,37 @@ function collectResourceFiles(dir: string, resourceType: ResourceType): string[]
 		return collectAutoExtensionEntries(dir);
 	}
 	return collectFiles(dir, FILE_PATTERNS[resourceType]);
+}
+
+// A `pi` object counts as an explicit resource manifest only when it lists resources. Packages whose
+// `pi` object holds only metadata (changelogPath, gallery image/video) still use directory auto-discovery.
+function hasManifestResourceFields(manifest: PiManifest): boolean {
+	return RESOURCE_TYPES.some((resourceType) => manifest[resourceType] !== undefined);
+}
+
+function isPathInside(parent: string, child: string): boolean {
+	const relativePath = relative(parent, child);
+	return (
+		relativePath !== "" && relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath)
+	);
+}
+
+function resolvePackageChangelogPath(packageRoot: string, manifest: PiManifest | null): string | undefined {
+	const changelogPath = manifest?.changelogPath ?? "CHANGELOG.md";
+	if (!changelogPath) return undefined;
+
+	const resolvedPath = resolve(packageRoot, changelogPath);
+	if (!existsSync(resolvedPath)) return undefined;
+
+	const canonicalPackageRoot = canonicalizePath(packageRoot);
+	const canonicalChangelogPath = canonicalizePath(resolvedPath);
+	if (!isPathInside(canonicalPackageRoot, canonicalChangelogPath)) return undefined;
+
+	try {
+		return statSync(resolvedPath).isFile() ? resolvedPath : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function matchesAnyPattern(filePath: string, patterns: string[], baseDir: string): boolean {
@@ -852,52 +968,136 @@ export class DefaultPackageManager implements PackageManager {
 		this.progressCallback = callback;
 	}
 
-	addSourceToSettings(source: string, options?: { local?: boolean }): boolean {
+	addSourceToSettings(source: string, options?: PackageMutationOptions): boolean {
+		this.assertPackageMutationOptions(options);
 		const scope: SourceScope = options?.local ? "project" : "user";
 		const currentSettings =
 			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
-		const currentPackages = currentSettings.packages ?? [];
-		const normalizedSource = this.normalizePackageSourceForSettings(source, scope);
+		const ownPackages = Array.isArray(currentSettings.piBolt?.packages) ? currentSettings.piBolt.packages : [];
+		const currentPackages = (options?.piBolt ? ownPackages : currentSettings.packages) ?? [];
+		let normalizedSource = this.normalizePackageSourceForSettings(source, scope);
+		if (options?.piBolt) {
+			// Relative local additions must not be interpreted as exclusion modifiers.
+			if (normalizedSource.startsWith("-")) normalizedSource = `./${normalizedSource}`;
+			const matches = (entry: PackageSource) =>
+				this.packageSourcesMatch(
+					typeof entry === "string" && entry.startsWith("-") ? entry.slice(1) : entry,
+					source,
+					scope,
+				);
+			const shared = currentSettings.packages ?? [];
+			const matchesShared = (entry: PackageSource) => this.packageSourcesMatch(entry, source, scope);
+			const existing =
+				currentPackages.findLast(
+					(entry) => matches(entry) && !(typeof entry === "string" && entry.startsWith("-")),
+				) ?? (scope === "project" ? shared.findLast(matchesShared) : shared.find(matchesShared));
+			const nextPackages = currentPackages.filter((entry) => !matches(entry));
+			const index = currentPackages.findIndex(matches);
+			nextPackages.splice(
+				index === -1 ? nextPackages.length : index,
+				0,
+				typeof existing === "object" ? { ...existing, source: normalizedSource } : normalizedSource,
+			);
+			if (JSON.stringify(nextPackages) === JSON.stringify(currentPackages)) return false;
+			if (scope === "project") this.settingsManager.setProjectPackages(nextPackages, options);
+			else this.settingsManager.setPackages(nextPackages, options);
+			return true;
+		}
+		const clearedOverride = this.clearPiBoltOverride(source, currentSettings, scope);
 		const matchIndex = currentPackages.findIndex((existing) => this.packageSourcesMatch(existing, source, scope));
 		if (matchIndex !== -1) {
 			const existing = currentPackages[matchIndex];
 			if (this.getPackageSourceString(existing) === normalizedSource) {
-				return false;
+				return clearedOverride;
 			}
 			const nextPackages = [...currentPackages];
 			nextPackages[matchIndex] =
 				typeof existing === "string" ? normalizedSource : { ...existing, source: normalizedSource };
 			if (scope === "project") {
-				this.settingsManager.setProjectPackages(nextPackages);
+				this.settingsManager.setProjectPackages(nextPackages, options);
 			} else {
-				this.settingsManager.setPackages(nextPackages);
+				this.settingsManager.setPackages(nextPackages, options);
 			}
 			return true;
 		}
 		const nextPackages = [...currentPackages, normalizedSource];
 		if (scope === "project") {
-			this.settingsManager.setProjectPackages(nextPackages);
+			this.settingsManager.setProjectPackages(nextPackages, options);
 		} else {
-			this.settingsManager.setPackages(nextPackages);
+			this.settingsManager.setPackages(nextPackages, options);
 		}
 		return true;
 	}
 
-	removeSourceFromSettings(source: string, options?: { local?: boolean }): boolean {
+	removeSourceFromSettings(source: string, options?: PackageMutationOptions): boolean {
+		const settings = options?.local
+			? this.settingsManager.getProjectSettings()
+			: this.settingsManager.getGlobalSettings();
+		return this.removeSourceFromPackageSettings(source, settings, options);
+	}
+
+	private removeSourceFromPackageSettings(
+		source: string,
+		currentSettings: Pick<Settings, "packages" | "piBolt">,
+		options?: PackageMutationOptions,
+	): boolean {
+		this.assertPackageMutationOptions(options);
 		const scope: SourceScope = options?.local ? "project" : "user";
-		const currentSettings =
-			scope === "project" ? this.settingsManager.getProjectSettings() : this.settingsManager.getGlobalSettings();
-		const currentPackages = currentSettings.packages ?? [];
-		const nextPackages = currentPackages.filter((existing) => !this.packageSourcesMatch(existing, source, scope));
-		const changed = nextPackages.length !== currentPackages.length;
+		const ownPackages = Array.isArray(currentSettings.piBolt?.packages) ? currentSettings.piBolt.packages : [];
+		const currentPackages = (options?.piBolt ? ownPackages : currentSettings.packages) ?? [];
+		const nextPackages = currentPackages.filter(
+			(existing) =>
+				!this.packageSourcesMatch(
+					typeof existing === "string" && options?.piBolt && existing.startsWith("-")
+						? existing.slice(1)
+						: existing,
+					source,
+					scope,
+				),
+		);
+		if (options?.piBolt) {
+			const shared = (currentSettings.packages ?? []).find((entry) =>
+				this.packageSourcesMatch(entry, source, scope),
+			);
+			if (shared) nextPackages.push(`-${this.getPackageSourceString(shared)}`);
+		}
+		const clearedOverride = !options?.piBolt && this.clearPiBoltOverride(source, currentSettings, scope);
+		const changed = JSON.stringify(nextPackages) !== JSON.stringify(currentPackages);
 		if (!changed) {
-			return false;
+			return clearedOverride;
 		}
 		if (scope === "project") {
-			this.settingsManager.setProjectPackages(nextPackages);
+			this.settingsManager.setProjectPackages(nextPackages, options);
 		} else {
-			this.settingsManager.setPackages(nextPackages);
+			this.settingsManager.setPackages(nextPackages, options);
 		}
+		return true;
+	}
+
+	/**
+	 * Plain install and remove (without --pi-bolt) in Pi-Bolt change the shared list and drop Pi-Bolt's entries for the same
+	 * package in that settings file: a replacement, an addition or an exclusion. Pi-Bolt then loads exactly what the shared
+	 * list declares, so `remove X` cannot leave Pi-Bolt loading X and `install X@2` cannot leave it on X@1 or without X.
+	 * Returns whether Pi-Bolt's list changed.
+	 */
+	private clearPiBoltOverride(
+		source: string,
+		currentSettings: Pick<Settings, "packages" | "piBolt">,
+		scope: SourceScope,
+	): boolean {
+		const own = currentSettings.piBolt?.packages;
+		if (PIBOLT === undefined || !Array.isArray(own)) return false;
+		const next = own.filter(
+			(entry) =>
+				!this.packageSourcesMatch(
+					typeof entry === "string" && entry.startsWith("-") ? entry.slice(1) : entry,
+					source,
+					scope,
+				),
+		);
+		if (next.length === own.length) return false;
+		if (scope === "project") this.settingsManager.setProjectPackages(next, { piBolt: true });
+		else this.settingsManager.setPackages(next, { piBolt: true });
 		return true;
 	}
 
@@ -940,23 +1140,27 @@ export class DefaultPackageManager implements PackageManager {
 		}
 	}
 
-	async resolve(onMissing?: (source: string) => Promise<MissingSourceAction>): Promise<ResolvedPaths> {
+	/** `pathKeys`: dedupe keys to compute the paths' keys with and to share with the caller's own pass. */
+	async resolve(
+		onMissing?: (source: string) => Promise<MissingSourceAction>,
+		pathKeys = new ResourcePathKeys(),
+	): Promise<ResolvedPaths> {
 		const accumulator = this.createAccumulator();
 		const globalSettings = this.settingsManager.getGlobalSettings();
 		const projectSettings = this.settingsManager.getProjectSettings();
 
 		// Collect all packages with scope (project first so cwd resources win collisions)
 		const allPackages: Array<{ pkg: PackageSource; scope: SourceScope }> = [];
-		for (const pkg of projectSettings.packages ?? []) {
+		for (const pkg of this.settingsManager.getResolvedPackages("project", join(this.cwd, CONFIG_DIR_NAME))) {
 			allPackages.push({ pkg, scope: "project" });
 		}
-		for (const pkg of globalSettings.packages ?? []) {
+		for (const pkg of this.settingsManager.getResolvedPackages("global", this.agentDir)) {
 			allPackages.push({ pkg, scope: "user" });
 		}
 
 		// Dedupe: project scope wins over global for same package identity
 		const packageSources = this.dedupePackages(allPackages);
-		await this.resolvePackageSources(packageSources, accumulator, onMissing);
+		const installFailures = await this.resolvePackageSources(packageSources, accumulator, onMissing);
 
 		const globalBaseDir = this.agentDir;
 		const projectBaseDir = join(this.cwd, CONFIG_DIR_NAME);
@@ -989,7 +1193,14 @@ export class DefaultPackageManager implements PackageManager {
 			);
 		}
 
-		this.addAutoDiscoveredResources(accumulator, globalSettings, projectSettings, globalBaseDir, projectBaseDir);
+		this.addAutoDiscoveredResources(
+			accumulator,
+			globalSettings,
+			projectSettings,
+			globalBaseDir,
+			projectBaseDir,
+			pathKeys,
+		);
 
 		// Built-in extensions are enabled unless the user `extensions` setting excludes them, for example
 		// with `-builtin:mcp`. A matching `+`, `-`, or `!` entry in the project setting overrides that.
@@ -1008,12 +1219,12 @@ export class DefaultPackageManager implements PackageManager {
 			);
 		}
 
-		return this.toResolvedPaths(accumulator);
+		return { ...this.toResolvedPaths(accumulator, pathKeys), installFailures };
 	}
 
 	async resolveExtensionSources(
 		sources: string[],
-		options?: { local?: boolean; temporary?: boolean },
+		options?: { local?: boolean; temporary?: boolean; pathKeys?: ResourcePathKeys },
 	): Promise<ResolvedPaths> {
 		const accumulator = this.createAccumulator();
 		const scope: SourceScope = options?.temporary ? "temporary" : options?.local ? "project" : "user";
@@ -1024,16 +1235,14 @@ export class DefaultPackageManager implements PackageManager {
 		const packageSources = sources
 			.filter((source) => !source.startsWith(BUILTIN_PATH_PREFIX))
 			.map((source) => ({ pkg: source as PackageSource, scope }));
-		await this.resolvePackageSources(packageSources, accumulator);
-		return this.toResolvedPaths(accumulator);
+		const installFailures = await this.resolvePackageSources(packageSources, accumulator);
+		return { ...this.toResolvedPaths(accumulator, options?.pathKeys ?? new ResourcePathKeys()), installFailures };
 	}
 
 	listConfiguredPackages(): ConfiguredPackage[] {
-		const globalSettings = this.settingsManager.getGlobalSettings();
-		const projectSettings = this.settingsManager.getProjectSettings();
 		const configuredPackages: ConfiguredPackage[] = [];
 
-		for (const pkg of globalSettings.packages ?? []) {
+		for (const pkg of this.settingsManager.getResolvedPackages("global", this.agentDir)) {
 			const source = typeof pkg === "string" ? pkg : pkg.source;
 			configuredPackages.push({
 				source,
@@ -1043,7 +1252,7 @@ export class DefaultPackageManager implements PackageManager {
 			});
 		}
 
-		for (const pkg of projectSettings.packages ?? []) {
+		for (const pkg of this.settingsManager.getResolvedPackages("project", join(this.cwd, CONFIG_DIR_NAME))) {
 			const source = typeof pkg === "string" ? pkg : pkg.source;
 			configuredPackages.push({
 				source,
@@ -1056,7 +1265,8 @@ export class DefaultPackageManager implements PackageManager {
 		return configuredPackages;
 	}
 
-	async install(source: string, options?: { local?: boolean }): Promise<void> {
+	async install(source: string, options?: PackageMutationOptions): Promise<void> {
+		this.assertPackageMutationOptions(options);
 		const parsed = this.parseSource(source);
 		const scope: SourceScope = options?.local ? "project" : "user";
 		this.assertProjectTrustedForScope(scope);
@@ -1080,20 +1290,31 @@ export class DefaultPackageManager implements PackageManager {
 		});
 	}
 
-	async installAndPersist(source: string, options?: { local?: boolean }): Promise<void> {
+	async installAndPersist(source: string, options?: PackageMutationOptions): Promise<void> {
 		await this.install(source, options);
 		this.addSourceToSettings(source, options);
 	}
 
-	async remove(source: string, options?: { local?: boolean }): Promise<void> {
+	async remove(source: string, options?: PackageMutationOptions): Promise<void> {
+		this.assertPackageMutationOptions(options);
 		const parsed = this.parseSource(source);
 		const scope: SourceScope = options?.local ? "project" : "user";
 		this.assertProjectTrustedForScope(scope);
 		await this.withProgress("remove", source, `Removing ${source}...`, async () => {
-			// Pi-Bolt with a package list of its own: Pi's list may still use this package, whose files stay.
-			const keptForPi = this.settingsManager.getPackagesKeptForPi(scope === "project" ? "project" : "global");
-			if (keptForPi.some((existing) => this.packageSourcesMatch(existing, source, scope))) {
-				return;
+			// Both runtimes share installed files: --pi-bolt keeps the files the shared list still declares. A plain remove
+			// drops the package from both lists of this settings file (clearPiBoltOverride), so no declaration keeps them.
+			// Settings that cannot be read abort before anything is deleted.
+			if (PIBOLT !== undefined) {
+				const settings = await this.settingsManager.getCurrentPackageSettings(
+					scope === "project" ? "project" : "global",
+				);
+				this.assertProjectTrustedForScope(scope);
+				if (
+					options?.piBolt &&
+					settings.packages?.some((existing) => this.packageSourcesMatch(existing, source, scope))
+				) {
+					return;
+				}
 			}
 			if (parsed.type === "npm") {
 				await this.uninstallNpm(parsed, scope);
@@ -1110,25 +1331,27 @@ export class DefaultPackageManager implements PackageManager {
 		});
 	}
 
-	async removeAndPersist(source: string, options?: { local?: boolean }): Promise<boolean> {
+	async removeAndPersist(source: string, options?: PackageMutationOptions): Promise<boolean> {
 		await this.remove(source, options);
-		return this.removeSourceFromSettings(source, options);
+		if (PIBOLT === undefined) return this.removeSourceFromSettings(source, options);
+		const settings = await this.settingsManager.getCurrentPackageSettings(options?.local ? "project" : "global");
+		return this.removeSourceFromPackageSettings(source, settings, options);
 	}
 
 	async update(source?: string): Promise<void> {
-		const globalSettings = this.settingsManager.getGlobalSettings();
-		const projectSettings = this.settingsManager.getProjectSettings();
+		const globalPackages = this.settingsManager.getResolvedPackages("global", this.agentDir);
+		const projectPackages = this.settingsManager.getResolvedPackages("project", join(this.cwd, CONFIG_DIR_NAME));
 		const identity = source ? this.getPackageIdentity(source) : undefined;
 		let matched = false;
 		const updateSources: ConfiguredUpdateSource[] = [];
 
-		for (const pkg of globalSettings.packages ?? []) {
+		for (const pkg of globalPackages) {
 			const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
 			if (identity && this.getPackageIdentity(sourceStr, "user") !== identity) continue;
 			matched = true;
 			updateSources.push({ source: sourceStr, scope: "user" });
 		}
-		for (const pkg of projectSettings.packages ?? []) {
+		for (const pkg of projectPackages) {
 			const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
 			if (identity && this.getPackageIdentity(sourceStr, "project") !== identity) continue;
 			matched = true;
@@ -1136,12 +1359,7 @@ export class DefaultPackageManager implements PackageManager {
 		}
 
 		if (source && !matched) {
-			throw new Error(
-				this.buildNoMatchingPackageMessage(source, [
-					...(globalSettings.packages ?? []),
-					...(projectSettings.packages ?? []),
-				]),
-			);
+			throw new Error(this.buildNoMatchingPackageMessage(source, [...globalPackages, ...projectPackages]));
 		}
 
 		await this.updateConfiguredSources(updateSources);
@@ -1168,17 +1386,18 @@ export class DefaultPackageManager implements PackageManager {
 			}
 		}
 
-		const npmCheckTasks = npmCandidates.map((entry) => async () => ({
-			entry,
-			shouldUpdate: await this.shouldUpdateNpmSource(entry.parsed, entry.scope),
-		}));
+		const npmCheckTasks = npmCandidates.map((entry) => async () => {
+			const check = await this.shouldUpdateNpmSource(entry.parsed, entry.scope);
+			return {
+				entry: { ...entry, installedVersion: check.installedVersion, targetVersion: check.targetVersion },
+				shouldUpdate: check.shouldUpdate,
+			};
+		});
 		const npmCheckResults = await this.runWithConcurrency(npmCheckTasks, UPDATE_CHECK_CONCURRENCY);
 		const userNpmUpdates: NpmUpdateTarget[] = [];
 		const projectNpmUpdates: NpmUpdateTarget[] = [];
-		for (const result of npmCheckResults) {
-			if (!result.shouldUpdate) {
-				continue;
-			}
+		const npmUpdates = npmCheckResults.filter((result) => result.shouldUpdate);
+		for (const result of npmUpdates) {
 			if (result.entry.scope === "user") {
 				userNpmUpdates.push(result.entry);
 			} else {
@@ -1193,24 +1412,74 @@ export class DefaultPackageManager implements PackageManager {
 		if (projectNpmUpdates.length > 0) {
 			tasks.push(this.updateNpmBatch(projectNpmUpdates, "project"));
 		}
+		const gitUpdates: UpdatedPackage[] = [];
 		if (gitCandidates.length > 0) {
 			const gitTasks = gitCandidates.map(
 				(entry) => async () =>
 					this.withProgress("update", entry.source, `Updating ${entry.source}...`, async () => {
+						const targetDir = this.getGitInstallPath(entry.parsed, entry.scope);
+						const from = await this.getGitHead(targetDir);
 						await this.updateGit(entry.parsed, entry.scope);
+						const to = await this.getGitHead(targetDir);
+						if (from !== to) {
+							gitUpdates.push({ source: entry.source, type: "git", scope: entry.scope, from, to });
+						}
 					}),
 			);
 			tasks.push(this.runWithConcurrency(gitTasks, GIT_UPDATE_CONCURRENCY).then(() => {}));
 		}
 
 		await Promise.all(tasks);
+
+		const updated: UpdatedPackage[] = [];
+		for (const { entry } of npmUpdates) {
+			const installedPath = this.getManagedNpmInstallPath(entry.parsed, entry.scope);
+			const to = existsSync(installedPath) ? this.getInstalledNpmVersion(installedPath) : undefined;
+			if (to !== entry.installedVersion) {
+				updated.push({ source: entry.source, type: "npm", scope: entry.scope, from: entry.installedVersion, to });
+			}
+		}
+		// Keep git results in configured order, independent of completion order.
+		for (const entry of gitCandidates) {
+			const update = gitUpdates.find((u) => u.source === entry.source && u.scope === entry.scope);
+			if (update) updated.push(update);
+		}
+
+		// Report each changed package, e.g. "npm:foo 1.2.0 -> 1.3.0".
+		for (const pkg of updated) {
+			const format = (value: string | undefined) =>
+				value === undefined ? "(none)" : pkg.type === "git" ? value.slice(0, 7) : value;
+			const scope = pkg.scope === "project" ? " (project)" : "";
+			this.emitProgress({
+				type: "result",
+				action: "update",
+				source: pkg.source,
+				message: `${pkg.source}${scope} ${format(pkg.from)} -> ${format(pkg.to)}`,
+			});
+		}
 	}
 
-	private async shouldUpdateNpmSource(source: NpmSource, scope: InstalledSourceScope): Promise<boolean> {
+	private async getGitHead(targetDir: string): Promise<string | undefined> {
+		if (!existsSync(targetDir)) return undefined;
+		try {
+			const head = await this.runCommandCapture("git", ["rev-parse", "HEAD"], {
+				cwd: targetDir,
+				timeoutMs: NETWORK_TIMEOUT_MS,
+			});
+			return head.trim() || undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	private async shouldUpdateNpmSource(
+		source: NpmSource,
+		scope: InstalledSourceScope,
+	): Promise<{ shouldUpdate: boolean; installedVersion?: string; targetVersion?: string }> {
 		const installedPath = this.getManagedNpmInstallPath(source, scope);
 		const installedVersion = existsSync(installedPath) ? this.getInstalledNpmVersion(installedPath) : undefined;
 		if (!installedVersion) {
-			return true;
+			return { shouldUpdate: true };
 		}
 
 		try {
@@ -1219,10 +1488,10 @@ export class DefaultPackageManager implements PackageManager {
 				source.range,
 				scope,
 			);
-			return gt(targetVersion, installedVersion);
+			return { shouldUpdate: semver().gt(targetVersion, installedVersion), installedVersion, targetVersion };
 		} catch {
 			// Preserve existing update behavior when version lookup fails.
-			return true;
+			return { shouldUpdate: true, installedVersion };
 		}
 	}
 
@@ -1236,14 +1505,39 @@ export class DefaultPackageManager implements PackageManager {
 		const specs = sources.map((entry) => (entry.parsed.version ? entry.parsed.spec : `${entry.parsed.name}@latest`));
 
 		await this.withProgress("update", sourceLabel, message, async () => {
-			await this.installNpmBatch(specs, scope);
+			await this.installNpmBatch(specs, scope, sourceLabel);
 		});
+
+		this.reportUnchangedNpmUpdates(sources, scope);
 	}
 
-	private async installNpmBatch(specs: string[], scope: InstalledSourceScope): Promise<void> {
+	/**
+	 * npm can resolve stale registry metadata shortly after a publish and install the old
+	 * version without an error. Warn when an announced update did not change the installed version.
+	 */
+	private reportUnchangedNpmUpdates(sources: NpmUpdateTarget[], scope: InstalledSourceScope): void {
+		for (const entry of sources) {
+			if (!entry.installedVersion || !entry.targetVersion) {
+				continue;
+			}
+			const installedPath = this.getManagedNpmInstallPath(entry.parsed, scope);
+			const versionAfter = this.getInstalledNpmVersion(installedPath);
+			if (versionAfter !== entry.installedVersion) {
+				continue;
+			}
+			this.emitProgress({
+				type: "progress",
+				action: "update",
+				source: entry.source,
+				message: `${entry.source} is still ${versionAfter} (registry reports ${entry.targetVersion}); npm registry metadata may be stale, try again in a few minutes`,
+			});
+		}
+	}
+
+	private async installNpmBatch(specs: string[], scope: InstalledSourceScope, sourceLabel: string): Promise<void> {
 		const installRoot = this.getNpmInstallRoot(scope, false);
 		this.ensureNpmProject(installRoot);
-		await this.runNpmCommand(this.getNpmInstallArgs(specs, installRoot));
+		await this.runNpmCommandInRoot(installRoot, this.getNpmInstallArgs(specs, installRoot), "update", sourceLabel);
 	}
 
 	async checkForAvailableUpdates(): Promise<PackageUpdate[]> {
@@ -1251,13 +1545,11 @@ export class DefaultPackageManager implements PackageManager {
 			return [];
 		}
 
-		const globalSettings = this.settingsManager.getGlobalSettings();
-		const projectSettings = this.settingsManager.getProjectSettings();
 		const allPackages: Array<{ pkg: PackageSource; scope: SourceScope }> = [];
-		for (const pkg of projectSettings.packages ?? []) {
+		for (const pkg of this.settingsManager.getResolvedPackages("project", join(this.cwd, CONFIG_DIR_NAME))) {
 			allPackages.push({ pkg, scope: "project" });
 		}
-		for (const pkg of globalSettings.packages ?? []) {
+		for (const pkg of this.settingsManager.getResolvedPackages("global", this.agentDir)) {
 			allPackages.push({ pkg, scope: "user" });
 		}
 
@@ -1315,7 +1607,8 @@ export class DefaultPackageManager implements PackageManager {
 		sources: Array<{ pkg: PackageSource; scope: SourceScope }>,
 		accumulator: ResourceAccumulator,
 		onMissing?: (source: string) => Promise<MissingSourceAction>,
-	): Promise<void> {
+	): Promise<PackageInstallFailure[]> {
+		const installFailures: PackageInstallFailure[] = [];
 		for (const { pkg, scope } of sources) {
 			const sourceStr = typeof pkg === "string" ? pkg : pkg.source;
 			const filter = typeof pkg === "object" ? pkg : undefined;
@@ -1333,21 +1626,46 @@ export class DefaultPackageManager implements PackageManager {
 
 			const installMissing = async (): Promise<boolean> => {
 				if (isOfflineModeEnabled()) return false;
-				if (!onMissing) {
+				if (onMissing) {
+					const action = await onMissing(resolvedSource);
+					if (action === "skip") return false;
+					if (action === "error") throw new Error(`Missing source: ${resolvedSource}`);
+				}
+				// A source that cannot be installed (no network, missing package, failing git prepare step)
+				// must not abort startup. Skip its resources, like offline mode does, and report the failure.
+				try {
 					await this.installParsedSource(parsed, resolvedScope);
 					return true;
+				} catch (error) {
+					installFailures.push({
+						source: resolvedSource,
+						scope: resolvedScope,
+						message: error instanceof Error ? error.message : String(error),
+					});
+					return false;
 				}
-				const action = await onMissing(resolvedSource);
-				if (action === "skip") return false;
-				if (action === "error") throw new Error(`Missing source: ${resolvedSource}`);
-				await this.installParsedSource(parsed, resolvedScope);
-				return true;
 			};
 
 			if (parsed.type === "npm") {
 				let installedPath = this.getNpmInstallPath(parsed, resolvedScope);
 				const needsInstall =
 					!existsSync(installedPath) || !(await this.installedNpmMatchesConfiguredVersion(parsed, installedPath));
+				if (
+					!needsInstall &&
+					resolvedScope === "temporary" &&
+					!parsed.pinned &&
+					(await this.npmHasAvailableUpdate(parsed, installedPath, "user"))
+				) {
+					// Temporary (-e) sources have no `pi update` path, so refresh unpinned ones on load like
+					// temporary git sources. Like `pi update`, install `name@latest` for unversioned specs because a bare
+					// `npm install name` keeps the range already saved in the temporary package.json.
+					const spec = parsed.version ? parsed.spec : `${parsed.name}@latest`;
+					try {
+						await this.installNpm({ ...parsed, spec }, resolvedScope, true);
+					} catch {
+						// Keep the cached install if the refresh fails.
+					}
+				}
 				if (needsInstall) {
 					const installed = await installMissing();
 					if (!installed) continue;
@@ -1364,14 +1682,15 @@ export class DefaultPackageManager implements PackageManager {
 				if (!existsSync(installedPath)) {
 					const installed = await installMissing();
 					if (!installed) continue;
-				} else if (resolvedScope === "temporary" && !parsed.pinned && !isOfflineModeEnabled()) {
-					await this.refreshTemporaryGitSource(parsed, resolvedSource);
+				} else if (resolvedScope === "temporary" && !isOfflineModeEnabled()) {
+					await this.refreshTemporaryGitSource(parsed, resolvedSource, installedPath);
 				}
 				metadata.baseDir = installedPath;
 				metadata.packageRoot = installedPath;
 				this.collectPackageResources(installedPath, accumulator, filter, metadata);
 			}
 		}
+		return installFailures;
 	}
 
 	private findAutoloadDeltaBase(
@@ -1444,7 +1763,7 @@ export class DefaultPackageManager implements PackageManager {
 		if (parsed.type === "git") {
 			return `git:${parsed.host}/${parsed.path}`;
 		}
-		return `local:${this.resolvePath(parsed.path)}`;
+		return `local:${getPathComparisonKey(this.resolvePath(parsed.path))}`;
 	}
 
 	private getSourceMatchKeyForSettings(source: string, scope: SourceScope): string {
@@ -1456,7 +1775,7 @@ export class DefaultPackageManager implements PackageManager {
 			return `git:${parsed.host}/${parsed.path}`;
 		}
 		const baseDir = this.getBaseDirForScope(scope);
-		return `local:${this.resolvePathFromBase(parsed.path, baseDir)}`;
+		return `local:${getPathComparisonKey(this.resolvePathFromBase(parsed.path, baseDir))}`;
 	}
 
 	private buildNoMatchingPackageMessage(source: string, configuredPackages: PackageSource[]): string {
@@ -1541,7 +1860,7 @@ export class DefaultPackageManager implements PackageManager {
 		if (!installedVersion) {
 			return false;
 		}
-		return source.range ? satisfies(installedVersion, source.range) : true;
+		return source.range ? semver().satisfies(installedVersion, source.range) : true;
 	}
 
 	private async npmHasAvailableUpdate(
@@ -1564,7 +1883,7 @@ export class DefaultPackageManager implements PackageManager {
 				source.range,
 				scope,
 			);
-			return gt(targetVersion, installedVersion);
+			return semver().gt(targetVersion, installedVersion);
 		} catch {
 			return false;
 		}
@@ -1589,14 +1908,17 @@ export class DefaultPackageManager implements PackageManager {
 	): Promise<string> {
 		const npmCommand = this.getNpmCommand();
 		let viewArgs = ["view", packageSpec, "version", "--json"];
+		const installRoot = this.getNpmInstallRoot(scope, false);
 		if (this.getPackageManagerName() === "bun") {
 			// bun has no `view` command; `bun pm view` needs a package.json in its working directory.
-			const installRoot = this.getNpmInstallRoot(scope, false);
 			this.ensureNpmProject(installRoot);
 			viewArgs = ["pm", ...viewArgs, "--cwd", installRoot];
 		}
 		const stdout = await this.runCommandCapture(npmCommand.command, [...npmCommand.args, ...viewArgs], {
-			cwd: this.cwd,
+			// Not in the opened folder, whose npm config (.npmrc) npm would read, trusted or not: it can name another
+			// registry and have npm send it the tokens it expands. The install root has the config of Pi's own folder (or,
+			// for a trusted project's packages, of the project's), and the user's.
+			cwd: existsSync(installRoot) ? installRoot : this.agentDir,
 			timeoutMs: NETWORK_TIMEOUT_MS,
 			...(npmCommand.env ? { env: npmCommand.env } : {}),
 		});
@@ -1608,7 +1930,7 @@ export class DefaultPackageManager implements PackageManager {
 		}
 		if (Array.isArray(parsed)) {
 			const versions = parsed.filter((value): value is string => typeof value === "string" && value.length > 0);
-			const latest = range ? maxSatisfying(versions, range) : [...versions].sort(rcompare)[0];
+			const latest = range ? semver().maxSatisfying(versions, range) : [...versions].sort(semver().rcompare)[0];
 			if (latest) return latest;
 		}
 		throw new Error("Unexpected response from npm view");
@@ -1770,19 +2092,9 @@ export class DefaultPackageManager implements PackageManager {
 	 * for the same repository are treated as identical.
 	 */
 	private getPackageIdentity(source: string, scope?: SourceScope): string {
-		const parsed = this.parseSource(source);
-		if (parsed.type === "npm") {
-			return `npm:${parsed.name}`;
-		}
-		if (parsed.type === "git") {
-			// Use host/path for identity to normalize SSH and HTTPS
-			return `git:${parsed.host}/${parsed.path}`;
-		}
-		if (scope) {
-			const baseDir = this.getBaseDirForScope(scope);
-			return `local:${this.resolvePathFromBase(parsed.path, baseDir)}`;
-		}
-		return `local:${this.resolvePath(parsed.path)}`;
+		const identity = getPackageIdentity(source, scope ? this.getBaseDirForScope(scope) : this.cwd);
+		// Local paths compare case-insensitively on Windows.
+		return identity.startsWith("local:") ? `local:${getPathComparisonKey(identity.slice(6))}` : identity;
 	}
 
 	/**
@@ -1821,6 +2133,10 @@ export class DefaultPackageManager implements PackageManager {
 		const name = match[1] ?? spec;
 		const version = match[2];
 		return { name, version };
+	}
+
+	private assertPackageMutationOptions(options?: PackageMutationOptions): void {
+		if (options?.piBolt && PIBOLT === undefined) throw new Error("--pi-bolt requires a Pi-Bolt build");
 	}
 
 	private assertProjectTrustedForScope(scope: SourceScope): void {
@@ -1897,7 +2213,7 @@ export class DefaultPackageManager implements PackageManager {
 					"--config.strict-dep-builds=false",
 				];
 			case "npm":
-				return ["install", "--omit=dev", "--legacy-peer-deps"];
+				return ["install", "--omit=dev", "--legacy-peer-deps", "--no-audit", "--no-fund"];
 			default:
 				return ["install"];
 		}
@@ -1911,7 +2227,9 @@ export class DefaultPackageManager implements PackageManager {
 			: this.runCommandSync(npmCommand.command, commandArgs);
 	}
 
-	private getNpmInstallArgs(specs: string[], installRoot: string): string[] {
+	private getNpmInstallArgs(specs: string[], root: string): string[] {
+		// npm writes broken nested package-lock.json paths when --prefix goes through a symlink.
+		const installRoot = existsSync(root) ? realpathSync(root) : root;
 		const packageManagerName = this.getPackageManagerName();
 		// Extension packages run inside pi and resolve pi APIs through loader aliases/virtual modules.
 		// Disable peer dependency resolution for managed installs (npm's --legacy-peer-deps, and
@@ -1943,31 +2261,170 @@ export class DefaultPackageManager implements PackageManager {
 				"--config.strict-dep-builds=false",
 			];
 		}
-		return ["install", ...specs, "--prefix", installRoot, "--legacy-peer-deps"];
+		// npm audit fix would run without --legacy-peer-deps and install pi peers, so skip audit advice.
+		return ["install", ...specs, "--prefix", installRoot, "--legacy-peer-deps", "--no-audit", "--no-fund"];
 	}
 
 	private async installNpm(source: NpmSource, scope: SourceScope, temporary: boolean): Promise<void> {
 		const installRoot = this.getNpmInstallRoot(scope, temporary);
 		this.ensureNpmProject(installRoot);
-		await this.runNpmCommand(this.getNpmInstallArgs([source.spec], installRoot));
+		const args = this.getNpmInstallArgs([source.spec], installRoot);
+		if (temporary) {
+			await this.runNpmCommand(args);
+			return;
+		}
+		await this.runNpmCommandInRoot(installRoot, args, "install", `npm:${source.spec}`);
+	}
+
+	/**
+	 * Run an install or uninstall in a managed npm root and report what it pruned. npm, pnpm, and bun reify the
+	 * whole root, so packages that are not saved in its package.json (for example installed with
+	 * `npm install --no-save`) are removed along with their dependencies, and the package manager's summary line
+	 * is easy to miss.
+	 */
+	private async runNpmCommandInRoot(
+		installRoot: string,
+		args: string[],
+		action: ProgressEvent["action"],
+		source: string,
+	): Promise<void> {
+		const unsaved = this.getUnsavedNpmPackages(installRoot);
+		await this.runNpmCommand(args);
+		if (unsaved.packages.length === 0) {
+			return;
+		}
+		const removed = unsaved.packages.filter(({ path }) => !existsSync(path)).map(({ name }) => name);
+		if (removed.length === 0) {
+			return;
+		}
+		const removedRoots = unsaved.roots.filter((name) => removed.includes(name));
+		const listed = removedRoots.length > 0 ? removedRoots : removed;
+		this.emitProgress({
+			type: "progress",
+			action,
+			source,
+			message: `${this.getPackageManagerName()} removed ${removed.length} ${removed.length === 1 ? "package" : "packages"} not saved in ${join(installRoot, "package.json")}: ${listed.join(", ")}. Save packages kept in this folder as dependencies in that package.json so installs and updates keep them.`,
+		});
+	}
+
+	private getUnsavedNpmPackages(installRoot: string): UnsavedNpmPackages {
+		const nodeModulesDir = join(installRoot, "node_modules");
+		const saved = this.readNpmManifestDependencies(join(installRoot, "package.json"), true);
+		if (!saved || !existsSync(nodeModulesDir)) {
+			return { packages: [], roots: [] };
+		}
+
+		// Every installed copy by path, top-level and nested, since one package can be installed at several versions.
+		const copies = new Map<string, InstalledNpmCopy>();
+		const collect = (dir: string, topLevel: boolean): void => {
+			for (const entry of this.listNodeModulesPackages(dir)) {
+				const path = join(dir, entry.name);
+				const dependencies = this.readNpmManifestDependencies(join(path, "package.json"), false) ?? [];
+				copies.set(path, { name: entry.name, path, topLevel, dependencies });
+				// Symlinked packages (pnpm, local links) resolve their dependencies outside this tree.
+				if (!entry.symlink) collect(join(path, "node_modules"), false);
+			}
+		};
+		collect(nodeModulesDir, true);
+
+		// Resolve a dependency like Node does: the nearest node_modules folder from the dependent up to the root.
+		const resolve = (fromDir: string, name: string): string | undefined => {
+			for (let dir = fromDir; ; dir = dirname(dir)) {
+				if (basename(dir) !== "node_modules") {
+					const candidate = join(dir, "node_modules", name);
+					if (copies.has(candidate)) return candidate;
+				}
+				if (dir === installRoot || dirname(dir) === dir) return undefined;
+			}
+		};
+		const resolveAll = (fromDir: string, names: string[]): string[] =>
+			names.flatMap((name) => resolve(fromDir, name) ?? []);
+
+		const reachable = new Set<string>();
+		const pending = resolveAll(installRoot, saved);
+		for (let path = pending.pop(); path !== undefined; path = pending.pop()) {
+			if (reachable.has(path)) continue;
+			reachable.add(path);
+			pending.push(...resolveAll(path, copies.get(path)?.dependencies ?? []));
+		}
+
+		const unreachable = [...copies.values()].filter((copy) => !reachable.has(copy.path));
+		const required = new Set(unreachable.flatMap((copy) => resolveAll(copy.path, copy.dependencies)));
+		const packages = unreachable.filter((copy) => copy.topLevel).sort((a, b) => a.name.localeCompare(b.name));
+		return {
+			packages,
+			roots: packages.filter((copy) => !required.has(copy.path)).map((copy) => copy.name),
+		};
+	}
+
+	private listNodeModulesPackages(nodeModulesDir: string): Array<{ name: string; symlink: boolean }> {
+		const packages: Array<{ name: string; symlink: boolean }> = [];
+		const read = (dir: string, scope: string | undefined): void => {
+			let entries: Dirent[];
+			try {
+				entries = readdirSync(dir, { withFileTypes: true });
+			} catch {
+				return;
+			}
+			for (const entry of entries) {
+				// Skip .bin, .package-lock.json, and package manager stores such as .pnpm.
+				if (entry.name.startsWith(".")) continue;
+				const symlink = entry.isSymbolicLink();
+				if (!symlink && !entry.isDirectory()) continue;
+				if (!scope && entry.name.startsWith("@")) {
+					read(join(dir, entry.name), entry.name);
+					continue;
+				}
+				packages.push({ name: scope ? `${scope}/${entry.name}` : entry.name, symlink });
+			}
+		};
+		read(nodeModulesDir, undefined);
+		return packages;
+	}
+
+	/**
+	 * Read the dependency names a package manager installs for a manifest. Peer dependencies are left out: managed installs
+	 * disable peer resolution (npm's --legacy-peer-deps, bun's --omit=peer, pnpm's auto-install-peers=false), so a
+	 * peer does not keep a package in the tree.
+	 */
+	private readNpmManifestDependencies(packageJsonPath: string, includeDevDependencies: boolean): string[] | undefined {
+		const fields = includeDevDependencies
+			? ["dependencies", "devDependencies", "optionalDependencies"]
+			: ["dependencies", "optionalDependencies"];
+		try {
+			const pkg = JSON.parse(stripBom(readFileSync(packageJsonPath, "utf-8"))) as Record<string, unknown>;
+			return fields.flatMap((field) => {
+				const deps = pkg[field];
+				return deps && typeof deps === "object" ? Object.keys(deps) : [];
+			});
+		} catch {
+			return undefined;
+		}
 	}
 
 	private async uninstallNpm(source: NpmSource, scope: SourceScope): Promise<void> {
-		const installRoot = this.getNpmInstallRoot(scope, false);
-		if (!existsSync(installRoot)) {
+		const root = this.getNpmInstallRoot(scope, false);
+		if (!existsSync(root)) {
 			return;
 		}
+		// npm writes broken nested package-lock.json paths when --prefix goes through a symlink.
+		const installRoot = realpathSync(root);
 		const packageManagerName = this.getPackageManagerName();
 		if (packageManagerName === "bun") {
 			// bun reinstalls the remaining packages on uninstall, peers included unless told otherwise.
-			await this.runNpmCommand(["uninstall", source.name, "--cwd", installRoot, "--omit=peer"]);
+			await this.runNpmCommandInRoot(
+				installRoot,
+				["uninstall", source.name, "--cwd", installRoot, "--omit=peer"],
+				"remove",
+				`npm:${source.name}`,
+			);
 			return;
 		}
 		const args = ["uninstall", source.name, "--prefix", installRoot];
 		if (packageManagerName !== "pnpm") {
-			args.push("--legacy-peer-deps");
+			args.push("--legacy-peer-deps", "--no-audit", "--no-fund");
 		}
-		await this.runNpmCommand(args);
+		await this.runNpmCommandInRoot(installRoot, args, "remove", `npm:${source.name}`);
 	}
 
 	private async installGit(source: GitSource, scope: SourceScope): Promise<void> {
@@ -2057,20 +2514,31 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private async cleanAndInstallGitDependencies(targetDir: string, markerPath: string): Promise<void> {
-		// Clean untracked files (extensions should be pristine). If this fails after
-		// deleting dependencies, repair them so the existing extension still loads.
+		// Clean untracked files (extensions should be pristine). On Windows, files loaded by
+		// another process (e.g. a native module of this extension in another pi session) cannot
+		// be deleted, so git clean fails. Still install dependencies for the new commit, but keep
+		// the marker so the next update retries the clean.
+		let cleaned = true;
 		try {
 			await this.runCommand("git", ["clean", "-fdx"], { cwd: targetDir });
 		} catch (error) {
-			await this.repairMissingGitDependencies(targetDir).catch(() => {});
-			throw error;
+			cleaned = false;
+			const reason = error instanceof Error ? error.message : String(error);
+			this.emitProgress({
+				type: "progress",
+				action: "update",
+				source: targetDir,
+				message: `Could not remove all untracked files in ${targetDir} (${reason}). Files may be in use by another pi session; close it and run the update again.`,
+			});
 		}
 
 		const packageJsonPath = join(targetDir, "package.json");
 		if (existsSync(packageJsonPath)) {
 			await this.runNpmCommand(this.getGitDependencyInstallArgs(), { cwd: targetDir });
 		}
-		rmSync(markerPath, { force: true });
+		if (cleaned) {
+			rmSync(markerPath, { force: true });
+		}
 	}
 
 	private async ensureGitRef(targetDir: string, fetchArgs: string[], ref: string): Promise<void> {
@@ -2101,11 +2569,22 @@ export class DefaultPackageManager implements PackageManager {
 		await this.cleanAndInstallGitDependencies(targetDir, markerPath);
 	}
 
-	private async refreshTemporaryGitSource(source: GitSource, sourceStr: string): Promise<void> {
+	private async refreshTemporaryGitSource(source: GitSource, sourceStr: string, installedPath: string): Promise<void> {
 		if (isOfflineModeEnabled()) {
 			return;
 		}
 		try {
+			// A ref can name a moving branch, so refresh refs too. Skip the network call only when the
+			// ref is a commit hash that is already checked out.
+			if (source.ref && /^[0-9a-f]{7,64}$/i.test(source.ref)) {
+				const head = await this.runCommandCapture("git", ["rev-parse", "HEAD"], {
+					cwd: installedPath,
+					timeoutMs: NETWORK_TIMEOUT_MS,
+				});
+				if (head.trim().toLowerCase().startsWith(source.ref.toLowerCase())) {
+					return;
+				}
+			}
 			await this.withProgress("pull", sourceStr, `Refreshing ${sourceStr}...`, async () => {
 				await this.updateGit(source, "temporary");
 			});
@@ -2262,7 +2741,10 @@ export class DefaultPackageManager implements PackageManager {
 
 	private getTemporaryDir(prefix: string, suffix?: string, ref?: string): string {
 		const root = this.resolveManagedPath(getExtensionTempFolder(this.agentDir), prefix);
-		const hash = createHash("sha256")
+		// (node:crypto looked up, not imported: evaluating it at every start costs about 2 M instructions.)
+		const hash = process
+			.getBuiltinModule("node:crypto")
+			.createHash("sha256")
 			.update(`${prefix}-${suffix ?? ""}${ref ? `@${ref}` : ""}`)
 			.digest("hex")
 			.slice(0, 8);
@@ -2303,6 +2785,14 @@ export class DefaultPackageManager implements PackageManager {
 		filter: PackageFilter | undefined,
 		metadata: PathMetadata,
 	): boolean {
+		const manifest = readPiManifest(join(packageRoot, "package.json"));
+		const changelogPath = resolvePackageChangelogPath(packageRoot, manifest);
+		if (changelogPath) {
+			metadata.changelogPath = changelogPath;
+		} else {
+			delete metadata.changelogPath;
+		}
+
 		if (filter) {
 			for (const resourceType of RESOURCE_TYPES) {
 				const patterns = filter[resourceType];
@@ -2318,10 +2808,9 @@ export class DefaultPackageManager implements PackageManager {
 			return true;
 		}
 
-		const manifest = readPiManifest(join(packageRoot, "package.json"));
-		if (manifest) {
+		if (manifest && hasManifestResourceFields(manifest)) {
 			for (const resourceType of RESOURCE_TYPES) {
-				const entries = manifest[resourceType as keyof PiManifest];
+				const entries = manifest[resourceType];
 				this.addManifestEntries(
 					entries,
 					packageRoot,
@@ -2355,7 +2844,7 @@ export class DefaultPackageManager implements PackageManager {
 		metadata: PathMetadata,
 	): void {
 		const manifest = readPiManifest(join(packageRoot, "package.json"));
-		const entries = manifest?.[resourceType as keyof PiManifest];
+		const entries = manifest?.[resourceType];
 		if (entries) {
 			this.addManifestEntries(entries, packageRoot, resourceType, target, metadata);
 			return;
@@ -2424,7 +2913,7 @@ export class DefaultPackageManager implements PackageManager {
 		resourceType: ResourceType,
 	): { allFiles: string[]; enabledByManifest: Set<string> } {
 		const manifest = readPiManifest(join(packageRoot, "package.json"));
-		const entries = manifest?.[resourceType as keyof PiManifest];
+		const entries = manifest?.[resourceType];
 		if (entries && entries.length > 0) {
 			const allFiles = this.collectFilesFromManifestEntries(entries, packageRoot, resourceType);
 			const manifestPatterns = entries.filter(isOverridePattern);
@@ -2502,6 +2991,7 @@ export class DefaultPackageManager implements PackageManager {
 		projectSettings: ReturnType<SettingsManager["getProjectSettings"]>,
 		globalBaseDir: string,
 		projectBaseDir: string,
+		pathKeys: ResourcePathKeys,
 	): void {
 		const userMetadata: PathMetadata = {
 			source: "auto",
@@ -2544,7 +3034,7 @@ export class DefaultPackageManager implements PackageManager {
 		const userAgentsSkillsDir = join(getHomeDir(), ".agents", "skills");
 		const projectTrusted = this.settingsManager.isProjectTrusted();
 		const projectAgentsSkillDirs = projectTrusted
-			? collectAncestorAgentsSkillDirs(this.cwd).filter((dir) => resolve(dir) !== resolve(userAgentsSkillsDir))
+			? collectAncestorAgentsSkillDirs(this.cwd).filter((dir) => !pathsEqual(dir, userAgentsSkillsDir))
 			: [];
 
 		const addResources = (
@@ -2574,7 +3064,7 @@ export class DefaultPackageManager implements PackageManager {
 			// Project skills from .pi/
 			addResources(
 				"skills",
-				collectAutoSkillEntries(projectDirs.skills, "pi"),
+				collectAutoSkillEntries(projectDirs.skills, "pi", pathKeys),
 				projectMetadata,
 				projectOverrides.skills,
 				projectBaseDir,
@@ -2590,7 +3080,7 @@ export class DefaultPackageManager implements PackageManager {
 			};
 			addResources(
 				"skills",
-				collectAutoSkillEntries(agentsSkillsDir, "agents"),
+				collectAutoSkillEntries(agentsSkillsDir, "agents", pathKeys),
 				agentsMetadata,
 				projectOverrides.skills,
 				agentsBaseDir,
@@ -2600,14 +3090,14 @@ export class DefaultPackageManager implements PackageManager {
 		if (projectTrusted) {
 			addResources(
 				"prompts",
-				collectAutoPromptEntries(projectDirs.prompts),
+				collectAutoPromptEntries(projectDirs.prompts, pathKeys),
 				projectMetadata,
 				projectOverrides.prompts,
 				projectBaseDir,
 			);
 			addResources(
 				"themes",
-				collectAutoThemeEntries(projectDirs.themes),
+				collectAutoThemeEntries(projectDirs.themes, pathKeys),
 				projectMetadata,
 				projectOverrides.themes,
 				projectBaseDir,
@@ -2626,7 +3116,7 @@ export class DefaultPackageManager implements PackageManager {
 		// User skills from ~/.pi/agent/
 		addResources(
 			"skills",
-			collectAutoSkillEntries(userDirs.skills, "pi"),
+			collectAutoSkillEntries(userDirs.skills, "pi", pathKeys),
 			userMetadata,
 			userOverrides.skills,
 			globalBaseDir,
@@ -2640,7 +3130,7 @@ export class DefaultPackageManager implements PackageManager {
 		};
 		addResources(
 			"skills",
-			collectAutoSkillEntries(userAgentsSkillsDir, "agents"),
+			collectAutoSkillEntries(userAgentsSkillsDir, "agents", pathKeys),
 			userAgentsMetadata,
 			userOverrides.skills,
 			userAgentsBaseDir,
@@ -2648,14 +3138,14 @@ export class DefaultPackageManager implements PackageManager {
 
 		addResources(
 			"prompts",
-			collectAutoPromptEntries(userDirs.prompts),
+			collectAutoPromptEntries(userDirs.prompts, pathKeys),
 			userMetadata,
 			userOverrides.prompts,
 			globalBaseDir,
 		);
 		addResources(
 			"themes",
-			collectAutoThemeEntries(userDirs.themes),
+			collectAutoThemeEntries(userDirs.themes, pathKeys),
 			userMetadata,
 			userOverrides.themes,
 			globalBaseDir,
@@ -2720,7 +3210,7 @@ export class DefaultPackageManager implements PackageManager {
 		};
 	}
 
-	private toResolvedPaths(accumulator: ResourceAccumulator): ResolvedPaths {
+	private toResolvedPaths(accumulator: ResourceAccumulator, pathKeys: ResourcePathKeys): ResolvedPaths {
 		const mapToResolved = (
 			entries: Map<string, { metadata: PathMetadata; enabled: boolean }>,
 		): ResolvedResource[] => {
@@ -2731,11 +3221,12 @@ export class DefaultPackageManager implements PackageManager {
 			}));
 			resolved.sort((a, b) => resourcePrecedenceRank(a.metadata) - resourcePrecedenceRank(b.metadata));
 
+			pathKeys.prepare(entries.keys());
 			const seen = new Set<string>();
 			return resolved.filter((entry) => {
-				const canonicalPath = canonicalizePath(entry.path);
-				if (seen.has(canonicalPath)) return false;
-				seen.add(canonicalPath);
+				const pathKey = pathKeys.keyOf(entry.path);
+				if (seen.has(pathKey)) return false;
+				seen.add(pathKey);
 				return true;
 			});
 		};

@@ -1,15 +1,23 @@
-import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { Api, ImageContent, Model, ModelImageResizeOptions, TextContent } from "@earendil-works/pi-ai";
+import { isUtf8 } from "buffer";
 import { constants } from "fs";
-import { access as fsAccess, readFile as fsReadFile } from "fs/promises";
-import { type Static, Type } from "typebox";
-import { processImage } from "../../utils/image-process.ts";
+import {
+	type FileHandle,
+	access as fsAccess,
+	open as fsOpen,
+	readFile as fsReadFile,
+	stat as fsStat,
+} from "fs/promises";
+import type { Static } from "typebox";
+import { TextDecoder } from "util";
+import { markProcessedImageBlock, processImage } from "../../utils/image-process.ts";
 import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
-import { detachString } from "../../utils/text.ts";
+import { detachSharedString } from "../../utils/text.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { resolveReadPathAsync } from "./path-utils.ts";
 import { readRenderers } from "./renderers/read.ts";
-import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
+import { type TypeBoxAgentTool, wrapToolDefinition } from "./tool-definition-wrapper.ts";
+import { readOutputSchema, readSchema } from "./tool-schemas.generated.ts";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -19,12 +27,6 @@ import {
 	truncationDetails,
 } from "./truncate.ts";
 
-const readSchema = Type.Object({
-	path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
-	offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed)" })),
-	limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
-});
-
 export const readToolSystemPromptContribution = {
 	snippet: "Read file contents",
 	guidelines: ["Use read to examine files instead of cat or sed."],
@@ -32,17 +34,7 @@ export const readToolSystemPromptContribution = {
 
 export type ReadToolInput = Static<typeof readSchema>;
 
-/**
- * Result for programmatic callers such as codemode scripts: the text for text files, and an image
- * block for images that codemode's `image()` accepts. `note` is the text that goes with the image,
- * such as resize hints. Property descriptions are left out so the type stays on one line in tool
- * descriptions.
- */
-const readOutputSchema = Type.Union([
-	Type.String(),
-	Type.Object({ type: Type.Literal("image"), data: Type.String(), mimeType: Type.String(), note: Type.String() }),
-]);
-
+/** Result for programmatic callers such as codemode scripts (see readOutputSchema in tool-schemas.ts). */
 export type ReadToolOutput = Static<typeof readOutputSchema>;
 
 export interface ReadToolDetails {
@@ -60,13 +52,36 @@ export interface ReadOperations {
 	access: (absolutePath: string) => Promise<void>;
 	/** Detect image MIME type, return null or undefined for non-images */
 	detectImageMimeType?: (absolutePath: string) => Promise<string | null | undefined>;
+	/**
+	 * Stream file contents in chunks. When present, text files are read through it and only the lines
+	 * that will be shown are kept in memory; otherwise readFile loads the whole file. Stop reading when
+	 * the signal aborts; the read tool also stops consuming the stream then.
+	 */
+	createReadStream?: (absolutePath: string, options: { signal?: AbortSignal }) => AsyncIterable<Uint8Array>;
 }
 
 const defaultReadOperations: ReadOperations = {
 	readFile: (path) => fsReadFile(path),
+	createReadStream: readLocalFileChunks,
 	access: (path) => fsAccess(path, constants.R_OK),
 	detectImageMimeType: detectSupportedImageMimeTypeFromFile,
 };
+
+/**
+ * Stream a local file the way fs.readFile reads it: a regular file up to its size when opened, so text
+ * appended during the read is not counted and a growing file still ends; a file reporting size 0 (such
+ * as /proc files) and other file types until EOF.
+ */
+async function* readLocalFileChunks(path: string, { signal }: { signal?: AbortSignal }): AsyncIterable<Uint8Array> {
+	const handle = await fsOpen(path, "r");
+	try {
+		const stats = await handle.stat();
+		const end = stats.isFile() && stats.size > 0 ? stats.size - 1 : undefined;
+		yield* handle.createReadStream({ end, signal, autoClose: false });
+	} finally {
+		await handle.close();
+	}
+}
 
 export interface ReadToolOptions {
 	/** Whether to auto-resize images. Default: true */
@@ -106,11 +121,272 @@ function locateLines(
 	return { totalLines: newlines + 1, start, end };
 }
 
+/** Text files at least this large are read in chunks instead of whole. */
+const CHUNKED_READ_MIN_BYTES = 1024 * 1024;
+const CHUNKED_READ_CHUNK_BYTES = 1024 * 1024;
+
+/**
+ * Where the bytes of `data` can be cut so that decoding each part on its own gives the text decoding all of it gives:
+ * before a byte that starts a sequence, among the last three (a sequence is at most four bytes, and an invalid one
+ * ends at the first byte that cannot continue it), or else at the end.
+ */
+function utf8SafeEnd(data: Buffer): number {
+	for (let i = data.length - 1; i >= Math.max(0, data.length - 3); i--) {
+		const byte = data[i]!;
+		if (byte < 0x80) return data.length;
+		if (byte >= 0xc0) return i;
+	}
+	return data.length;
+}
+
+/** The UTF-8 length of the text that bytes fed in order decode to (invalid sequences decode to U+FFFD, 3 bytes). */
+class DecodedLength {
+	private carry: Buffer | undefined;
+	private total = 0;
+
+	feed(bytes: Buffer): void {
+		const data = this.carry ? Buffer.concat([this.carry, bytes]) : bytes;
+		this.carry = undefined;
+		const end = utf8SafeEnd(data);
+		if (end < data.length) this.carry = Buffer.from(data.subarray(end));
+		this.add(data.subarray(0, end));
+	}
+
+	end(): number {
+		if (this.carry) this.add(this.carry);
+		this.carry = undefined;
+		return this.total;
+	}
+
+	private add(part: Buffer): void {
+		this.total += isUtf8(part) ? part.length : Buffer.byteLength(part.toString("utf-8"), "utf-8");
+	}
+}
+
+/**
+ * What the read tool needs of a large file, read in chunks: the selected lines as `locateLines` and slicing the decoded
+ * file select them, without decoding the file (a 128 MB log took 50-100 ms and 250-400 MB of memory per read).
+ * A "\n" byte is "\n" in the decoded text and never part of a multi-byte sequence, so lines are found in the bytes.
+ */
+interface ChunkedSelection {
+	totalLines: number;
+	/** The selected text when it is at most `prefixBytes` long, else its first `prefixBytes` bytes, decoded. */
+	prefix: string;
+	/** Whether `prefix` is all of the selected text. */
+	complete: boolean;
+	/** Lines of the selected text, counted as truncateHead counts them. */
+	selectedLines: number;
+	/** UTF-8 length of the selected text. */
+	selectedBytes: number;
+	/** UTF-8 length of the selected text's first line. */
+	firstLineBytes: number;
+}
+
+async function readSelectionInChunks(
+	file: FileHandle,
+	startLine: number,
+	endLine: number,
+	prefixBytes: number,
+	isAborted: () => boolean,
+): Promise<ChunkedSelection | undefined> {
+	const chunk = Buffer.allocUnsafe(CHUNKED_READ_CHUNK_BYTES);
+	const prefix = Buffer.allocUnsafe(prefixBytes);
+	let prefixLength = 0;
+	const selectedLength = new DecodedLength();
+	const firstLineLength = new DecodedLength();
+	let firstLineEnded = false;
+	// No text is selected for a zero limit.
+	const selecting = endLine > startLine;
+	// Byte offsets of the selection in the file, once known; start is where line `startLine` starts.
+	let start = startLine === 0 ? 0 : -1;
+	let end = -1;
+	let selectedRawBytes = 0;
+	let selectedNewlines = 0;
+	let lastSelectedByte = -1;
+	let newlines = 0;
+	let offset = 0;
+	while (true) {
+		if (isAborted()) return undefined;
+		const { bytesRead } = await file.read(chunk, 0, chunk.length, null);
+		if (bytesRead === 0) break;
+		const bytes = chunk.subarray(0, bytesRead);
+		const endBefore = end;
+		for (let i = bytes.indexOf(0x0a); i !== -1; i = bytes.indexOf(0x0a, i + 1)) {
+			// Line `newlines` ends at i, and line `newlines + 1` starts after it.
+			if (newlines === endLine - 1) end = offset + i;
+			else if (selecting && start !== -1 && end === -1) selectedNewlines++;
+			newlines++;
+			if (newlines === startLine) start = offset + i + 1;
+		}
+		if (selecting && start !== -1 && endBefore === -1) {
+			// The part of this chunk in the selection.
+			const from = Math.max(start, offset) - offset;
+			const to = (end === -1 || end > offset + bytesRead ? offset + bytesRead : end) - offset;
+			if (from < to) {
+				const part = bytes.subarray(from, to);
+				selectedLength.feed(part);
+				selectedRawBytes += part.length;
+				lastSelectedByte = part[part.length - 1]!;
+				if (prefixLength < prefixBytes) {
+					prefixLength += part.copy(prefix, prefixLength, 0, Math.min(part.length, prefixBytes - prefixLength));
+				}
+				if (!firstLineEnded) {
+					const lineEnd = part.indexOf(0x0a);
+					firstLineLength.feed(lineEnd === -1 ? part : part.subarray(0, lineEnd));
+					firstLineEnded = lineEnd !== -1;
+				}
+			}
+		}
+		offset += bytesRead;
+	}
+	const complete = selectedRawBytes <= prefixBytes;
+	return {
+		totalLines: newlines + 1,
+		prefix: prefix.toString("utf-8", 0, prefixLength),
+		complete,
+		selectedLines: selectedRawBytes === 0 ? 0 : lastSelectedByte === 0x0a ? selectedNewlines : selectedNewlines + 1,
+		selectedBytes: selectedLength.end(),
+		firstLineBytes: firstLineLength.end(),
+	};
+}
+
+/**
+ * truncateHead of the selected text, from a selection read in chunks. When `prefix` is only the start of the selection,
+ * it is more than DEFAULT_MAX_BYTES bytes, and decoded text is never shorter in UTF-8 than its bytes (an invalid
+ * sequence of up to 3 bytes becomes U+FFFD, 3 bytes): so the prefix holds every line truncateHead keeps, and the line
+ * that does not fit, or enough of it not to fit. truncateHead then keeps what it keeps from the whole selection, and
+ * only its totals are those of the prefix.
+ */
+function truncateSelection(selection: ChunkedSelection): TruncationResult {
+	const truncation = truncateHead(selection.prefix);
+	if (selection.complete) return truncation;
+	return { ...truncation, totalLines: selection.selectedLines, totalBytes: selection.selectedBytes };
+}
+
 function getNonVisionImageNote(model: Model<Api> | undefined): string | undefined {
 	if (!model || model.input.includes("image")) {
 		return undefined;
 	}
 	return "[Current model does not support images. The image will be omitted from this request.]";
+}
+
+/** The lines a read shows, with the file's line count; line counts follow `text.split("\n")`. */
+interface SelectedLines {
+	totalFileLines: number;
+	truncation: TruncationResult;
+	/** Bytes of the first selected line, for the notice when it alone exceeds the byte limit. */
+	firstLineBytes: number;
+}
+
+/**
+ * Whether a range can be streamed. Other values (fractional, negative limit) keep the whole-file path,
+ * whose array slicing defines what they select, for example limit -1 as all lines but the last.
+ */
+function isStreamableRange(offset: number | undefined, limit: number | undefined): boolean {
+	return (
+		(offset === undefined || Number.isInteger(offset)) &&
+		(limit === undefined || (Number.isInteger(limit) && limit >= 0))
+	);
+}
+
+/** Select lines from a whole file in memory: for operations without createReadStream and unusual ranges. */
+function selectLinesFromBuffer(buffer: Buffer, startLine: number, limit: number | undefined): SelectedLines {
+	const allLines = buffer.toString("utf-8").split("\n");
+	const endLine = limit === undefined ? undefined : Math.min(startLine + limit, allLines.length);
+	const truncation = truncateHead(allLines.slice(startLine, endLine).join("\n"));
+	const firstLineBytes = truncation.firstLineExceedsLimit ? Buffer.byteLength(allLines[startLine], "utf-8") : 0;
+	return { totalFileLines: allLines.length, truncation, firstLineBytes };
+}
+
+/**
+ * Select lines from a file read in chunks. Only lines truncateHead can show are stored; the rest are
+ * counted, so memory does not grow with the file. Stops reading when the signal aborts.
+ */
+async function selectLinesFromStream(
+	chunks: AsyncIterable<Uint8Array>,
+	startLine: number,
+	limit: number | undefined,
+	signal: AbortSignal | undefined,
+): Promise<SelectedLines> {
+	const endLine = limit === undefined ? Number.POSITIVE_INFINITY : startLine + limit;
+	// Non-fatal UTF-8 that keeps a byte order mark decodes like Buffer.toString("utf-8").
+	const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+	const storedLines: string[] = [];
+	let storedBytes = 0;
+	let storedPastCaps = false;
+	let line = 0;
+	let selectedLines = 0;
+	let selectedBytes = 0;
+	let firstLineBytes = 0;
+	let lastLineEmpty = true;
+	// The selected line being read: its text, while it is stored, and its size.
+	let pieces: string[] | undefined = [];
+	let lineBytes = 0;
+	let lineHasText = false;
+
+	const appendToLine = (text: string, start: number, end: number) => {
+		lineHasText = true;
+		if (!pieces) return;
+		const piece = text.slice(start, end);
+		// A line over the byte cap is never shown, and a first line over it is only measured: never store
+		// all of a 1 GB line.
+		if (lineBytes <= DEFAULT_MAX_BYTES) pieces.push(piece);
+		lineBytes += Buffer.byteLength(piece, "utf-8");
+	};
+	const finishLine = () => {
+		if (pieces) {
+			if (selectedLines === 0) firstLineBytes = lineBytes;
+			// Storing continues one line past the caps: truncateHead ignores a trailing empty line, so the
+			// line after the cap must be there for it to decide truncation as for the full text.
+			if (storedLines.length > DEFAULT_MAX_LINES || storedBytes > DEFAULT_MAX_BYTES) storedPastCaps = true;
+			const text = pieces.join("");
+			storedBytes += Buffer.byteLength(text, "utf-8") + (storedLines.length > 0 ? 1 : 0);
+			storedLines.push(text);
+		}
+		selectedLines++;
+		lastLineEmpty = !lineHasText;
+		pieces = storedPastCaps ? undefined : [];
+		lineBytes = 0;
+		lineHasText = false;
+	};
+	const select = (text: string) => {
+		let position = 0;
+		// Start of the selected text in this piece, measured as a whole: the joined lines' size.
+		let selectionStart = -1;
+		while (true) {
+			const selected = line >= startLine && line < endLine;
+			if (selected && selectionStart === -1) selectionStart = position;
+			const newline = text.indexOf("\n", position);
+			const end = newline === -1 ? text.length : newline;
+			if (selected && end > position) appendToLine(text, position, end);
+			if (newline === -1) break;
+			if (selected) {
+				finishLine();
+				if (line + 1 === endLine) {
+					selectedBytes += Buffer.byteLength(text.slice(selectionStart, newline), "utf-8");
+					selectionStart = -1;
+				}
+			}
+			line++;
+			position = newline + 1;
+		}
+		if (selectionStart !== -1) selectedBytes += Buffer.byteLength(text.slice(selectionStart), "utf-8");
+	};
+
+	for await (const chunk of chunks) {
+		// Leaving the loop closes the stream.
+		if (signal?.aborted) throw new Error("Operation aborted");
+		select(decoder.decode(chunk, { stream: true }));
+	}
+	select(decoder.decode());
+	if (line >= startLine && line < endLine) finishLine();
+	const truncation: TruncationResult = {
+		...truncateHead(storedLines.join("\n")),
+		// truncateHead's counts for the joined selected lines, which drop a trailing empty line.
+		totalLines: selectedBytes === 0 ? 0 : selectedLines - (lastLineEmpty ? 1 : 0),
+		totalBytes: selectedBytes,
+	};
+	return { totalFileLines: line + 1, truncation, firstLineBytes };
 }
 
 export function createReadToolDefinition(
@@ -163,10 +439,11 @@ export function createReadToolDefinition(
 							if (mimeType) {
 								// Read image as binary.
 								const buffer = await ops.readFile(absolutePath);
-								const processed = await processImage(buffer, mimeType, {
+								const processOptions = {
 									autoResizeImages,
 									resizeOptions: ctx?.model?.inputLimits?.images?.resize ?? fallbackResizeOptions,
-								});
+								};
+								const processed = await processImage(buffer, mimeType, processOptions);
 								if (!processed.ok) {
 									let textNote = `Read image file [${mimeType}]\n${processed.message}`;
 									if (nonVisionImageNote) textNote += `\n${nonVisionImageNote}`;
@@ -175,44 +452,91 @@ export function createReadToolDefinition(
 									let textNote = `Read image file [${processed.mimeType}]`;
 									if (processed.hints.length > 0) textNote += `\n${processed.hints.join("\n")}`;
 									if (nonVisionImageNote) textNote += `\n${nonVisionImageNote}`;
-									content = [
-										{ type: "text", text: textNote },
-										{ type: "image", data: processed.data, mimeType: processed.mimeType },
-									];
+									const image: ImageContent = {
+										type: "image",
+										data: processed.data,
+										mimeType: processed.mimeType,
+									};
+									markProcessedImageBlock(image, processOptions);
+									content = [{ type: "text", text: textNote }, image];
 								}
 							} else {
-								// Read text content.
-								const buffer = await ops.readFile(absolutePath);
-								const textContent = buffer.toString("utf-8");
-								// Apply offset if specified. Convert from 1-indexed input to 0-indexed line numbers.
-								const startLine = offset ? Math.max(0, Math.floor(offset) - 1) : 0;
+								// Read text content. Convert offset from 1-indexed input to 0-indexed line access.
+								const startLine = offset ? Math.max(0, offset - 1) : 0;
 								const startLineDisplay = startLine + 1;
-								const requestedEndLine =
-									limit !== undefined ? startLine + Math.max(0, Math.floor(limit)) : Number.POSITIVE_INFINITY;
-								// Find the selected lines by scanning for newlines instead of splitting the file: splitting
-								// allocates a string per line of the whole file to return at most a few thousand of them.
-								const {
-									totalLines: totalFileLines,
-									start,
-									end,
-								} = locateLines(textContent, startLine, requestedEndLine);
+								let totalFileLines: number;
+								let truncation: TruncationResult;
+								let firstLineBytes: () => number;
+								if (ops === defaultReadOperations && isStreamableRange(offset, limit)) {
+									// Pi-Bolt: lines are found in the bytes, and only the selected ones are decoded; a large
+									// file is read in chunks (readSelectionInChunks), a smaller one whole without splitting it.
+									const requestedEndLine = limit !== undefined ? startLine + limit : Number.POSITIVE_INFINITY;
+									const size = (await fsStat(absolutePath)).size;
+									if (size >= CHUNKED_READ_MIN_BYTES) {
+										const file = await fsOpen(absolutePath, "r");
+										let selection: ChunkedSelection | undefined;
+										try {
+											// A few bytes more than truncateHead keeps: see truncateSelection().
+											selection = await readSelectionInChunks(
+												file,
+												startLine,
+												requestedEndLine,
+												DEFAULT_MAX_BYTES + 4,
+												() => aborted,
+											);
+										} finally {
+											await file.close();
+										}
+										if (!selection) return;
+										totalFileLines = selection.totalLines;
+										truncation =
+											startLine >= totalFileLines ? truncateHead("") : truncateSelection(selection);
+										const selectedFirstLineBytes = selection.firstLineBytes;
+										firstLineBytes = () => selectedFirstLineBytes;
+									} else {
+										const textContent = (await ops.readFile(absolutePath)).toString("utf-8");
+										// Find the selected lines by scanning for newlines instead of splitting the file: splitting
+										// allocates a string per line of the whole file to return at most a few thousand of them.
+										const located = locateLines(textContent, startLine, requestedEndLine);
+										totalFileLines = located.totalLines;
+										const selectedContent =
+											requestedEndLine > startLine && startLine < totalFileLines
+												? textContent.slice(located.start, located.end)
+												: "";
+										truncation = truncateHead(selectedContent);
+										firstLineBytes = () => {
+											const firstNewline = selectedContent.indexOf("\n");
+											const firstLine =
+												firstNewline === -1 ? selectedContent : selectedContent.slice(0, firstNewline);
+											return Buffer.byteLength(firstLine, "utf-8");
+										};
+									}
+								} else {
+									const selected =
+										ops.createReadStream && isStreamableRange(offset, limit)
+											? await selectLinesFromStream(
+													ops.createReadStream(absolutePath, { signal }),
+													startLine,
+													limit,
+													signal,
+												)
+											: selectLinesFromBuffer(await ops.readFile(absolutePath), startLine, limit);
+									totalFileLines = selected.totalFileLines;
+									truncation = selected.truncation;
+									firstLineBytes = () => selected.firstLineBytes;
+								}
+								if (aborted) return;
 								// Check if offset is out of bounds.
 								if (startLine >= totalFileLines) {
 									throw new Error(`Offset ${offset} is beyond end of file (${totalFileLines} lines total)`);
 								}
-								// If limit is specified by the user, honor it first. Otherwise truncateHead decides.
-								const selectedContent = requestedEndLine > startLine ? textContent.slice(start, end) : "";
+								// A user-specified limit is honored before truncation.
 								const userLimitedLines =
-									limit !== undefined ? Math.min(requestedEndLine, totalFileLines) - startLine : undefined;
-								// Apply truncation, respecting both line and byte limits.
-								const truncation = truncateHead(selectedContent);
+									limit === undefined ? undefined : Math.min(startLine + limit, totalFileLines) - startLine;
 								let outputText: string;
 								if (truncation.firstLineExceedsLimit) {
 									// First line alone exceeds the byte limit. Point the model at a bash fallback.
-									const firstNewline = selectedContent.indexOf("\n");
-									const firstLine =
-										firstNewline === -1 ? selectedContent : selectedContent.slice(0, firstNewline);
-									const firstLineSize = formatSize(Buffer.byteLength(firstLine, "utf-8"));
+									const firstLineSize = formatSize(firstLineBytes());
 									outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use bash: sed -n '${startLineDisplay}p' ${path} | head -c ${DEFAULT_MAX_BYTES}]`;
 									details = { truncation: truncationDetails(truncation) };
 								} else if (truncation.truncated) {
@@ -236,8 +560,8 @@ export function createReadToolDefinition(
 									outputText = truncation.content;
 								}
 								// The output can be a substring of the whole file's text, which it would keep in memory for as
-								// long as the session holds the result.
-								content = [{ type: "text", text: detachString(outputText) }];
+								// long as the session holds the result. A file read again unchanged gives the same string.
+								content = [{ type: "text", text: detachSharedString(outputText) }];
 							}
 
 							if (aborted) return;
@@ -255,6 +579,6 @@ export function createReadToolDefinition(
 	};
 }
 
-export function createReadTool(cwd: string, options?: ReadToolOptions): AgentTool<typeof readSchema> {
+export function createReadTool(cwd: string, options?: ReadToolOptions): TypeBoxAgentTool<typeof readSchema> {
 	return wrapToolDefinition(createReadToolDefinition(cwd, options));
 }

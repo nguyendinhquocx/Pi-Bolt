@@ -1,10 +1,13 @@
 import { createHash } from "node:crypto";
+import { once } from "node:events";
+import { createConnection } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { McpClient, StreamableHttpTransport } from "../src/index.ts";
 import {
 	adaptOAuthProvider,
 	authorizeMcp,
 	discoverAuthorizationServerMetadata,
+	discoverProtectedResourceMetadata,
 	McpOAuthAuthorizationRequiredError,
 	McpOAuthProvider,
 	MemoryOAuthStateStore,
@@ -16,7 +19,9 @@ import {
 	OAuthInsecureEndpointError,
 	OAuthIssuerMismatchError,
 	type OAuthTokens,
+	parseWwwAuthenticate,
 	registerClient,
+	startAuthorization,
 } from "../src/oauth/index.ts";
 import { closeServers, listen, readBody } from "./helpers.ts";
 
@@ -450,6 +455,39 @@ describe("MCP OAuth", () => {
 		await expect(discoverAuthorizationServerMetadata(origin)).rejects.toBeInstanceOf(OAuthIssuerMismatchError);
 	});
 
+	it("rejects non-HTTP authorization endpoints, which the platform URL handler would launch", async () => {
+		const endpoints = ["file://attacker.example/share/x.exe", "search-ms:query=x", "ms-msdt:/id"];
+		let endpoint = "";
+		const origin = await listen(async (_request, response, serverOrigin) => {
+			response.setHeader("content-type", "application/json");
+			response.end(
+				JSON.stringify({
+					issuer: serverOrigin,
+					authorization_endpoint: endpoint,
+					token_endpoint: `${serverOrigin}/token`,
+					response_types_supported: ["code"],
+				}),
+			);
+		});
+		for (const value of endpoints) {
+			endpoint = value;
+			await expect(discoverAuthorizationServerMetadata(origin)).rejects.toThrow("Invalid authorization endpoint");
+			const metadata = {
+				issuer: origin,
+				authorization_endpoint: value,
+				token_endpoint: `${origin}/token`,
+				response_types_supported: ["code"],
+			};
+			await expect(
+				startAuthorization(origin, {
+					metadata,
+					clientInformation: { client_id: "client" },
+					redirectUrl: "http://127.0.0.1/callback",
+				}),
+			).rejects.toThrow("Invalid authorization endpoint");
+		}
+	});
+
 	// #10172
 	it("uses a configured authorization server metadata document as is", async () => {
 		const origin = await listen(async (request, response, serverOrigin) => {
@@ -489,11 +527,13 @@ describe("MCP OAuth", () => {
 	});
 
 	it("opens no authorization endpoint other than https or this machine's http (a file: URL runs the file on Windows)", async () => {
-		for (const endpoint of [
-			"file:///C:/Users/me/Downloads/x.bat",
-			"file://attacker.example/share/x",
-			"http://idp.example/a",
-		]) {
+		// Not http or https: rejected as invalid when the metadata is read. Plain http to another machine: insecure.
+		for (const [endpoint, error] of [
+			["file:///C:/Users/me/Downloads/x.bat", "Invalid authorization endpoint"],
+			["file://attacker.example/share/x", "Invalid authorization endpoint"],
+			["file://localhost/C:/Users/me/Downloads/x.bat", "Invalid authorization endpoint"],
+			["http://idp.example/a", OAuthInsecureEndpointError],
+		] as const) {
 			const origin = await listen(async (request, response, serverOrigin) => {
 				const url = new URL(request.url ?? "/", serverOrigin);
 				response.setHeader("content-type", "application/json");
@@ -519,7 +559,8 @@ describe("MCP OAuth", () => {
 				serverUrl: `${origin}/mcp`,
 				authorizationServerMetadataUrl: new URL(`${origin}/idp/metadata.json`),
 			};
-			await expect(authorizeMcp(provider, options)).rejects.toBeInstanceOf(OAuthInsecureEndpointError);
+			if (typeof error === "string") await expect(authorizeMcp(provider, options)).rejects.toThrow(error);
+			else await expect(authorizeMcp(provider, options)).rejects.toBeInstanceOf(error);
 			expect(provider.authorizationUrl).toBeUndefined();
 		}
 	});
@@ -567,6 +608,95 @@ describe("MCP OAuth", () => {
 		);
 		expect(await exchange("no-metadata", undefined, false, false)).toBe("AUTHORIZED");
 		expect(codes).toEqual(["matching", "omitted", "no-metadata"]);
+	});
+
+	it("loads OAuth metadata only over https, from this machine, or from the MCP server's own origin", async () => {
+		const requested: string[] = [];
+		const recording = async (input: string | URL) => {
+			requested.push(String(input));
+			return new Response("{}", { status: 404 });
+		};
+		// A challenge that names a URL of another scheme names none.
+		expect(parseWwwAuthenticate('Bearer resource_metadata="file:///dev/zero"').resourceMetadataUrl).toBeUndefined();
+		for (const url of ["file:///dev/zero", "http://internal.example/metadata"]) {
+			await expect(
+				discoverProtectedResourceMetadata("https://mcp.example/mcp", {
+					resourceMetadataUrl: url,
+					fetch: recording,
+				}),
+			).rejects.toBeInstanceOf(OAuthInsecureEndpointError);
+		}
+		await expect(
+			discoverAuthorizationServerMetadata("http://internal.example", {
+				serverUrl: "https://mcp.example/mcp",
+				fetch: recording,
+			}),
+		).rejects.toBeInstanceOf(OAuthInsecureEndpointError);
+		expect(requested).toEqual([]);
+
+		// The MCP server's own origin keeps the scheme the user configured.
+		expect(
+			await discoverAuthorizationServerMetadata("http://mcp.internal.example", {
+				serverUrl: "http://mcp.internal.example/mcp",
+				fetch: recording,
+			}),
+		).toBeUndefined();
+		expect(requested[0]).toBe("http://mcp.internal.example/.well-known/oauth-authorization-server");
+
+		// Redirects are checked as the first URL is.
+		const origin = await listen(async (_request, response) => {
+			response.writeHead(302, { location: "http://internal.example/metadata" });
+			response.end();
+		});
+		const followed: string[] = [];
+		const fetch = async (input: string | URL, init?: RequestInit) => {
+			followed.push(String(input));
+			return globalThis.fetch(input, init);
+		};
+		await expect(discoverAuthorizationServerMetadata(origin, { fetch })).rejects.toBeInstanceOf(
+			OAuthInsecureEndpointError,
+		);
+		expect(followed).toEqual([`${origin}/.well-known/oauth-authorization-server`]);
+	});
+
+	it("reads at most 1 MiB of an OAuth response", async () => {
+		const origin = await listen(async (_request, response) => {
+			response.setHeader("content-type", "application/json");
+			// No content-length: the body is streamed, and it is never-ending as far as the client knows.
+			for (let i = 0; i < 64 && !response.destroyed; i++) response.write(Buffer.alloc(64 * 1024, 0x20));
+			response.end("{}");
+		});
+		await expect(discoverAuthorizationServerMetadata(origin)).rejects.toThrow("larger than 1 MiB");
+		await expect(
+			registerClient(origin, { clientMetadata: { redirect_uris: ["http://127.0.0.1/callback"] } }),
+		).rejects.toThrow("larger than 1 MiB");
+	});
+
+	it("registers a client only over https or this machine's http", async () => {
+		const requested: string[] = [];
+		const fetch = async (input: string | URL) => {
+			requested.push(String(input));
+			return new Response(JSON.stringify({ client_id: "client" }), { status: 201 });
+		};
+		const clientMetadata = { redirect_uris: ["http://127.0.0.1/callback"] };
+		await expect(registerClient("http://idp.example", { clientMetadata, fetch })).rejects.toBeInstanceOf(
+			OAuthInsecureEndpointError,
+		);
+		const metadata = {
+			issuer: "https://idp.example",
+			authorization_endpoint: "https://idp.example/authorize",
+			token_endpoint: "https://idp.example/token",
+			registration_endpoint: "http://idp.example/register",
+			response_types_supported: ["code"],
+		};
+		await expect(registerClient("https://idp.example", { metadata, clientMetadata, fetch })).rejects.toBeInstanceOf(
+			OAuthInsecureEndpointError,
+		);
+		expect(requested).toEqual([]);
+		expect(await registerClient("https://idp.example", { clientMetadata, fetch })).toMatchObject({
+			client_id: "client",
+		});
+		expect(requested).toEqual(["https://idp.example/register"]);
 	});
 
 	// #10565
@@ -621,6 +751,25 @@ describe("OAuthCallbackServer pages", () => {
 			expect((await pending).code).toBe("abc");
 		} finally {
 			await callback.close();
+		}
+	});
+
+	// #11311
+	it("closes while the browser keeps an unused connection open", async () => {
+		const callback = await OAuthCallbackServer.listen();
+		const url = new URL(callback.redirectUrl);
+		const spare = createConnection({ host: url.hostname, port: Number(url.port) });
+		try {
+			await once(spare, "connect");
+			const pending = callback.waitForCallback("s1");
+			const response = await fetch(`${callback.redirectUrl}?code=abc&state=s1`);
+			expect(await response.text()).toBe("Authorization complete. You may close this window.");
+			expect((await pending).code).toBe("abc");
+			const closed = callback.close().then(() => "closed");
+			const timeout = new Promise((resolve) => setTimeout(() => resolve("timed out"), 2000));
+			expect(await Promise.race([closed, timeout])).toBe("closed");
+		} finally {
+			spare.destroy();
 		}
 	});
 

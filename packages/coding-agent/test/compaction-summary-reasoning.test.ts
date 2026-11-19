@@ -151,6 +151,26 @@ describe("generateSummary reasoning options", () => {
 		expect(prompt).toContain("# Instructions\\nThe messages above are earlier context from an ongoing conversation.");
 	});
 
+	it("applies custom instructions to the turn prefix summary of a split turn", async () => {
+		// Regression test for #11058
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "entry-keep",
+			messagesToSummarize: [],
+			turnPrefixMessages: messages,
+			isSplitTurn: true,
+			tokensBefore: 100,
+			previousSummary: "previous checkpoint",
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
+		};
+
+		await compact(preparation, createModel(false), "test-key", undefined, "keep migration decisions");
+
+		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+		const requestContext = completeSimpleMock.mock.calls[0][1] as TranscriptContext;
+		expect(JSON.stringify(requestContext.messages)).toContain("Additional focus: keep migration decisions");
+	});
+
 	it("rejects tool calls from conversation summaries", async () => {
 		completeSimpleMock.mockResolvedValueOnce(mockToolCallResponse);
 
@@ -294,8 +314,76 @@ describe("generateSummary reasoning options", () => {
 			input: 20,
 			output: 20,
 			totalTokens: 40,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, totalFromProvider: false },
 		});
 		expect(completeSimpleMock.mock.calls.map((call) => call[2]?.maxTokens)).toEqual([128000, 128000]);
+	});
+
+	it("caps summary output by reserveTokens on 1M-context models", async () => {
+		// A 1M model's 128K output limit plus a large summary input overflowed the context window.
+		const model = { ...createModel(true, 128000), contextWindow: 1_000_000 };
+
+		await generateSummary(messages, model, 16384, "test-key", undefined, undefined, undefined, undefined, "high");
+
+		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({ maxTokens: 13107, reasoning: "high" });
+	});
+
+	it("keeps a minimum summary output budget when reserveTokens is zero", async () => {
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "entry-keep",
+			messagesToSummarize: messages,
+			turnPrefixMessages: messages,
+			isSplitTurn: true,
+			tokensBefore: 600000,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 0, keepRecentTokens: 20000 },
+		};
+
+		await compact(preparation, createModel(false), "test-key");
+
+		expect(completeSimpleMock.mock.calls.map((call) => call[2]?.maxTokens)).toEqual([4096, 4096]);
+	});
+
+	it("summarizes again without reasoning when reasoning uses the whole output cap", async () => {
+		completeSimpleMock.mockResolvedValueOnce({ ...mockSummaryResponse, stopReason: "length", content: [] });
+
+		const result = await generateSummaryWithUsage(
+			messages,
+			createModel(true),
+			16384,
+			"test-key",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			"high",
+		);
+
+		expect(result.text).toBe("## Goal\nTest summary");
+		expect(result.usage).toMatchObject({ input: 20, output: 20, totalTokens: 40 });
+		expect(completeSimpleMock).toHaveBeenCalledTimes(2);
+		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({ maxTokens: 8192, reasoning: "high" });
+		expect(completeSimpleMock.mock.calls[1][2]).toMatchObject({ maxTokens: 8192 });
+		expect(completeSimpleMock.mock.calls[1][2]).not.toHaveProperty("reasoning");
+	});
+
+	it("rejects a length-limited summary made without reasoning", async () => {
+		completeSimpleMock.mockResolvedValue({ ...mockSummaryResponse, stopReason: "length", content: [] });
+
+		await expect(
+			generateSummaryWithUsage(
+				messages,
+				createModel(true),
+				16384,
+				"test-key",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				"high",
+			),
+		).rejects.toThrow("generation hit the token cap");
+		expect(completeSimpleMock).toHaveBeenCalledTimes(2);
 	});
 });

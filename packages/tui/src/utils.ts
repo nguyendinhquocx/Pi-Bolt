@@ -1,13 +1,15 @@
 import { eastAsianWidth } from "get-east-asian-width";
 
-// segmenters (shared instance)
-const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-const wordSegmenter = new Intl.Segmenter(undefined, { granularity: "word" });
+// Segmenters (shared instances), made on first use: the first Intl.Segmenter of a process sets up ICU's segmentation
+// data, about half a millisecond, which a start that measures no text (`pi -p`) does not need.
+let graphemeSegmenter: Intl.Segmenter | undefined;
+let wordSegmenter: Intl.Segmenter | undefined;
 
 /**
  * Get the shared grapheme segmenter instance.
  */
 export function getGraphemeSegmenter(): Intl.Segmenter {
+	graphemeSegmenter ??= new Intl.Segmenter(undefined, { granularity: "grapheme" });
 	return graphemeSegmenter;
 }
 
@@ -15,6 +17,7 @@ export function getGraphemeSegmenter(): Intl.Segmenter {
  * Get the shared word segmenter instance.
  */
 export function getWordSegmenter(): Intl.Segmenter {
+	wordSegmenter ??= new Intl.Segmenter(undefined, { granularity: "word" });
 	return wordSegmenter;
 }
 
@@ -46,6 +49,11 @@ const markCharRegex = /^\p{Mark}$/v;
 const terminalSpacingMarkRegex =
 	/^(?:[\p{Spacing_Mark}--[\u1734\u302E\u302F]]|[\u065F\u0F7F\u102B\u102C\u1031\u1033-\u1035\u1038\u103A-\u103E])+$/v;
 const rgiEmojiRegex = /^\p{RGI_Emoji}$/v;
+// RGI_Emoji restricted to a single code point: Emoji_Presentation without the regional indicators
+// (test/rgi-emoji-single-code-point.test.ts checks every code point). The first test of rgiEmojiRegex
+// builds its matcher for all of RGI_Emoji's sequences, which costs tens of millions of instructions
+// for each string width; this one costs about as much as the other property regexes.
+const singleCodePointEmojiRegex = /^(?![\u{1F1E6}-\u{1F1FF}])\p{Emoji_Presentation}$/u;
 
 // Cache for non-ASCII strings
 const WIDTH_CACHE_SIZE = 512;
@@ -87,7 +95,7 @@ function truncateFragmentToWidth(text: string, maxWidth: number): { text: string
 	if (!hasAnsi && !hasTabs) {
 		let result = "";
 		let width = 0;
-		for (const { segment } of graphemeSegmenter.segment(text)) {
+		for (const { segment } of getGraphemeSegmenter().segment(text)) {
 			const w = graphemeWidth(segment);
 			if (width + w > maxWidth) {
 				break;
@@ -134,7 +142,7 @@ function truncateFragmentToWidth(text: string, maxWidth: number): { text: string
 			end++;
 		}
 
-		for (const { segment } of graphemeSegmenter.segment(text.slice(i, end))) {
+		for (const { segment } of getGraphemeSegmenter().segment(text.slice(i, end))) {
 			const w = graphemeWidth(segment);
 			if (width + w > maxWidth) {
 				return { text: result, width };
@@ -174,6 +182,12 @@ function finalizeTruncatedResult(
 	return pad ? result + " ".repeat(Math.max(0, maxWidth - visibleWidth)) : result;
 }
 
+/** Whether a grapheme cluster matches `rgiEmojiRegex`. Exported for its test. */
+export function isRgiEmoji(segment: string): boolean {
+	const singleCodePoint = segment.length === (segment.codePointAt(0)! > 0xffff ? 2 : 1);
+	return singleCodePoint ? singleCodePointEmojiRegex.test(segment) : rgiEmojiRegex.test(segment);
+}
+
 /**
  * Calculate the terminal width of a single grapheme cluster.
  * Based on code from the string-width library, but includes a possible-emoji
@@ -197,7 +211,7 @@ function graphemeWidth(segment: string): number {
 	}
 
 	// Emoji check with pre-filter
-	if (couldBeEmoji(segment) && rgiEmojiRegex.test(segment)) {
+	if (couldBeEmoji(segment) && isRgiEmoji(segment)) {
 		return 2;
 	}
 
@@ -293,7 +307,7 @@ export function visibleWidth(str: string): number {
 
 	// Calculate width
 	let width = 0;
-	for (const { segment } of graphemeSegmenter.segment(clean)) {
+	for (const { segment } of getGraphemeSegmenter().segment(clean)) {
 		width += graphemeWidth(segment);
 	}
 
@@ -326,6 +340,241 @@ export function stripTerminalSequences(str: string): string {
 	return result;
 }
 
+/**
+ * Text a terminal would act on rather than show: C0 controls but tab and line feed (a carriage return not before a line
+ * feed included), DEL, and C1 controls. Searched from lastIndex.
+ */
+const TERMINAL_CONTROL_REGEX = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]|\r(?!\n)/g;
+
+/**
+ * A complete escape sequence (CSI; OSC, DCS, SOS, PM or APC up to its terminator; any other ESC sequence), a lone
+ * carriage return, or one control character of TERMINAL_CONTROL_REGEX (a lone ESC among them).
+ */
+const TERMINAL_SEQUENCE_GLOBAL_REGEX =
+	/\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]|\x1b[\]PX^_][^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)|\x1b[\x20-\x2f]*[\x30-\x4f\x51-\x57\x59\x5a\x5c\x60-\x7e]|\r(?!\n)|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g;
+
+/**
+ * Text from outside Pi (a model's reply, a tool call's arguments, a tool's or MCP server's output) made safe to draw:
+ * escape sequences and control characters are removed, so the text cannot set the clipboard (OSC 52) or the window
+ * title, add hyperlinks, move the cursor or clear lines (which would let it draw over what Pi drew, such as a tool's
+ * header or a shell command line). Tabs and line breaks are kept; a carriage return alone becomes a line break, as
+ * Markdown and wrapTextWithAnsi() read it. An escape sequence that is not complete loses its ESC, and the rest is shown
+ * as text. Text without any of these is returned as it is.
+ */
+export function sanitizeTerminalText(text: string): string {
+	TERMINAL_CONTROL_REGEX.lastIndex = 0;
+	if (!TERMINAL_CONTROL_REGEX.test(text)) return text;
+	return text.replace(TERMINAL_SEQUENCE_GLOBAL_REGEX, (match) => (match === "\r" ? "\n" : ""));
+}
+
+/**
+ * At a lone ESC (lastIndex): the start of an escape sequence that runs to the end of the text, which more text could
+ * complete (a CSI, OSC, DCS, SOS, PM, APC or other ESC sequence without its last character or terminator).
+ */
+const PENDING_ESCAPE_REGEX = /\x1b(?:\[[\x30-\x3f]*[\x20-\x2f]*|[\]PX^_][^\x07\x1b\x9c]*\x1b?|[\x20-\x2f]*)$/y;
+
+/**
+ * text.startsWith(prefix), comparing the part of `text` as long as `prefix` with it. A message streaming in is the text before
+ * with the text added to it (`text += delta`): the engine keeps that as the two strings joined, not as one copy of both,
+ * until it is read; it then copies all of it into one. The part of it that is the text before is that string itself, which
+ * compares with the text before without reading either. (startsWith() reads all of `text`, and so copies it.)
+ */
+export function startsWithText(text: string, prefix: string): boolean {
+	return text.length >= prefix.length && text.slice(0, prefix.length) === prefix;
+}
+
+/** What sanitizeTerminalTextFrom() made of a text: the start of what it makes of a longer text that begins with it. */
+export interface SanitizedTerminalText {
+	/** The text. */
+	readonly raw: string;
+	/** sanitizeTerminalText(raw). */
+	readonly text: string;
+	/** Whether `text` is `raw`: nothing was removed or replaced. */
+	readonly unchanged: boolean;
+	/**
+	 * Where in `raw` no escape sequence or carriage return is pending: every text that begins with `raw` sanitises, up to
+	 * there, to the first `safeLength` characters of `text`, and from there as if it began there.
+	 */
+	readonly safeRaw: number;
+	readonly safeLength: number;
+	/**
+	 * When `text` is the text of the `previous` result given for it with more text after it: that text (empty when the
+	 * text is the same). A message streaming in is lexed from what was lexed for it before and what was added.
+	 */
+	readonly added: string | undefined;
+}
+
+/**
+ * sanitizeTerminalText(text), with what it made of a shorter text (`previous`). When `text` begins with that text (a
+ * message streaming in), only what follows the last point where no escape sequence was pending is gone through, so the
+ * cost of each chunk does not grow with the length of the message. The result is the same as sanitizeTerminalText()'s.
+ *
+ * Example: "a\x1b[3" then "a\x1b[31mb". The first sanitises to "a[3" (an escape sequence that is not complete loses its
+ * ESC), but the ESC is pending: the second is gone through from the ESC, and gives "ab", as all of it would.
+ */
+export function sanitizeTerminalTextFrom(text: string, previous?: SanitizedTerminalText): SanitizedTerminalText {
+	let start = 0;
+	let prefix = "";
+	let unchanged = true;
+	// (Whether the result is the previous text with more after it.)
+	let extendsPrevious = false;
+	if (previous !== undefined && startsWithText(text, previous.raw)) {
+		if (text.length === previous.raw.length) return { ...previous, added: "" };
+		start = previous.safeRaw;
+		unchanged = previous.unchanged;
+		prefix =
+			previous.safeLength === previous.text.length ? previous.text : previous.text.slice(0, previous.safeLength);
+		extendsPrevious = prefix.length === previous.text.length;
+	}
+
+	// (Only the text from `start` is read: for a text made of the previous one and the text added to it, reading all of it
+	// would copy all of it. No expression here looks behind or anchors at the start, so they match the same there.)
+	const tail = start === 0 ? text : text.slice(start);
+	TERMINAL_CONTROL_REGEX.lastIndex = 0;
+	if (!TERMINAL_CONTROL_REGEX.test(tail)) {
+		const sanitized = unchanged ? text : prefix + tail;
+		return {
+			raw: text,
+			text: sanitized,
+			unchanged,
+			safeRaw: text.length,
+			safeLength: sanitized.length,
+			added: extendsPrevious ? tail : undefined,
+		};
+	}
+
+	// As sanitizeTerminalText() replaces, from `start`, noting the first match that more text could make another: a lone
+	// ESC that begins an escape sequence not complete yet, or a carriage return at the end (it is a line break unless a
+	// line feed follows).
+	// (Positions in `tail`.)
+	let added = "";
+	let last = 0;
+	let safeRaw = -1;
+	let safeLength = 0;
+	// (Regular expressions as literals: one built from a string at run time is not compiled ahead of time.)
+	const regex = TERMINAL_SEQUENCE_GLOBAL_REGEX;
+	regex.lastIndex = 0;
+	for (let match = regex.exec(tail); match !== null; match = regex.exec(tail)) {
+		const at = match.index;
+		const sequence = match[0];
+		if (safeRaw < 0) {
+			let pending = false;
+			if (sequence === "\r") {
+				pending = at + 1 === tail.length;
+			} else if (sequence === "\x1b") {
+				PENDING_ESCAPE_REGEX.lastIndex = at;
+				pending = PENDING_ESCAPE_REGEX.test(tail);
+			}
+			if (pending) {
+				safeRaw = start + at;
+				safeLength = prefix.length + added.length + (at - last);
+			}
+		}
+		added += tail.slice(last, at);
+		if (sequence === "\r") added += "\n";
+		last = at + sequence.length;
+	}
+	added += tail.slice(last);
+	const sanitized = prefix + added;
+	if (safeRaw < 0) {
+		safeRaw = text.length;
+		safeLength = sanitized.length;
+	}
+	return {
+		raw: text,
+		text: sanitized,
+		unchanged: false,
+		safeRaw,
+		safeLength,
+		added: extendsPrevious ? added : undefined,
+	};
+}
+
+/**
+ * Whether a link may be drawn as a clickable terminal hyperlink (OSC 8): a web or mail link, which only a browser or mail
+ * program opens.
+ */
+export function isWebLink(url: string): boolean {
+	return /^(?:https?|mailto):/i.test(url);
+}
+
+/** Longest URL drawn as a hyperlink: VTE ignores longer ones (2083 bytes). */
+const MAX_HYPERLINK_URL_LENGTH = 2048;
+
+/**
+ * What a link to `url` may be a hyperlink (OSC 8) to, when `url` is a `file:` URL of an absolute path on this computer
+ * (`file:///…`, `file://localhost/…`): the URL as parsed, with spaces and other characters percent-encoded. Such a link is
+ * drawn with its URL printed after its text, as Pi draws the paths tools read and write, so the hyperlink opens what a
+ * click on the printed URL opens. Undefined for anything else: a file on another computer (`file://server/share`, or
+ * `file:////server/share`, a share Windows would sign in to), a URL without `//` (`file:C:/x`), one with an encoded
+ * separator (`%2f`, `%5c`) or control character, one with control or format characters (which can make the printed URL
+ * read as another), or one too long for terminals to keep.
+ */
+export function localFileLinkTarget(url: string): string | undefined {
+	if (!/^file:\/\/(?:localhost)?\//i.test(url) || /[\p{Cc}\p{Cf}]/u.test(url) || !URL.canParse(url)) return undefined;
+	const parsed = new URL(url);
+	if (
+		parsed.protocol !== "file:" ||
+		parsed.hostname !== "" ||
+		parsed.pathname.startsWith("//") ||
+		/%(?:2f|5c|[01][0-9a-f]|7f|c2%[89][0-9a-f])/i.test(parsed.href) ||
+		parsed.href.length > MAX_HYPERLINK_URL_LENGTH
+	) {
+		return undefined;
+	}
+	return parsed.href;
+}
+
+function extractAnsiCodes(str: string): string {
+	let result = "";
+	let i = str.indexOf("\x1b");
+	while (i !== -1) {
+		const length = ansiCodeLength(str, i);
+		if (length > 0) {
+			result += str.substring(i, i + length);
+			i += length;
+		} else {
+			i++;
+		}
+		i = str.indexOf("\x1b", i);
+	}
+	return result;
+}
+
+// Same character set as String.prototype.trim()
+const WHITESPACE_REGEX = /\s/;
+
+/**
+ * Whether a token's visible text is only whitespace. Codes closing a styled word attach to the following space,
+ * e.g. "\x1b[22m ", so they are skipped. Stops at the first visible non-whitespace text without allocating a
+ * stripped copy, because styled words reach this check on every wrap.
+ */
+function isWhitespaceToken(token: string): boolean {
+	let i = 0;
+	while (i < token.length) {
+		const code = token.charCodeAt(i);
+		if (code === 0x1b) {
+			const length = ansiCodeLength(token, i);
+			if (length === 0) return false; // A lone ESC is visible text
+			i += length;
+		} else if (code === 0x20 || (code >= 0x09 && code <= 0x0d)) {
+			i++;
+		} else if (code < 0x80 || !WHITESPACE_REGEX.test(token[i]!)) {
+			return false;
+		} else {
+			i++;
+		}
+	}
+	return true;
+}
+
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]+/g;
+
+/** Replace each run of C0 and C1 control characters (ESC, BEL, newlines, ...) with one space. */
+export function replaceControlCharacters(str: string): string {
+	return str.replace(CONTROL_CHARACTERS, " ");
+}
+
 interface GraphemeCellRange {
 	start: number;
 	end: number;
@@ -343,7 +592,7 @@ export function getGraphemeCellRange(line: string, column: number): GraphemeCell
 		}
 		let textEnd = i;
 		while (textEnd < line.length && !extractAnsiCode(line, textEnd)) textEnd++;
-		for (const { segment } of graphemeSegmenter.segment(line.slice(i, textEnd))) {
+		for (const { segment } of getGraphemeSegmenter().segment(line.slice(i, textEnd))) {
 			const width = graphemeWidth(segment);
 			if (width > 0 && column >= currentCol && column < currentCol + width) {
 				return { start: currentCol, end: currentCol + width };
@@ -370,7 +619,7 @@ export function getOsc8LinkAtColumn(line: string, column: number): string | unde
 		}
 		let textEnd = i;
 		while (textEnd < line.length && !extractAnsiCode(line, textEnd)) textEnd++;
-		for (const { segment } of graphemeSegmenter.segment(line.slice(i, textEnd))) {
+		for (const { segment } of getGraphemeSegmenter().segment(line.slice(i, textEnd))) {
 			const width = segment === "\t" ? 3 : graphemeWidth(segment);
 			if (column >= currentCol && column < currentCol + width) return activeUrl;
 			currentCol += width;
@@ -764,7 +1013,7 @@ class AnsiCodeTracker {
 
 	/**
 	 * Get reset codes for attributes that need to be turned off at line end.
-	 * Underline must be closed to prevent bleeding into padding.
+	 * Underline and strikethrough must be closed to prevent bleeding into padding.
 	 * Active OSC 8 hyperlinks must be closed and re-opened on the next line.
 	 * Returns empty string if no attributes need closing.
 	 */
@@ -772,6 +1021,9 @@ class AnsiCodeTracker {
 		let result = "";
 		if (this.underline) {
 			result += "\x1b[24m"; // Underline off only
+		}
+		if (this.strikethrough) {
+			result += "\x1b[29m"; // Strikethrough off only, re-opened at line start via getActiveCodes()
 		}
 		if (this.activeHyperlink) {
 			result += formatOsc8Close(this.activeHyperlink.terminator); // Re-opened at line start via getActiveCodes()
@@ -802,15 +1054,17 @@ export function getActiveBackgroundAnsi(text: string): string {
 }
 
 function* graphemeSegments(text: string): Generator<string> {
-	for (const { segment } of graphemeSegmenter.segment(text)) yield segment;
+	for (const { segment } of getGraphemeSegmenter().segment(text)) yield segment;
 }
 
 /**
- * Split text into words while keeping ANSI codes attached.
+ * Split text into words while keeping ANSI codes attached. `widths`, if given, gets each token's visible width where it is
+ * known without measuring it again (printable ASCII and ANSI codes only: one column a character), and -1 elsewhere.
  */
-function splitIntoTokensWithAnsi(text: string): string[] {
+function splitIntoTokensWithAnsi(text: string, widths?: number[]): string[] {
 	const tokens: string[] = [];
 	let current = "";
+	let currentWidth = 0;
 	let pendingAnsi = ""; // ANSI codes waiting to be attached to next visible content
 	let currentKind: "space" | "word" | null = null;
 	let i = 0;
@@ -820,8 +1074,40 @@ function splitIntoTokensWithAnsi(text: string): string[] {
 			return;
 		}
 		tokens.push(current);
+		widths?.push(currentWidth);
 		current = "";
+		currentWidth = 0;
 		currentKind = null;
+	};
+
+	const addSegment = (segment: string, segmentIsSpace: boolean, segmentWidth: number): void => {
+		// Codes between a word and the space after it (usually the word's closing style) end that word.
+		// Attached to the space instead, they make it a non-whitespace token, so a line wrapped there
+		// started with the space. The codes stay in the same place in the output.
+		if (pendingAnsi && segmentIsSpace && currentKind !== "space") {
+			if (current) {
+				current += pendingAnsi;
+				pendingAnsi = "";
+			} else if (tokens.length > 0) {
+				tokens[tokens.length - 1] += pendingAnsi;
+				pendingAnsi = "";
+			}
+		}
+
+		const segmentKind = segmentIsSpace ? "space" : "word";
+		if (current && currentKind !== segmentKind) {
+			flushCurrent();
+		}
+
+		// Attach any pending ANSI codes to this visible character
+		if (pendingAnsi) {
+			current += pendingAnsi;
+			pendingAnsi = "";
+		}
+
+		currentKind = segmentKind;
+		current += segment;
+		currentWidth = currentWidth < 0 || segmentWidth < 0 ? -1 : currentWidth + segmentWidth;
 	};
 
 	while (i < text.length) {
@@ -842,30 +1128,34 @@ function splitIntoTokensWithAnsi(text: string): string[] {
 
 		const chunk = text.slice(i, end);
 		// Printable ASCII characters are single graphemes, so skip the segmenter for them.
-		const ascii = isPrintableAscii(chunk);
-		for (const segment of ascii ? chunk : graphemeSegments(chunk)) {
-			const segmentIsSpace = segment === " ";
-			if (!ascii && !segmentIsSpace && cjkBreakRegex.test(segment)) {
-				flushCurrent();
-				const token = pendingAnsi + segment;
-				pendingAnsi = "";
-				tokens.push(token);
-				continue;
+		if (isPrintableAscii(chunk)) {
+			// A run of spaces, or of other characters, goes where its characters would one by one: the first one decides,
+			// and the others only add to the same token.
+			let start = 0;
+			while (start < chunk.length) {
+				const isSpace = chunk.charCodeAt(start) === 0x20;
+				let runEnd = start + 1;
+				while (runEnd < chunk.length && (chunk.charCodeAt(runEnd) === 0x20) === isSpace) runEnd++;
+				addSegment(
+					start === 0 && runEnd === chunk.length ? chunk : chunk.slice(start, runEnd),
+					isSpace,
+					runEnd - start,
+				);
+				start = runEnd;
 			}
-
-			const segmentKind = segmentIsSpace ? "space" : "word";
-			if (current && currentKind !== segmentKind) {
-				flushCurrent();
+		} else {
+			for (const segment of graphemeSegments(chunk)) {
+				const segmentIsSpace = segment === " ";
+				if (!segmentIsSpace && cjkBreakRegex.test(segment)) {
+					flushCurrent();
+					const token = pendingAnsi + segment;
+					pendingAnsi = "";
+					tokens.push(token);
+					widths?.push(-1);
+					continue;
+				}
+				addSegment(segment, segmentIsSpace, -1);
 			}
-
-			// Attach any pending ANSI codes to this visible character
-			if (pendingAnsi) {
-				current += pendingAnsi;
-				pendingAnsi = "";
-			}
-
-			currentKind = segmentKind;
-			current += segment;
 		}
 
 		i = end;
@@ -884,9 +1174,39 @@ function splitIntoTokensWithAnsi(text: string): string[] {
 
 	if (current) {
 		tokens.push(current);
+		widths?.push(currentWidth);
 	}
 
 	return tokens;
+}
+
+/** For tests: the tokens wrapTextWithAnsi() wraps a line at, and the widths it knows of them. */
+export function splitIntoTokensWithAnsiForTest(text: string, widths?: number[]): string[] {
+	return splitIntoTokensWithAnsi(text, widths);
+}
+
+/**
+ * For tests: the tokens scanPrintableAscii() finds in a line of printable ASCII and escape sequences, each with its width
+ * and whether it is spaces and has escape sequences; undefined for any other line.
+ */
+export function scanPrintableAsciiForTest(
+	text: string,
+): { width: number; tokens: { text: string; width: number; spaces: boolean; codes: boolean }[] } | undefined {
+	const width = scanPrintableAscii(text);
+	if (width === -1) return undefined;
+	const tokens: { text: string; width: number; spaces: boolean; codes: boolean }[] = [];
+	let start = 0;
+	for (let index = 0; index < scannedCount; index++) {
+		const info = scannedInfo[index]!;
+		tokens.push({
+			text: text.slice(start, scannedEnds[index]),
+			width: info >> 2,
+			spaces: (info & 1) !== 0,
+			codes: (info & 2) !== 0,
+		});
+		start = scannedEnds[index]!;
+	}
+	return { width, tokens };
 }
 
 /**
@@ -905,6 +1225,27 @@ function splitIntoTokensWithAnsi(text: string): string[] {
  * whole, and a cached line kept as such a tree retains several times its own size. Converting a string to a number
  * reads it whole, so V8 flattens it in place; the strings' values do not change.
  */
+/** internLine()'s lines, by their text. */
+const internedLines = new Map<string, string>();
+/** Lines whose text before padding is at most this long are drawn alike often enough to be interned (internLine()). */
+export const INTERNED_LINE_LENGTH = 32;
+/** How many lines internLine() keeps before it starts again. */
+const INTERNED_LINES_KEPT = 1024;
+
+/**
+ * The line drawn for `line` that is kept for lines of the same text: for the short lines many components draw alike (a
+ * blank line of a width, a line of background only, a code fence), so that a long transcript keeps one copy of each instead
+ * of one per line (2,292 entries: about 12,000 such lines, 3 MB). Bounded: it starts again once it holds
+ * INTERNED_LINES_KEPT lines. The text is the same: only which string holds it differs.
+ */
+export function internLine(line: string): string {
+	const known = internedLines.get(line);
+	if (known !== undefined) return known;
+	if (internedLines.size >= INTERNED_LINES_KEPT) internedLines.clear();
+	internedLines.set(line, line);
+	return line;
+}
+
 export function flattenLines(lines: readonly string[]): void {
 	for (const line of lines) Number(line);
 }
@@ -914,24 +1255,183 @@ export function wrapTextWithAnsi(text: string, width: number): string[] {
 		return [""];
 	}
 
+	// One line (what Markdown and most components wrap): no ANSI state to carry over to a line after it.
+	if (text.indexOf("\n") === -1 && text.indexOf("\r") === -1) {
+		return wrapSingleLine(text, width);
+	}
+
 	// Handle newlines by processing each line separately
 	// Track ANSI state across lines so styles carry over after literal newlines
 	const inputLines = text.split(/\r\n|\r|\n/);
 	const result: string[] = [];
 	const tracker = new AnsiCodeTracker();
 
-	for (const inputLine of inputLines) {
+	for (let index = 0; index < inputLines.length; index++) {
+		const inputLine = inputLines[index]!;
 		// Prepend active ANSI codes from previous lines (except for first line)
 		const prefix = result.length > 0 ? tracker.getActiveCodes() : "";
 		const wrappedLines = wrapSingleLine(prefix + inputLine, width);
 		for (const wrappedLine of wrappedLines) {
 			result.push(wrappedLine);
 		}
-		// Update tracker with codes from this line for next iteration
-		updateTrackerFromText(inputLine, tracker);
+		// Update tracker with codes from this line for the next one (the last line has none after it)
+		if (index < inputLines.length - 1) updateTrackerFromText(inputLine, tracker);
 	}
 
 	return result.length > 0 ? result : [""];
+}
+
+/**
+ * The tokens of the line scanPrintableAscii() read last: where each ends, and its width with what it holds (bit 0: it is
+ * spaces, bit 1: it has escape sequences). Kept from line to line; only wrapSingleLine() reads them, before scanning again.
+ */
+let scannedEnds = new Int32Array(64);
+let scannedInfo = new Int32Array(64);
+let scannedCount = 0;
+
+function addScannedToken(end: number, width: number, spaces: boolean, codes: boolean): void {
+	if (scannedCount === scannedEnds.length) {
+		const ends = new Int32Array(scannedCount * 2);
+		ends.set(scannedEnds);
+		scannedEnds = ends;
+		const info = new Int32Array(scannedCount * 2);
+		info.set(scannedInfo);
+		scannedInfo = info;
+	}
+	scannedEnds[scannedCount] = end;
+	scannedInfo[scannedCount] = (width << 2) | (codes ? 2 : 0) | (spaces ? 1 : 0);
+	scannedCount++;
+}
+
+/**
+ * The visible width of a line of printable ASCII and escape sequences, with its tokens (those splitIntoTokensWithAnsi()
+ * gives it) left in scannedEnds and scannedInfo; -1 for any other line. Each token is a piece of the line, cut where a run
+ * of spaces meets a run of other characters: codes between a word and the space after it end the word, codes between a
+ * space and the word after it start the word, and codes between two runs of the same kind stay inside the token. One
+ * pass measures the line and finds its tokens, where wrapping it took a pass to measure, one to split the line into
+ * strings built a run at a time, and an array entry for each token.
+ */
+function scanPrintableAscii(text: string): number {
+	scannedCount = 0;
+	let total = 0;
+	let tokenStart = 0;
+	let tokenWidth = 0;
+	let tokenCodes = false;
+	// The kind of the token being read: 0 before any visible character, 1 spaces, 2 other characters.
+	let kind = 0;
+	let i = 0;
+	while (i < text.length) {
+		const code = text.charCodeAt(i);
+		if (code === 0x1b) {
+			const codesStart = i;
+			do {
+				const length = ansiCodeLength(text, i);
+				if (length === 0) return -1;
+				i += length;
+			} while (i < text.length && text.charCodeAt(i) === 0x1b);
+			if (i < text.length) {
+				const nextKind = text.charCodeAt(i) === 0x20 ? 1 : 2;
+				if (kind !== 0 && kind !== nextKind) {
+					if (kind === 2) {
+						// Codes between a word and the space after it end the word.
+						addScannedToken(i, tokenWidth, false, true);
+						tokenStart = i;
+						tokenCodes = false;
+					} else {
+						// Codes between a space and the word after it start the word.
+						addScannedToken(codesStart, tokenWidth, true, tokenCodes);
+						tokenStart = codesStart;
+						tokenCodes = true;
+					}
+					tokenWidth = 0;
+					kind = nextKind;
+					continue;
+				}
+			}
+			tokenCodes = true;
+			continue;
+		}
+		if (code < 0x20 || code > 0x7e) return -1;
+		const charKind = code === 0x20 ? 1 : 2;
+		if (kind !== charKind) {
+			if (kind !== 0) {
+				addScannedToken(i, tokenWidth, kind === 1, tokenCodes);
+				tokenStart = i;
+				tokenWidth = 0;
+				tokenCodes = false;
+			}
+			kind = charKind;
+		}
+		tokenWidth++;
+		total++;
+		i++;
+	}
+	if (tokenStart < text.length) addScannedToken(text.length, tokenWidth, kind !== 2, tokenCodes);
+	return total;
+}
+
+/**
+ * wrapSingleLine() of a line scanPrintableAscii() has just read, from its tokens: the same lines, without the passes
+ * over code-free tokens that only look for codes. Undefined when a token is wider than the line, which the general path
+ * breaks up.
+ */
+function wrapScannedLine(line: string, width: number): string[] | undefined {
+	const wrapped: string[] = [];
+	const tracker = new AnsiCodeTracker();
+	// (A tracker that has seen no codes has none to give.)
+	let tracked = false;
+	let currentLine = "";
+	let currentVisibleLength = 0;
+	let start = 0;
+	for (let index = 0; index < scannedCount; index++) {
+		const end = scannedEnds[index]!;
+		const info = scannedInfo[index]!;
+		const token = line.slice(start, end);
+		start = end;
+		const tokenVisibleLength = info >> 2;
+		const isWhitespace = (info & 1) !== 0;
+		const hasCodes = (info & 2) !== 0;
+		if (tokenVisibleLength > width && !isWhitespace) return undefined;
+
+		const totalNeeded = currentVisibleLength + tokenVisibleLength;
+		if (totalNeeded > width && currentVisibleLength > 0) {
+			let lineToWrap = currentLine.trimEnd();
+			if (isWhitespace && hasCodes) {
+				lineToWrap += extractAnsiCodes(token);
+				updateTrackerFromText(token, tracker);
+				tracked = true;
+			}
+			if (tracked) {
+				const lineEndReset = tracker.getLineEndReset();
+				if (lineEndReset) {
+					lineToWrap += lineEndReset;
+				}
+			}
+			wrapped.push(lineToWrap);
+			if (isWhitespace) {
+				currentLine = tracked ? tracker.getActiveCodes() : "";
+				currentVisibleLength = 0;
+				continue;
+			}
+			currentLine = tracked ? tracker.getActiveCodes() + token : token;
+			currentVisibleLength = tokenVisibleLength;
+		} else if (isWhitespace && totalNeeded > width && hasCodes) {
+			currentLine += extractAnsiCodes(token);
+		} else {
+			currentLine += token;
+			currentVisibleLength += tokenVisibleLength;
+		}
+
+		if (hasCodes) {
+			updateTrackerFromText(token, tracker);
+			tracked = true;
+		}
+	}
+
+	if (currentLine) {
+		wrapped.push(currentLine);
+	}
+	return wrapped.length > 0 ? wrapped.map((wrappedLine) => wrappedLine.trimEnd()) : [""];
 }
 
 function wrapSingleLine(line: string, width: number): string[] {
@@ -939,25 +1439,39 @@ function wrapSingleLine(line: string, width: number): string[] {
 		return [""];
 	}
 
-	const visibleLength = visibleWidth(line);
+	const scannedWidth = scanPrintableAscii(line);
+	if (scannedWidth !== -1) {
+		if (scannedWidth <= width) {
+			return [line];
+		}
+		const scannedLines = wrapScannedLine(line, width);
+		if (scannedLines) return scannedLines;
+	}
+
+	const visibleLength = scannedWidth !== -1 ? scannedWidth : visibleWidth(line);
 	if (visibleLength <= width) {
 		return [line];
 	}
 
 	const wrapped: string[] = [];
 	const tracker = new AnsiCodeTracker();
-	const tokens = splitIntoTokensWithAnsi(line);
+	const widths: number[] = [];
+	const tokens = splitIntoTokensWithAnsi(line, widths);
 
 	let currentLine = "";
 	let currentVisibleLength = 0;
 
-	for (const token of tokens) {
-		const tokenVisibleLength = visibleWidth(token);
-		const isWhitespace = token.trim() === "";
+	for (let index = 0; index < tokens.length; index++) {
+		const token = tokens[index]!;
+		const knownWidth = widths[index]!;
+		const tokenVisibleLength = knownWidth >= 0 ? knownWidth : visibleWidth(token);
+		const isWhitespace = isWhitespaceToken(token);
 
 		// Token itself is too long - break it character by character
 		if (tokenVisibleLength > width && !isWhitespace) {
 			if (currentLine) {
+				// Trim before adding the reset, which would otherwise block the final trimEnd()
+				currentLine = currentLine.trimEnd();
 				// Add specific reset for underline only (preserves background)
 				const lineEndReset = tracker.getLineEndReset();
 				if (lineEndReset) {
@@ -984,6 +1498,12 @@ function wrapSingleLine(line: string, width: number): string[] {
 		if (totalNeeded > width && currentVisibleLength > 0) {
 			// Trim trailing whitespace, then add underline reset (not full reset, to preserve background)
 			let lineToWrap = currentLine.trimEnd();
+			if (isWhitespace) {
+				// The dropped space may carry codes (e.g. closing a styled word). Keep them on the wrapped line so
+				// the style ends there and is not re-opened on the next line.
+				lineToWrap += extractAnsiCodes(token);
+				updateTrackerFromText(token, tracker);
+			}
 			const lineEndReset = tracker.getLineEndReset();
 			if (lineEndReset) {
 				lineToWrap += lineEndReset;
@@ -993,10 +1513,14 @@ function wrapSingleLine(line: string, width: number): string[] {
 				// Don't start new line with whitespace
 				currentLine = tracker.getActiveCodes();
 				currentVisibleLength = 0;
-			} else {
-				currentLine = tracker.getActiveCodes() + token;
-				currentVisibleLength = tokenVisibleLength;
+				continue;
 			}
+			currentLine = tracker.getActiveCodes() + token;
+			currentVisibleLength = tokenVisibleLength;
+		} else if (isWhitespace && totalNeeded > width && token.includes("\x1b")) {
+			// Whitespace wider than an empty line. Plain spaces are removed by the final trimEnd(), but codes after
+			// them (e.g. a trailing reset) would block that and leave the line wider than width. Keep only the codes.
+			currentLine += extractAnsiCodes(token);
 		} else {
 			// Add to current line
 			currentLine += token;
@@ -1056,7 +1580,7 @@ function breakLongWord(word: string, width: number, tracker: AnsiCodeTracker): s
 			}
 			// Segment this non-ANSI portion into graphemes
 			const textPortion = word.slice(i, end);
-			for (const seg of graphemeSegmenter.segment(textPortion)) {
+			for (const seg of getGraphemeSegmenter().segment(textPortion)) {
 				segments.push({ type: "grapheme", value: seg.segment });
 			}
 			i = end;
@@ -1116,7 +1640,55 @@ export function applyBackgroundToLine(line: string, width: number, bgFn: (text: 
 
 	// Apply background to content + padding
 	const withPadding = line + padding;
-	return bgFn(withPadding);
+	return applyBackgroundAround(withPadding, bgFn);
+}
+
+const SGR_SEQUENCE = /\x1b\[([0-9;:]*)m/g;
+
+/** Whether an SGR sequence with these parameters sets or resets the background (a full reset does). */
+function setsBackground(params: string): boolean {
+	const codes = params.split(/[;:]/);
+	for (let i = 0; i < codes.length; i++) {
+		const code = Number(codes[i] || 0);
+		if (code === 0 || (code >= 40 && code <= 49) || (code >= 100 && code <= 107)) return true;
+		// (The color of an extended foreground or underline color is not a code: 38;5;N, 38;2;R;G;B.)
+		if (code === 38 || code === 58) i += codes[i + 1] === "5" ? 2 : 4;
+	}
+	return false;
+}
+
+/**
+ * bgFn(line), with the background opened again where a part of `line` on a background of its own (a shaded code block
+ * line) ends with a background reset (SGR 49), so the rest of the line keeps this background instead of showing the
+ * terminal's. A reset that starts such a part (a code block on the terminal's own background) is kept.
+ */
+export function applyBackgroundAround(line: string, bgFn: (text: string) => string): string {
+	const styled = bgFn(line);
+	if (!line.includes("\x1b[49m")) {
+		return styled;
+	}
+	const start = styled.indexOf(line);
+	const open = start > 0 ? getActiveBackgroundAnsi(styled.slice(0, start)) : "";
+	if (!open) {
+		return styled;
+	}
+	// Whether the background in effect is this one; a reset while another is in effect ends that one.
+	let ours = true;
+	const reopened = line.replace(SGR_SEQUENCE, (sequence: string, params: string) => {
+		if (params === "49") {
+			if (ours) {
+				ours = false;
+				return sequence;
+			}
+			ours = true;
+			return open;
+		}
+		if (setsBackground(params)) {
+			ours = false;
+		}
+		return sequence;
+	});
+	return styled.slice(0, start) + reopened + styled.slice(start + line.length);
 }
 
 /**
@@ -1184,7 +1756,7 @@ export function truncateToWidth(
 	const hasTabs = text.includes("\t");
 
 	if (!hasAnsi && !hasTabs) {
-		for (const { segment } of graphemeSegmenter.segment(text)) {
+		for (const { segment } of getGraphemeSegmenter().segment(text)) {
 			const width = graphemeWidth(segment);
 			if (keepContiguousPrefix && keptWidth + width <= targetWidth) {
 				result += segment;
@@ -1239,7 +1811,7 @@ export function truncateToWidth(
 				end++;
 			}
 
-			for (const { segment } of graphemeSegmenter.segment(text.slice(i, end))) {
+			for (const { segment } of getGraphemeSegmenter().segment(text.slice(i, end))) {
 				const width = graphemeWidth(segment);
 				if (keepContiguousPrefix && keptWidth + width <= targetWidth) {
 					if (pendingAnsi) {
@@ -1300,11 +1872,13 @@ export function sliceWithWidth(
 	while (i < line.length) {
 		const ansi = extractAnsiCode(line, i);
 		if (ansi) {
+			// APC sequences (cursor markers) are positional one-shot commands, not persistent style
+			// state, so codes before the range carry over only when they are not APC.
 			if (currentCol >= startCol && currentCol < endCol) {
 				// Keep original order: codes from before the range must precede codes at the boundary
 				result += pendingAnsi + ansi.code;
 				pendingAnsi = "";
-			} else if (currentCol < startCol) pendingAnsi += ansi.code;
+			} else if (currentCol < startCol && !ansi.code.startsWith("\x1b_")) pendingAnsi += ansi.code;
 			i += ansi.length;
 			continue;
 		}
@@ -1312,7 +1886,7 @@ export function sliceWithWidth(
 		let textEnd = i;
 		while (textEnd < line.length && !extractAnsiCode(line, textEnd)) textEnd++;
 
-		for (const { segment } of graphemeSegmenter.segment(line.slice(i, textEnd))) {
+		for (const { segment } of getGraphemeSegmenter().segment(line.slice(i, textEnd))) {
 			const w = graphemeWidth(segment);
 			const inRange = currentCol >= startCol && currentCol < endCol;
 			const fits = !strict || currentCol + w <= endCol;
@@ -1385,7 +1959,7 @@ export function extractSegments(
 		let textEnd = i;
 		while (textEnd < line.length && !extractAnsiCode(line, textEnd)) textEnd++;
 
-		for (const { segment } of graphemeSegmenter.segment(line.slice(i, textEnd))) {
+		for (const { segment } of getGraphemeSegmenter().segment(line.slice(i, textEnd))) {
 			const w = graphemeWidth(segment);
 
 			if (currentCol < beforeEnd && currentCol + w <= beforeEnd) {

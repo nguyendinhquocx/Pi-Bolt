@@ -1,8 +1,8 @@
-import { ModelThinkingLevelSchema } from "@earendil-works/pi-ai/providers/model-schema";
 import { type Static, type TSchemaOptions, Type } from "typebox";
+import { ModelThinkingLevelSchema } from "./pi-ai-schemas.ts";
 import { SETTINGS_DEFAULTS } from "./settings-defaults.ts";
 
-function nonNegativeSafeInteger(options: { default?: number } = {}) {
+function nonNegativeSafeInteger(options: TSchemaOptions = {}) {
 	return Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER, ...options });
 }
 
@@ -10,15 +10,68 @@ function timeoutSetting(options?: TSchemaOptions) {
 	return Type.Union([Type.Number({ minimum: 0 }), Type.Literal("disabled")], options);
 }
 
+function compactionThresholdPercent(options: TSchemaOptions = {}) {
+	return Type.Integer({ minimum: 1, maximum: 100, ...options });
+}
+
+function summaryMaxTokens(options: TSchemaOptions = {}) {
+	return Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER, ...options });
+}
+
+/** How remote control reaches a phone away from the local network: a Cloudflare tunnel, or none. */
+function remoteControlTunnel(options: TSchemaOptions = {}) {
+	return Type.Union(
+		[
+			Type.Literal("quick"),
+			Type.Literal("off"),
+			Type.Object(
+				{
+					name: Type.String({ description: "Named Cloudflare tunnel (cloudflared tunnel create)." }),
+					hostname: Type.String({ description: "Public hostname routed to the tunnel." }),
+				},
+				{ additionalProperties: false },
+			),
+		],
+		options,
+	);
+}
+
 const CompactionModelOverrideSchema = Type.Object({
 	reserveTokens: Type.Optional(nonNegativeSafeInteger()),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger()),
+	thresholdPercent: Type.Optional(compactionThresholdPercent()),
+	summaryMaxTokens: Type.Optional(summaryMaxTokens()),
 });
 
 const CompactionSettingsSchema = Type.Object({
 	enabled: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.compaction.enabled })),
-	reserveTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.reserveTokens })),
-	keepRecentTokens: Type.Optional(nonNegativeSafeInteger({ default: SETTINGS_DEFAULTS.compaction.keepRecentTokens })),
+	reserveTokens: Type.Optional(
+		nonNegativeSafeInteger({
+			description:
+				"Tokens reserved for the model response: compaction triggers above contextWindow - reserveTokens. Setting it turns off the thresholdPercent default and the context-window share of the summary cap.",
+			default: SETTINGS_DEFAULTS.compaction.reserveTokens,
+		}),
+	),
+	keepRecentTokens: Type.Optional(
+		nonNegativeSafeInteger({
+			description:
+				"Recent tokens kept without summarization. Unset: the larger of 20000 and 5% of the context window.",
+			default: SETTINGS_DEFAULTS.compaction.keepRecentTokens,
+		}),
+	),
+	thresholdPercent: Type.Optional(
+		compactionThresholdPercent({
+			description:
+				"Also compact above this percentage of the context window when that is below contextWindow - reserveTokens. The default applies only while reserveTokens is unset.",
+			default: SETTINGS_DEFAULTS.compaction.thresholdPercent,
+		}),
+	),
+	summaryMaxTokens: Type.Optional(
+		summaryMaxTokens({
+			description:
+				"Output cap of a compaction summary; a split turn's prefix summary gets half. Unset: the largest of 80% of reserveTokens, 4096 and (while reserveTokens is unset) 3.2% of the context window, capped by the model's output limit.",
+		}),
+	),
 	modelOverrides: Type.Optional(
 		Type.Record(Type.String(), CompactionModelOverrideSchema, {
 			description: 'Per-model overrides keyed by exact "provider/modelId" strings.',
@@ -207,6 +260,11 @@ export const SettingsSchema = Type.Object(
 	{
 		$schema: Type.Optional(Type.String({ description: "JSON Schema reference." })),
 		lastChangelogVersion: Type.Optional(Type.String()),
+		extensionChangelogVersions: Type.Optional(
+			Type.Record(Type.String(), Type.String(), {
+				description: "Last seen changelog version per extension package.",
+			}),
+		),
 		defaultProvider: Type.Optional(Type.String()),
 		defaultModel: Type.Optional(Type.String()),
 		defaultThinkingLevel: Type.Optional(ModelThinkingLevelSchema),
@@ -219,6 +277,61 @@ export const SettingsSchema = Type.Object(
 			Type.Union(
 				[Type.Literal("auto"), Type.Literal("sse"), Type.Literal("websocket"), Type.Literal("websocket-cached")],
 				{ default: SETTINGS_DEFAULTS.transport },
+			),
+		),
+		sessionShareDestination: Type.Optional(
+			Type.Union([Type.Literal("auto"), Type.Literal("gist"), Type.Literal("radius")], {
+				description:
+					'Destination used by /share. "auto" uses Radius when authenticated and otherwise creates a GitHub gist.',
+				default: SETTINGS_DEFAULTS.sessionShareDestination,
+			}),
+		),
+		remoteControl: Type.Optional(
+			Type.Object(
+				{
+					enabled: Type.Optional(
+						Type.Boolean({
+							description:
+								"Turn on /remote-control and the background service (pi-bolt service). Default false. Read from the global settings only: a project's settings cannot turn it on.",
+						}),
+					),
+					port: Type.Optional(
+						Type.Integer({
+							minimum: 0,
+							maximum: 65535,
+							description:
+								"Port of the /remote-control listener. 0 picks a free port each time; a fixed port lets paired phones reconnect on the LAN without a new QR code.",
+						}),
+					),
+					tunnel: Type.Optional(remoteControlTunnel()),
+					cloudflared: Type.Optional(Type.String({ description: "Path to the cloudflared executable." })),
+					askCloudflared: Type.Optional(
+						Type.Boolean({
+							description:
+								'Offer to install cloudflared when /remote-control finds none (false after "Don\'t ask again").',
+						}),
+					),
+					readSecretFiles: Type.Optional(
+						Type.Boolean({
+							description:
+								"Let paired phones read files that look like secrets (.env*, keys, .git/, ...) when reviewing the session's folder. Default false.",
+						}),
+					),
+					service: Type.Optional(
+						Type.Object(
+							{
+								tunnel: Type.Optional(
+									remoteControlTunnel({
+										description:
+											'Tunnel of the background service (pi-bolt service install). Default: the remoteControl.tunnel setting; "off" serves the local network and Tailscale only.',
+									}),
+								),
+							},
+							{ additionalProperties: false, description: "The background service (pi-bolt service)." },
+						),
+					),
+				},
+				{ additionalProperties: false, description: "Settings of /remote-control (Pi-Bolt Android app)." },
 			),
 		),
 		steeringMode: Type.Optional(
@@ -240,6 +353,12 @@ export const SettingsSchema = Type.Object(
 			Type.Boolean({
 				description: "Show cache cost and provider recovery notices.",
 				default: SETTINGS_DEFAULTS.showCacheMissNotices,
+			}),
+		),
+		shadedCodeBlocks: Type.Optional(
+			Type.Boolean({
+				description: "Render code blocks on a background instead of between literal ``` fence lines.",
+				default: SETTINGS_DEFAULTS.shadedCodeBlocks,
 			}),
 		),
 		externalEditor: Type.Optional(
@@ -269,6 +388,13 @@ export const SettingsSchema = Type.Object(
 			Type.Array(Type.String(), {
 				description:
 					'Command used for npm package lookup and installation, in argv form such as ["mise", "exec", "node@20", "--", "npm"].',
+			}),
+		),
+		selfUpdateCommand: Type.Optional(
+			Type.Array(Type.String(), {
+				minItems: 1,
+				description:
+					'Command `pi update` runs to update Pi itself, in argv form such as ["mise", "use", "-g", "npm:{packageName}@{version}"]. Placeholders: {packageName}, {version}, {installSpec}. PI_SELF_UPDATE_COMMAND takes precedence. Global setting only.',
 			}),
 		),
 		collapseChangelog: Type.Optional(
@@ -303,7 +429,19 @@ export const SettingsSchema = Type.Object(
 					packages: Type.Optional(
 						Type.Array(PackageSourceSchema, {
 							description:
-								"Pi-Bolt's own package sources, loaded by Pi-Bolt in place of packages; Pi keeps using packages.",
+								"Pi-Bolt package additions and same-identity replacements over this file's shared packages. Use -<source> strings to exclude inherited packages. An empty list inherits shared packages.",
+						}),
+					),
+					packagesOverlay: Type.Optional(
+						Type.Boolean({
+							description:
+								"Set by Pi-Bolt when it writes packages. A list without it and without -<source> entries is taken for an independent copy written before Pi-Bolt 0.9.1 and converted to an overlay once.",
+						}),
+					),
+					autoUpdate: Type.Optional(
+						Type.Boolean({
+							description:
+								"Install new Pi-Bolt releases in the background when an interactive session starts, at most once a day: the installer's installations only. Default false. Read from the global settings only: a project's settings cannot turn it on. PIBOLT_NO_AUTO_UPDATE=1 turns it off.",
 						}),
 					),
 				},
@@ -477,6 +615,8 @@ export interface CodemodeSettings extends Static<typeof CodemodeSettingsSchema> 
 export type DefaultProjectTrust = NonNullable<SettingsInput["defaultProjectTrust"]>;
 export type QuietStartup = NonNullable<SettingsInput["quietStartup"]>;
 export type TransportSetting = NonNullable<SettingsInput["transport"]>;
+export type SessionShareDestination = NonNullable<SettingsInput["sessionShareDestination"]>;
+export type RemoteControlSettings = NonNullable<SettingsInput["remoteControl"]>;
 export type PackageSource = Static<typeof PackageSourceSchema>;
 export type FullscreenExitOutput = NonNullable<SettingsInput["fullscreenExitOutput"]>;
 export type TuiMode = NonNullable<SettingsInput["tuiMode"]>;

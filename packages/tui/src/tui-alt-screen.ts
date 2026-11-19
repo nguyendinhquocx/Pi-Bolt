@@ -6,7 +6,7 @@ import {
 } from "./alt-screen-search.ts";
 import { AltScreenFlashContainer } from "./components/alt-screen-flash.ts";
 import { ScrollView } from "./components/scroll-view.ts";
-import { getKeybindings } from "./keybindings.ts";
+import { getKeybindings, type Keybinding } from "./keybindings.ts";
 import { isKeyRelease } from "./keys.ts";
 import {
 	getLayoutBoxesAt,
@@ -84,6 +84,23 @@ interface MovedRows {
 const OSC133_ZONE_PREFIX = /^(?:\x1b\]133;[ABC](?:\x07|\x1b\\))+/;
 const OSC133_PROMPT_START = /^\x1b\]133;A(?:\x07|\x1b\\)/;
 const PAGE_SCROLL_OVERLAP = 4;
+/** The keys that act on the viewport: what they do reads the document's lines or its height. */
+const VIEWPORT_KEYS: readonly Keybinding[] = [
+	"tui.altScreen.search",
+	"tui.altScreen.searchNext",
+	"tui.altScreen.searchPrevious",
+	"tui.altScreen.searchClose",
+	"tui.altScreen.pageUp",
+	"tui.altScreen.pageDown",
+	"tui.altScreen.halfPageUp",
+	"tui.altScreen.halfPageDown",
+	"tui.altScreen.lineUp",
+	"tui.altScreen.lineDown",
+	"tui.altScreen.previousPrompt",
+	"tui.altScreen.nextPrompt",
+	"tui.altScreen.top",
+	"tui.altScreen.bottom",
+];
 const ALT_WHEEL_SCROLL_MULTIPLIER = 5;
 const MAX_CACHED_OFFSCREEN_KITTY_IMAGES = 16;
 const MAX_CACHED_OFFSCREEN_KITTY_TRANSMISSION_BYTES = 32 * 1024 * 1024;
@@ -91,9 +108,9 @@ const MAX_CACHED_OFFSCREEN_KITTY_DECODED_BYTES = 64 * 1024 * 1024;
 const DOUBLE_CLICK_INTERVAL_MS = 500;
 const COPY_ERROR_FLASH_DURATION_MS = 5000;
 // Regular mode delegates double-click selection to the terminal emulator. Fullscreen owns mouse selection,
-// so mirror common terminal word-selection behavior by keeping paths and kebab-case tokens whole.
-const TERMINAL_WORD_SELECTION_JOINERS = new Set(["/", "-"]);
-const wordSegmenter = getWordSegmenter();
+// so it uses iTerm2's default "characters considered part of a word" set:
+// https://github.com/gnachman/iTerm2/blob/7f4ff739721f95d0b93003d8701c4523a7edf261/sources/Settings/iTermPreferences.m#L743
+const TERMINAL_WORD_SELECTION_JOINERS = new Set(["/", "-", "+", "\\", "~", "_", "."]);
 
 interface CachedKittyImage {
 	transmissionGeneration: number;
@@ -220,6 +237,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	private finishedRows = new Map<string, string>();
 	private finishedRowsWidth = 0;
 	private imageRows = new Set<string>();
+	// The rows of the frame before as the layout drew them, by what they became without the prompt markers and with the fake
+	// cursors resolved, and whether the hardware cursor was shown.
+	private resolvedRows = new Map<string, string>();
+	private resolvedRowsCursor = false;
 	private layoutRoot: Component | undefined;
 	private currentLayout: LayoutFrame | undefined;
 	private readonly implicitDocument: Component;
@@ -265,6 +286,13 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	private readonly onRightClickPaste?: () => void;
 	private copyOnSelect: boolean;
 	private readonly copySelection?: (text: string) => Promise<boolean | string>;
+	/**
+	 * Called before the document is read in whole: before render(), and before a key or mouse event acts on the viewport
+	 * (scrolling, search, prompt jumps, selection, the scrollbar). True when the document changed since it was last laid
+	 * out: a frame is drawn first, so that the event acts on the document as it is. For a document that draws its end
+	 * before the rest of it (a resumed transcript).
+	 */
+	beforeDocumentRead: (() => boolean) | undefined;
 
 	constructor(
 		terminal: Terminal,
@@ -347,6 +375,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	}
 
 	override render(width: number): string[] {
+		this.beforeDocumentRead?.();
 		return this.layoutRoot?.render(width) ?? super.render(width);
 	}
 
@@ -440,6 +469,17 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			setCapabilities(this.savedCapabilities);
 			this.savedCapabilities = undefined;
 		}
+	}
+
+	protected override getExitRestorePrefix(): string {
+		const prefix = super.getExitRestorePrefix();
+		if (!this.altScreenActive) return prefix;
+		return `${END_SYNCHRONIZED_OUTPUT}${this.mouseEnabled ? DISABLE_MOUSE : ""}${ENABLE_AUTOWRAP}${prefix}`;
+	}
+
+	protected override getExitRestoreSuffix(): string {
+		// Kitty keyboard flags are per screen, so the terminal pops them before the alternate screen is left.
+		return `${super.getExitRestoreSuffix()}${this.altScreenActive ? `${EXIT_ALT_SCREEN}\x1b[?25h` : ""}`;
 	}
 
 	private deleteKittyImages(): string {
@@ -683,7 +723,9 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.flashes.flash(message, durationMs);
 	}
 
-	private shouldDeferViewportInputToOverlay(): boolean {
+	/** Focused overlays and components that capture viewport input receive viewport keys instead of the transcript. */
+	private shouldDeferViewportInput(): boolean {
+		if (this.getFocusedComponent()?.capturesViewportInput) return true;
 		return this.isOverlayFocused() && this.activeSearch?.overlay?.isFocused() !== true;
 	}
 
@@ -718,6 +760,9 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			return { consume: true };
 		}
 		if (data === FOCUS_IN) return { consume: true };
+		if (this.beforeDocumentRead !== undefined && this.isViewportInput(data) && this.beforeDocumentRead()) {
+			this.renderNow();
+		}
 
 		const wheelEvent = this.parseWheelEvent(data);
 		if (wheelEvent) {
@@ -762,7 +807,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 				return { consume: true };
 			}
 		}
-		if (this.shouldDeferViewportInputToOverlay()) return undefined;
+		if (this.shouldDeferViewportInput()) return undefined;
 		if (keybindings.matches(data, "tui.altScreen.pageUp")) {
 			if (!isRelease) {
 				this.scrollBy(-Math.max(1, this.getPrimaryScrollView().viewportHeight - PAGE_SCROLL_OVERLAP));
@@ -1194,7 +1239,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		const line = stripTerminalSequences(this.getSelectionSourceLine(point));
 		const segments: Array<{ start: number; end: number; selectable: boolean; joiner: boolean }> = [];
 		let start = 0;
-		for (const segment of wordSegmenter.segment(line)) {
+		for (const segment of getWordSegmenter().segment(line)) {
 			const end = start + visibleWidth(segment.segment);
 			const joiner = TERMINAL_WORD_SELECTION_JOINERS.has(segment.segment);
 			segments.push({ start, end, selectable: segment.isWordLike === true || joiner, joiner });
@@ -1655,6 +1700,13 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return /^\x1b\[<\d+;\d+;\d+[Mm]$/.test(data) || (data.length === 6 && data.startsWith("\x1b[M"));
 	}
 
+	/** Whether `data` may act on the viewport: any mouse event, or a viewport key (VIEWPORT_KEYS). */
+	private isViewportInput(data: string): boolean {
+		if (this.isMouseSequence(data)) return true;
+		const keybindings = getKeybindings();
+		return VIEWPORT_KEYS.some((key) => keybindings.matches(data, key));
+	}
+
 	private compositeScrollToEndIndicator(screen: string[], layout: LayoutFrame, width: number): string[] {
 		this.scrollToEndIndicatorRect = undefined;
 		const scrollView = layout.primaryScrollView ?? this.implicitScrollView;
@@ -1698,9 +1750,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	 * its viewport changes, though all but a few only move. Scrolling those rows in the terminal and drawing what differs
 	 * afterwards writes a fraction of what drawing every row does: less for the terminal to parse, and for a multiplexer
 	 * (tmux, zmx) or an ssh connection between Pi and the screen to carry and draw again. Returns undefined when it would
-	 * not save rows. PI_TUI_SCROLL_ROWS=0 turns it off.
+	 * not save rows. PI_TUI_SCROLL_ROWS=0 turns it off. `images`: whether either frame has a row that isImageLine() (rows with
+	 * images are drawn row by row); when neither has one, no row is looked at for one.
 	 */
-	private findMovedRows(screen: readonly string[], height: number): MovedRows | undefined {
+	private findMovedRows(screen: readonly string[], height: number, images: boolean): MovedRows | undefined {
 		const previous = this.previousScreen;
 		let top = 0;
 		while (top < height && screen[top] === previous[top]) top++;
@@ -1714,7 +1767,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			if (line === previous[row]) continue;
 			changed++;
 			// Images are placed and deleted by their own sequences: frames with one are drawn row by row.
-			if (isImageLine(line) || isImageLine(previous[row] ?? "")) return undefined;
+			if (images && (isImageLine(line) || isImageLine(previous[row] ?? ""))) return undefined;
 		}
 		if (changed <= MIN_ROWS_SAVED_BY_SCROLLING) return undefined;
 
@@ -1738,8 +1791,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			}
 		}
 		if (changed - (span - best) < MIN_ROWS_SAVED_BY_SCROLLING) return undefined;
-		for (let row = top; row <= bottom; row++) {
-			if (isImageLine(previous[row] ?? "")) return undefined;
+		if (images) {
+			for (let row = top; row <= bottom; row++) {
+				if (isImageLine(previous[row] ?? "")) return undefined;
+			}
 		}
 		return { top, bottom, up };
 	}
@@ -1753,10 +1808,23 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		if (this.refreshSearch(nextLayout)) {
 			nextLayout = renderLayoutFrame(root, width, height, () => this.requestRender());
 		}
-		// Resolve fake cursors before highlighting and compositing, which only track SGR codes
-		let screen = this.resolveFakeCursors(
-			nextLayout.lines.map((line) => (line.startsWith("\x1b]133;") ? line.replace(OSC133_ZONE_PREFIX, "") : line)),
-		);
+		// Resolve fake cursors before highlighting and compositing, which only track SGR codes. A row that is a row of the frame
+		// before (most of the screen, while a reply streams in) is resolved as that one was, and is that same string.
+		const showHardwareCursor = this.getShowHardwareCursor();
+		const knownResolved = this.resolvedRowsCursor === showHardwareCursor ? this.resolvedRows : undefined;
+		const resolvedRows = new Map<string, string>();
+		const single = [""];
+		let screen = nextLayout.lines.map((line) => {
+			let resolved = knownResolved?.get(line);
+			if (resolved === undefined) {
+				single[0] = line.startsWith("\x1b]133;") ? line.replace(OSC133_ZONE_PREFIX, "") : line;
+				resolved = this.resolveFakeCursors(single)[0]!;
+			}
+			resolvedRows.set(line, resolved);
+			return resolved;
+		});
+		this.resolvedRows = resolvedRows;
+		this.resolvedRowsCursor = showHardwareCursor;
 		screen = this.applySearchHighlights(screen, nextLayout);
 		screen = this.compositeScrollToEndIndicator(screen, nextLayout, width);
 		screen = this.compositeOverlays(screen, width, height);
@@ -1796,11 +1864,8 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 					line !== this.previousScreen[row] &&
 					(imageRows.has(line) || previousImageRows.has(this.previousScreen[row] ?? "")),
 			);
-		const isWezTerm = Boolean(process.env.WEZTERM_PANE) || process.env.TERM_PROGRAM?.toLowerCase() === "wezterm";
-		// WezTerm also erases a Kitty image's cells when a row it covers is written.
 		const imageCellsNeedRedraw =
 			!imageAnchorsNeedRedraw &&
-			isWezTerm &&
 			this.imageProtocol === "kitty" &&
 			imageRows.size > 0 &&
 			screen.some((line, row) => {
@@ -1834,10 +1899,11 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		}
 		buffer += preparedKittyScreen.evictedImageDeletion;
 
-		// WezTerm erases intersecting Kitty image cells when a later row write touches a covered row.
-		// Draw image placements after every clear and text write so nothing later intersects them; preserve
-		// the existing interleaved output for text-only frames and every other terminal.
-		const drawKittyImagesLast = redrawImages && this.imageProtocol === "kitty" && imageRows.size > 0 && isWezTerm;
+		// Some terminals store Kitty images in the cells they cover (WezTerm, xterm.js's image addon in Orca),
+		// so clearing or writing a covered row erases that part of the image. Draw placements after every clear
+		// and text write so nothing later intersects them. Terminals that keep images on a separate layer
+		// (Kitty, Ghostty) render the same result; text-only frames keep the interleaved output.
+		const drawKittyImagesLast = redrawImages && this.imageProtocol === "kitty" && imageRows.size > 0;
 		if (drawKittyImagesLast) {
 			for (let row = 0; row < height; row++) {
 				if (!fullRedraw && !imagesNeedRedraw && screen[row] === this.previousScreen[row]) continue;
@@ -1859,7 +1925,9 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			const moved =
 				fullRedraw || redrawImages || process.env.PI_TUI_SCROLL_ROWS === "0"
 					? undefined
-					: this.findMovedRows(screen, height);
+					: // (A row of the frame before is an image row exactly when it is in previousImageRows: the set was made of the
+						// finished rows that are, as imageRows is made now.)
+						this.findMovedRows(screen, height, imageRows.size > 0 || previousImageRows.size > 0);
 			if (moved) {
 				buffer += `\x1b[${moved.top + 1};${moved.bottom + 1}r`;
 				buffer +=

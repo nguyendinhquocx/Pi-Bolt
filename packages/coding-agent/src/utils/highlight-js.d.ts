@@ -1,5 +1,10 @@
 interface HighlightJsResult {
 	value: string;
+	/** What made the result (its token tree): the emitter class the API is configured with. */
+	emitter: unknown;
+	/** Set when highlight.js gave up (an illegal match without ignoreIllegals, or an error): the value is the code escaped. */
+	illegal?: boolean;
+	errorRaised?: unknown;
 }
 
 interface HighlightJsOptions {
@@ -9,6 +14,7 @@ interface HighlightJsOptions {
 
 interface HighlightJsLanguageDefinition {
 	readonly name?: string;
+	readonly aliases?: string[];
 }
 
 type HighlightJsLanguageFactory = (hljs: HighlightJsApi) => HighlightJsLanguageDefinition;
@@ -17,7 +23,9 @@ interface HighlightJsApi {
 	highlight(code: string, options: HighlightJsOptions): HighlightJsResult;
 	highlightAuto(code: string, languageSubset?: string[]): HighlightJsResult;
 	getLanguage(name: string): HighlightJsLanguageDefinition | undefined;
+	listLanguages(): string[];
 	registerLanguage(name: string, language: HighlightJsLanguageFactory): void;
+	configure(options: { __emitter?: new (options: unknown) => unknown }): void;
 }
 
 declare module "highlight.js/lib/core.js" {

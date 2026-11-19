@@ -7,6 +7,7 @@ import {
 	type Provider,
 	type RefreshModelsContext,
 } from "@earendil-works/pi-ai";
+import { getModelListing, setModelListing } from "@earendil-works/pi-ai/providers/model-listing";
 import { VERSION } from "../config.ts";
 import { fetchWithRetry } from "../utils/management-http.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
@@ -147,13 +148,18 @@ export function withRemoteCatalog(
 	const mergeChat = memoizedMerge<ReturnType<Provider["getModels"]>[number]>();
 	const mergeAll = memoizedMerge<AnyModel>();
 
-	return {
+	const wrapped: Provider = {
 		...provider,
 		getModels: () => mergeChat(provider.getModels(), dynamicChatModels()),
 		getAllModels: () => mergeAll(provider.getAllModels?.() ?? provider.getModels(), dynamicModels),
+		// pi.dev serves the catalog, so a stale provider login must not block or fail its refresh.
+		refreshModelsAuth: "configured",
 		refreshModels: async (context) => {
 			const stored = context.stored;
 			const restored = remoteModels(stored, localGeneratedAt).filter((model) => model.provider === provider.id);
+			// Offline with nothing to restore and nothing to clear (every provider without a newer stored catalog, at every
+			// start), publishing would change nothing.
+			if (!context.allowNetwork && restored.length === 0 && dynamicModels.length === 0) return;
 			if (
 				!(await context.publish({
 					update: () => {
@@ -217,6 +223,8 @@ export function withRemoteCatalog(
 			});
 		},
 	};
+	// Without newer chat models it lists the provider's own.
+	return setModelListing(wrapped, () => (dynamicChatModels().length === 0 ? getModelListing(provider) : undefined));
 }
 
 /**
@@ -237,12 +245,14 @@ export function withPersonalizedCatalog(
 	const builtinModels = (): readonly AnyModel[] => provider.getAllModels?.() ?? provider.getModels();
 	const getAllModels = (): readonly AnyModel[] => (personalModels.length > 0 ? personalModels : builtinModels());
 
-	return {
+	const wrapped: Provider = {
 		...provider,
 		getModels: () => getAllModels().filter((model) => isModelType(model, "chat")),
 		getAllModels,
 		refreshModels: async (context) => {
 			const restored = (context.stored?.models ?? []).filter((model) => model.provider === provider.id);
+			// (As in withRemoteCatalog: offline, nothing to restore or clear changes nothing.)
+			if (!context.allowNetwork && restored.length === 0 && personalModels.length === 0) return;
 			if (
 				!(await context.publish({
 					update: () => {
@@ -272,4 +282,6 @@ export function withPersonalizedCatalog(
 			});
 		},
 	};
+	// Until a personalized catalog replaces them, it lists the provider's own models.
+	return setModelListing(wrapped, () => (personalModels.length === 0 ? getModelListing(provider) : undefined));
 }

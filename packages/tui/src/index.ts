@@ -1,6 +1,6 @@
 // Core TUI interfaces and classes
 
-export { Marked, type Token, type Tokens } from "marked";
+export type { Token, Tokens } from "marked";
 // Autocomplete support
 export {
 	type AutocompleteItem,
@@ -83,6 +83,7 @@ export { type FuzzyMatch, fuzzyFilter, fuzzyMatch } from "./fuzzy.ts";
 // Keybindings
 export {
 	getKeybindings,
+	getSelectPageIndex,
 	type Keybinding,
 	type KeybindingConflict,
 	type KeybindingDefinition,
@@ -108,6 +109,8 @@ export {
 } from "./keys.ts";
 // LaTeX rendering
 export { type RenderLatexOptions, renderLatex } from "./latex.ts";
+// marked's Marked class, evaluated at first use
+export { Marked } from "./marked-module.ts";
 // Native platform integration
 export { getNativeClipboard, type NativeClipboard } from "./native-platform.ts";
 export { oklabToOkhslLightness } from "./oklab.ts";
@@ -167,6 +170,10 @@ export {
 	isFocusable,
 	isStableRender,
 	isViewportTUI,
+	LiveLineArray,
+	type LiveLines,
+	markLiveRender,
+	markReportsChanges,
 	markStableRender,
 	type OverlayAnchor,
 	type OverlayBounds,
@@ -174,9 +181,17 @@ export {
 	type OverlayMargin,
 	type OverlayOptions,
 	type OverlayUnfocusOptions,
+	renderChildLines,
 	renderFakeCursor,
+	renderLiveLines,
 	renderSharedLines,
+	reportRenderChange,
+	reportsChanges,
 	type SizeValue,
+	setChangeReportsForTest,
+	setRenderClockForTest,
+	setRenderOwner,
+	setSubtreeReportsChanges,
 	type TUI,
 	type TuiInputListener,
 	type TuiInputListenerResult,
@@ -193,7 +208,13 @@ export { TuiMainScreen, type TuiMainScreenRenderState } from "./tui-main-screen.
 // Utilities
 export {
 	getOsc8LinkAtColumn,
+	isWebLink,
+	replaceControlCharacters,
+	type SanitizedTerminalText,
+	sanitizeTerminalText,
+	sanitizeTerminalTextFrom,
 	sliceByColumn,
+	startsWithText,
 	stripTerminalSequences,
 	truncateToWidth,
 	visibleWidth,

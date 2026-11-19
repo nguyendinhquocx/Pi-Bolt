@@ -1,4 +1,4 @@
-node_modules/
+node_modules
 dist/
 .artifacts/
 *.log
@@ -9,6 +9,8 @@ packages/*/dist/
 packages/*/dist-chrome/
 packages/*/dist-firefox/
 packages/ai/src/providers/.model-generation-*/
+# Generated from packages/ai/src/providers/data by every build (packages/ai/scripts/model-catalog-modules.ts).
+packages/ai/src/providers/*.catalog.generated.ts
 *.cpuprofile
 
 # Environment
@@ -42,6 +44,7 @@ todo.md
 plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
+.pi/settings.json
 collect.sh
 packages/agent/docs/extensions/pi-server-artifact/index.md
 
@@ -58,6 +61,8 @@ packages/agent/docs/extensions/pi-server-artifact/index.md
 # Benchmark and test output (the published results in bench/results/ are kept)
 *.jsonl
 !bench/results/**/*.jsonl
+# Recorded engine RPC events the Android unit tests replay
+!android/app/src/test/resources/fixtures/**/*.jsonl
 /results/
 tmux-*.out
 *.order.tmp

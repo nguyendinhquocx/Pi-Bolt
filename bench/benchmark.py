@@ -11,6 +11,12 @@ Scenarios (each run is a fresh process):
 Runs are interleaved round-robin across builds, so background load hits all of them alike; pin them to the same cores with
 --cpus. CPU time and peak memory come from wait4() and cover all threads.
 
+--home realistic starts every run with a Pi home and project as they are after daily use (harness.realistic_home(): prompt
+templates, skills, a models-store.json, AGENTS.md files and a .git folder) instead of a blank one. --home-extensions DIR[,DIR]
+adds Pi packages to that home: each folder (an unpacked package, such as an extension the installers offer) becomes a
+local-path entry of the home's `packages` setting, so every run starts with those extensions loaded. The warmup rounds fill
+the home's extension cache, as a start after the first one finds it.
+
 --floor PATH adds the process floor to the rounds, as the build "floor": a minimal native program (bench/floor/floor.c) that
 takes Pi's arguments and answers each scenario the way Pi does, so that what process creation, the loader and (on Windows)
 Defender's check of a new process cost can be told from what a build costs. The tables then add each build's figure over it.
@@ -33,8 +39,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import harness
 from harness import (
-    DONE, MACOS, MODEL_ARGS, PROMPT, WINDOWS, Build, Tty, done, fake_model, maxrss_mb, median, parse_builds, peak_footprint_mb,
-    pi_env, pi_home, pinned, warm_page_cache, workdir,
+    DONE, HOMES, MACOS, MODEL_ARGS, PROMPT, WINDOWS, Build, PeakOwnSampler, Tty, done, fake_model, maxrss_mb, median,
+    parse_builds, peak_footprint_mb, pi_env, pi_home, pinned, realistic_home, warm_page_cache, workdir,
 )
 
 if WINDOWS:
@@ -61,11 +67,15 @@ def run_plain(build, args, env, cwd, cpus):
     t0 = time.perf_counter()
     p = subprocess.Popen(pinned([*build.argv, *args], cpus), env=env, cwd=cwd, stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    own = PeakOwnSampler(p.pid)
     out = p.stdout.read()
     peak_fp = peak_footprint_mb(p.pid)
+    peak_own = own.stop()
     _, status, ru = os.wait4(p.pid, 0)
     r = {"ok": os.waitstatus_to_exitcode(status) == 0, "wall_ms": (time.perf_counter() - t0) * 1e3,
          "cpu_ms": (ru.ru_utime + ru.ru_stime) * 1e3, "peak_mb": maxrss_mb(ru)}
+    if peak_own is not None:
+        r["peak_own_mb"] = peak_own
     if peak_fp is not None:
         r["peak_fp_mb"] = peak_fp
         r.update(harness.last_exit_counters)
@@ -87,6 +97,7 @@ def headless(build, env, cwd, cpus):
 def interactive(build, env, cwd, cpus, prompts=5):
     t0 = time.perf_counter()
     tty = Tty(pinned([*build.argv, "--no-session", *MODEL_ARGS], cpus), env, cwd)
+    own = PeakOwnSampler(tty.pid)
     deadline = t0 + 120
     r = {"ok": False}
     if not tty.wait_for("fake-model", 0, deadline):
@@ -106,6 +117,8 @@ def interactive(build, env, cwd, cpus, prompts=5):
     else:
         r["turns_ms"] = turns
     status, ru = tty.quit()
+    if (peak_own := own.stop()) is not None:
+        r["peak_own_mb"] = peak_own
     r["ok"] = "turns_ms" in r and status == 0
     r["wall_ms"] = (time.perf_counter() - t0) * 1e3
     r["cpu_ms"] = (ru.ru_utime + ru.ru_stime) * 1e3
@@ -142,6 +155,11 @@ if MACOS:
     # (peak_mb, ru_maxrss, counts clean file pages and freed pages the kernel may take back; the footprint does not.)
     for columns in COLUMNS.values():
         columns.extend(["peak_fp_mb", "instr_m"])
+if not MACOS and not WINDOWS:
+    # (Linux: peak_mb, ru_maxrss, counts the clean file pages a build maps; peak_own_mb, its own memory, does not.)
+    for columns in COLUMNS.values():
+        if "peak_mb" in columns:
+            columns.append("peak_own_mb")
 if WINDOWS:
     # peak_mb is the peak working set; peak_private_mb the peak commit charge (private bytes); peak_private_ws_mb the peak
     # private working set. cpu_ms is the main process's, by cycles; job_cpu_ms adds what it started, in clock ticks. (The rise of
@@ -197,7 +215,17 @@ def main():
     ap.add_argument("--out", help="append raw results to this JSONL file")
     ap.add_argument("--floor", metavar="PATH", help="also run this minimal program (bench/floor/floor.c, built) in every round, "
                     "as the build 'floor': the process floor")
+    ap.add_argument("--home", choices=HOMES, default="blank", help="the Pi home and project every run starts with: blank (only "
+                    "the fake model) or realistic (prompt templates, skills, a model store, AGENTS.md, .git)")
+    ap.add_argument("--home-extensions", metavar="DIR[,DIR]", help="with --home realistic: Pi package folders the home lists "
+                    "in its packages setting (local paths), so every run loads those extensions")
     a = ap.parse_args()
+    extensions = [os.path.abspath(d) for d in a.home_extensions.split(",") if d] if a.home_extensions else []
+    if extensions and a.home != "realistic":
+        raise SystemExit("--home-extensions needs --home realistic")
+    for d in extensions:
+        if not os.path.isfile(os.path.join(d, "package.json")):
+            raise SystemExit(f"--home-extensions: {d} is not a package folder (no package.json)")
     builds = parse_builds(a.build)
     baseline = a.baseline or builds[-1].name
     if a.floor:
@@ -211,6 +239,11 @@ def main():
         warm_page_cache(builds[:1])
     rows = []
     with fake_model() as port, pi_home(port) as home, workdir() as cwd:
+        if a.home == "realistic":
+            realistic_home(home, cwd)
+        if extensions:
+            settings = home / "settings.json"
+            settings.write_text(json.dumps({**json.loads(settings.read_text()), "packages": extensions}))
         env = pi_env(home)
         for scenario in a.scenarios.split(","):
             fn = SCENARIOS[scenario]
@@ -220,6 +253,10 @@ def main():
                     if i < a.warmup:
                         continue
                     r.update(build=build.name, scenario=scenario, run=i - a.warmup)
+                    if a.home != "blank":
+                        r["home"] = a.home
+                    if extensions:
+                        r["home_extensions"] = [os.path.basename(d) for d in extensions]
                     rows.append(r)
                     if a.out:
                         with open(a.out, "a") as f:

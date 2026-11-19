@@ -22,11 +22,16 @@ import {
 	type TerminalColors,
 	type TextAttributes,
 } from "@earendil-works/pi-tui";
-import chalk from "chalk";
 import { getCustomThemesDir, getThemesDir } from "../../../config.ts";
 import type { SourceInfo } from "../../../core/source-info.ts";
 import { closeWatcher, watchWithErrorHandler } from "../../../utils/fs-watch.ts";
-import { highlight, supportsLanguage } from "../../../utils/syntax-highlight.ts";
+import { loadChalk } from "../../../utils/lazy-packages.ts";
+import {
+	GrowingHighlighter,
+	getHighlightLanguageCount,
+	highlight,
+	supportsLanguage,
+} from "../../../utils/syntax-highlight.ts";
 import { stripBom } from "../../../utils/text.ts";
 import { generateSystemThemeColors, SYSTEM_THEME_NAME, terminalAppearance } from "./system-theme.ts";
 import {
@@ -312,23 +317,23 @@ export class Theme {
 	}
 
 	bold(text: string): string {
-		return chalk.bold(text);
+		return loadChalk().bold(text);
 	}
 
 	italic(text: string): string {
-		return chalk.italic(text);
+		return loadChalk().italic(text);
 	}
 
 	underline(text: string): string {
-		return chalk.underline(text);
+		return loadChalk().underline(text);
 	}
 
 	inverse(text: string): string {
-		return chalk.inverse(text);
+		return loadChalk().inverse(text);
 	}
 
 	strikethrough(text: string): string {
-		return chalk.strikethrough(text);
+		return loadChalk().strikethrough(text);
 	}
 
 	/** Opening escape sequence for a foreground token. Faint tokens include SGR 2, which `\x1b[22m` closes. */
@@ -376,19 +381,25 @@ export class Theme {
 // Theme Loading
 // ============================================================================
 
-let BUILTIN_THEMES: Record<string, ThemeJson> | undefined;
+let BUILTIN_THEME_NAMES: string[] | undefined;
+const builtinThemeCache = new Map<string, ThemeJson>();
 
-function getBuiltinThemes(): Record<string, ThemeJson> {
-	if (!BUILTIN_THEMES) {
-		const themesDir = getThemesDir();
-		const darkPath = path.join(themesDir, "dark.json");
-		const lightPath = path.join(themesDir, "light.json");
-		BUILTIN_THEMES = {
-			dark: JSON.parse(stripBom(fs.readFileSync(darkPath, "utf-8"))) as ThemeJson,
-			light: JSON.parse(stripBom(fs.readFileSync(lightPath, "utf-8"))) as ThemeJson,
-		};
+/** Every `*.json` file in the themes directory is a built-in theme named after its file. */
+function getBuiltinThemeNames(): string[] {
+	BUILTIN_THEME_NAMES ??= fs
+		.readdirSync(getThemesDir())
+		.filter((file) => file.endsWith(".json"))
+		.map((file) => file.slice(0, -".json".length));
+	return BUILTIN_THEME_NAMES;
+}
+
+function getBuiltinTheme(name: string): ThemeJson | undefined {
+	let theme = builtinThemeCache.get(name);
+	if (!theme && getBuiltinThemeNames().includes(name)) {
+		theme = JSON.parse(stripBom(fs.readFileSync(path.join(getThemesDir(), `${name}.json`), "utf-8"))) as ThemeJson;
+		builtinThemeCache.set(name, theme);
 	}
-	return BUILTIN_THEMES;
+	return theme;
 }
 
 export function getAvailableThemes(): string[] {
@@ -412,19 +423,20 @@ export function getAvailableThemesWithPaths(): ThemeInfo[] {
 		result.push(themeInfo);
 	};
 
-	// Built-in themes. The system theme is generated, so it has no file.
+	// The system theme is generated, so it has no file.
 	addTheme({ name: SYSTEM_THEME_NAME, path: undefined });
-	for (const name of Object.keys(getBuiltinThemes())) {
-		addTheme({ name, path: path.join(themesDir, `${name}.json`) });
-	}
 
-	// Custom themes
+	// Custom and registered themes come before the built-ins: one with a built-in's name replaces it, listed once.
 	for (const themeInfo of getCustomThemeInfos()) {
 		addTheme(themeInfo);
 	}
 
 	for (const [name, theme] of registeredThemes.entries()) {
 		addTheme({ name, path: theme.sourcePath });
+	}
+
+	for (const name of getBuiltinThemeNames()) {
+		addTheme({ name, path: path.join(themesDir, `${name}.json`) });
 	}
 
 	// The system theme comes first: it is the default and adapts to every terminal.
@@ -485,10 +497,9 @@ function parseThemeJsonContent(label: string, content: string): ThemeJson {
 }
 
 function loadThemeJson(name: string): ThemeJson {
-	const builtinThemes = getBuiltinThemes();
-	if (name in builtinThemes) {
-		return builtinThemes[name];
-	}
+	// A registered theme (one theme discovery found: the user's or a trusted project's, by the name it declares) wins over
+	// a built-in of the same name. A custom file of a built-in's name replaces it only that way, so `--no-themes`, which
+	// turns discovery off, gives back the built-in.
 	const registeredTheme = registeredThemes.get(name);
 	if (registeredTheme?.sourcePath) {
 		const content = fs.readFileSync(registeredTheme.sourcePath, "utf-8");
@@ -497,13 +508,15 @@ function loadThemeJson(name: string): ThemeJson {
 	if (registeredTheme) {
 		throw new Error(`Theme "${name}" does not have a source path for export`);
 	}
-	const customThemesDir = getCustomThemesDir();
-	const themePath = path.join(customThemesDir, `${name}.json`);
-	if (!fs.existsSync(themePath)) {
+	const builtinTheme = getBuiltinTheme(name);
+	if (builtinTheme) {
+		return builtinTheme;
+	}
+	const customThemePath = path.join(getCustomThemesDir(), `${name}.json`);
+	if (!fs.existsSync(customThemePath)) {
 		throw new Error(`Theme not found: ${name}`);
 	}
-	const content = fs.readFileSync(themePath, "utf-8");
-	return parseThemeJsonContent(name, content);
+	return parseThemeJsonContent(name, fs.readFileSync(customThemePath, "utf-8"));
 }
 
 function splitThemeColors(colors: ResolvedThemeColorValues<string | number>): {
@@ -743,16 +756,20 @@ export function onThemeChange(callback: () => void): void {
 	onThemeChangeCallback = callback;
 }
 
+/** Whether the theme file declares this name; a file that cannot be read or parsed now is taken as the theme (it may be fixed). */
+function fileDeclaresName(themeFile: string, name: string): boolean {
+	try {
+		return (JSON.parse(stripBom(fs.readFileSync(themeFile, "utf-8"))) as { name?: unknown }).name === name;
+	} catch {
+		return true;
+	}
+}
+
 function startThemeWatcher(): void {
 	stopThemeWatcher();
 
-	// Only watch if it's a custom theme (not built-in)
-	if (
-		!currentThemeName ||
-		currentThemeName === "dark" ||
-		currentThemeName === "light" ||
-		currentThemeName === SYSTEM_THEME_NAME
-	) {
+	// Only watch a custom theme's file (the system theme has none)
+	if (!currentThemeName || currentThemeName === SYSTEM_THEME_NAME) {
 		return;
 	}
 
@@ -761,8 +778,13 @@ function startThemeWatcher(): void {
 	const watchedFileName = `${watchedThemeName}.json`;
 	const themeFile = path.join(customThemesDir, watchedFileName);
 
-	// Only watch if the file exists
-	if (!fs.existsSync(themeFile)) {
+	// Only watch if the file exists, and is the theme in use (loadThemeJson()): a theme of this name registered from
+	// another file (a trusted project's) wins over it, and a built-in theme is replaced only by a registered file.
+	const registeredSource = registeredThemes.get(watchedThemeName)?.sourcePath;
+	const replacesBuiltin = getBuiltinThemeNames().includes(watchedThemeName);
+	const inUse =
+		registeredSource === undefined ? !replacesBuiltin : path.resolve(registeredSource) === path.resolve(themeFile);
+	if (!fs.existsSync(themeFile) || !inUse) {
 		return;
 	}
 
@@ -784,9 +806,27 @@ function startThemeWatcher(): void {
 			}
 
 			try {
-				// Reload the theme from disk and refresh the registry cache
-				const reloadedTheme = loadThemeFromPath(themeFile);
-				registeredThemes.set(watchedThemeName, reloadedTheme);
+				// Reload the theme from disk and refresh the registry cache. A file edited to name another theme no
+				// longer replaces the built-in of its file name: that comes back (and the file is watched still).
+				const builtinTheme =
+					replacesBuiltin && !fileDeclaresName(themeFile, watchedThemeName)
+						? getBuiltinTheme(watchedThemeName)
+						: undefined;
+				const reloadedTheme = builtinTheme ? createTheme(builtinTheme) : loadThemeFromPath(themeFile);
+				if (reloadedTheme.sourcePath) {
+					registeredThemes.set(watchedThemeName, reloadedTheme);
+				} else {
+					registeredThemes.delete(watchedThemeName);
+					// (The file is listed by the name it now declares, so it loads by that name too.)
+					try {
+						const renamedTheme = loadThemeFromPath(themeFile);
+						if (renamedTheme.name && !renamedTheme.name.includes("/")) {
+							registeredThemes.set(renamedTheme.name, renamedTheme);
+						}
+					} catch {
+						// Not a valid theme (yet): it is not listed either.
+					}
+				}
 				setGlobalTheme(reloadedTheme);
 				// Notify callback (to invalidate UI)
 				if (onThemeChangeCallback) {
@@ -942,6 +982,7 @@ const HIGHLIGHTED_CODE_MAX_LENGTH = 512 * 1024;
 const highlightedCode = new Map<string, string[]>();
 let highlightedCodeLength = 0;
 let highlightedCodeTheme: Theme | undefined;
+let highlightedCodeLanguageCount = 0;
 let lastHighlightedKey: string | undefined;
 
 function rememberHighlightedCode(key: string, lines: string[]): void {
@@ -969,6 +1010,12 @@ function rememberHighlightedCode(key: string, lines: string[]): void {
 	}
 }
 
+// The code block being written (a reply streaming in has it grow at its end each time it is drawn), highlighted from what
+// was highlighted of it before: only its last lines are highlighted again (GrowingHighlighter). It is followed from the
+// second time code that extends the code highlighted before is asked for.
+let growingCode: { lang: string; code: string; lines: string[]; highlighter: GrowingHighlighter } | undefined;
+let lastHighlightedCode: { lang: string; code: string } | undefined;
+
 /**
  * The lines of `code` highlighted as `lang`, a language that is supported, from what is kept or highlighted now and kept.
  * Throws what highlight() throws.
@@ -976,25 +1023,57 @@ function rememberHighlightedCode(key: string, lines: string[]): void {
 function highlightedLines(code: string, lang: string): string[] {
 	// (The theme in use, whichever instance of this module set it.)
 	const themeInUse = (globalThis as Record<symbol, Theme>)[THEME_KEY];
-	if (highlightedCodeTheme !== themeInUse) {
+	// (Grammars loaded since can highlight code embedded in another language differently.)
+	const languageCount = getHighlightLanguageCount();
+	if (highlightedCodeTheme !== themeInUse || highlightedCodeLanguageCount !== languageCount) {
 		highlightedCodeTheme = themeInUse;
+		highlightedCodeLanguageCount = languageCount;
 		highlightedCode.clear();
 		highlightedCodeLength = 0;
 		lastHighlightedKey = undefined;
+		growingCode = undefined;
+		lastHighlightedCode = undefined;
 	}
+	const growing = growingCode;
+	const extendsGrowing = growing !== undefined && growing.lang === lang && extendsCode(code, growing.code);
+	if (extendsGrowing && code.length === growing.code.length) return growing.lines.slice();
+	// The same text highlighted before (the same reply streamed again) is taken as it was, unless the block being written
+	// has final lines already: its next lines then cost less than looking the whole text up.
 	const key = `${lang}\n${code}`;
-	const known = highlightedCode.get(key);
+	const known = extendsGrowing && growing.highlighter.finalLength > 0 ? undefined : highlightedCode.get(key);
 	if (known) {
 		// (Most recent last.)
 		highlightedCode.delete(key);
 		highlightedCode.set(key, known);
 		return known.slice();
 	}
+	if (extendsGrowing) {
+		growing.lines = growing.highlighter.lines(code);
+		growing.code = code;
+		return growing.lines.slice();
+	}
+	const last = lastHighlightedCode;
+	if (last !== undefined && last.lang === lang && code.length > last.code.length && extendsCode(code, last.code)) {
+		// The code highlighted before, grown: from now on only what changes is highlighted again. The block followed
+		// before is kept with the rest.
+		if (growing !== undefined) rememberHighlightedCode(`${growing.lang}\n${growing.code}`, growing.lines);
+		const highlighter = new GrowingHighlighter(lang, getCliHighlightTheme(theme));
+		const lines = highlighter.lines(code);
+		growingCode = { lang, code, lines, highlighter };
+		lastHighlightedCode = undefined;
+		return lines.slice();
+	}
 	const lines = highlight(code, { language: lang, ignoreIllegals: true, theme: getCliHighlightTheme(theme) }).split(
 		"\n",
 	);
 	rememberHighlightedCode(key, lines);
+	lastHighlightedCode = { lang, code };
 	return lines.slice();
+}
+
+/** Whether `code` is `before` with text added at its end, or `before` itself. */
+function extendsCode(code: string, before: string): boolean {
+	return code.length >= before.length && code.startsWith(before);
 }
 
 /**
@@ -1013,7 +1092,42 @@ export function highlightCode(code: string, lang?: string): string[] {
 	try {
 		return highlightedLines(code, validLang);
 	} catch {
-		return code.split("\n");
+		return code.split("\n").map((line) => theme.fg("mdCodeBlock", line));
+	}
+}
+
+/**
+ * Highlights code for one owner, such as a tool row, and reuses the last result while the code, the language, the
+ * theme and the registered grammars stay the same. Each owner keeps its own highlighter, so cached results live as long
+ * as the code they show instead of in a process-wide cache.
+ */
+export class CodeHighlighter {
+	private last?: {
+		code: string;
+		lang: string | undefined;
+		theme: Theme | undefined;
+		languageCount: number;
+		lines: readonly string[];
+	};
+
+	/** Like {@link highlightCode}. The result is shared with later calls, so callers must not modify it. */
+	highlight(code: string, lang: string | undefined): readonly string[] {
+		// Renderers cannot tell a theme change from any other redraw, so the highlighter checks what its result depends on.
+		const currentTheme = getThemeInstance();
+		const languageCount = getHighlightLanguageCount();
+		const last = this.last;
+		if (
+			last?.code === code &&
+			last.lang === lang &&
+			last.theme === currentTheme &&
+			last.languageCount === languageCount
+		) {
+			return last.lines;
+		}
+		const lines = highlightCode(code, lang);
+		// (The count after highlighting: highlighting can load the grammar it needs.)
+		this.last = { code, lang, theme: currentTheme, languageCount: getHighlightLanguageCount(), lines };
+		return lines;
 	}
 }
 
@@ -1038,6 +1152,10 @@ export function getLanguageFromPath(filePath: string): string | undefined {
 		java: "java",
 		kt: "kotlin",
 		swift: "swift",
+		dart: "dart",
+		groovy: "groovy",
+		gradle: "groovy",
+		nix: "nix",
 		c: "c",
 		h: "c",
 		cpp: "cpp",
@@ -1088,6 +1206,16 @@ export function getLanguageFromPath(filePath: string): string | undefined {
 	return extToLang[ext];
 }
 
+// Shared across module loaders as the theme is: an extension's instance of this module (jiti) draws code blocks the same way.
+const SHADED_CODE_BLOCKS_KEY = Symbol.for("@earendil-works/pi-coding-agent:shadedCodeBlocks");
+
+/** Render code blocks on a background, without fence lines, instead of between literal ``` lines. */
+export function setShadedCodeBlocks(enabled: boolean): void {
+	(globalThis as Record<symbol, boolean>)[SHADED_CODE_BLOCKS_KEY] = enabled;
+}
+
+const shadeCodeBlock = (text: string) => theme.bg("mdCodeBlockBg", text);
+
 export function getMarkdownTheme(): MarkdownTheme {
 	return {
 		heading: (text: string) => theme.fg("mdHeading", text),
@@ -1096,6 +1224,13 @@ export function getMarkdownTheme(): MarkdownTheme {
 		code: (text: string) => theme.fg("mdCode", text),
 		codeBlock: (text: string) => theme.fg("mdCodeBlock", text),
 		codeBlockBorder: (text: string) => theme.fg("mdCodeBlockBorder", text),
+		// (Read when a block is drawn: a change of the setting applies to every Markdown already shown once it is redrawn,
+		// a streaming answer's too.)
+		get codeBlockBg() {
+			return (globalThis as Record<symbol, boolean | undefined>)[SHADED_CODE_BLOCKS_KEY]
+				? shadeCodeBlock
+				: undefined;
+		},
 		quote: (text: string) => theme.fg("mdQuote", text),
 		quoteBorder: (text: string) => theme.fg("mdQuoteBorder", text),
 		hr: (text: string) => theme.fg("mdHr", text),
@@ -1104,21 +1239,7 @@ export function getMarkdownTheme(): MarkdownTheme {
 		italic: (text: string) => theme.italic(text),
 		underline: (text: string) => theme.underline(text),
 		strikethrough: (text: string) => theme.strikethrough(text),
-		highlightCode: (code: string, lang?: string): string[] => {
-			// Validate language before highlighting to avoid stderr spam from cli-highlight
-			const validLang = lang && supportsLanguage(lang) ? lang : undefined;
-			// Skip highlighting when no valid language is specified. cli-highlight's
-			// auto-detection is unreliable and can misidentify prose as AppleScript,
-			// LiveCodeServer, etc., coloring random English words as keywords.
-			if (!validLang) {
-				return code.split("\n").map((line) => theme.fg("mdCodeBlock", line));
-			}
-			try {
-				return highlightedLines(code, validLang);
-			} catch {
-				return code.split("\n").map((line) => theme.fg("mdCodeBlock", line));
-			}
-		},
+		highlightCode,
 	};
 }
 

@@ -28,6 +28,8 @@ out/pi-bolt/pi --version
 Apart from downloading the runtime and npm packages, the build is offline: Pi's model catalog
 (`packages/ai/src/providers/data`) is in the repository. `scripts/prepare-pi.sh --refresh-models` fetches it again from the
 model providers; every provider has to answer, so it is for updating the catalog (commit what changes), not for building.
+The build writes each provider's catalog module (`packages/ai/src/providers/<provider>.catalog.generated.ts`, which builds its models on
+first use) from that data; they are not in git (`npm run generate:catalog-modules` writes them alone).
 When a step fails, the script prints the end of its output, and the whole of it is in `.work/prepare-pi.log`.
 
 ## Building the runtime
@@ -36,7 +38,7 @@ When a step fails, the script prints the end of its output, and the whole of it 
 
 | Tool | Version | Notes |
 |---|---|---|
-| Linux x86-64 | | 32 GB of RAM or more; about 40 GB of disk |
+| Linux x86-64 or ARM64 | | 32 GB of RAM or more (16 GB with swap is enough on ARM64, below); about 40 GB of disk |
 | or macOS on Apple silicon | 13 or later | Xcode (its SDK); 16 GB of RAM is enough with ThinLTO; about 40 GB of disk |
 | clang / LLVM | 23.1 | the version Bun's build pins (`scripts/build/ci-images/spec.ts` in Bun) |
 | CMake | 3.30 | |
@@ -61,10 +63,20 @@ scripts/build-runtime.sh            # release build with LTO -> .work/runtime/bu
   [`patches/bun.patch`](../patches/bun.patch), applied with `git am`.
 
 The sysroot is what makes the executables portable. Linked against it, they need only glibc 2.17, and they carry their own
-ICU, like official Bun builds.
+ICU, like official Bun builds. `make-sysroot.sh` makes it for the machine's architecture: on ARM64 from Ubuntu's arm64 packages,
+with ICU built for any ARMv8 CPU (`-march=armv8-a+crc`, as the runtime itself).
 
 `scripts/build-runtime.sh --native` skips the sysroot and links against the host's libc and ICU. That is faster to set up, but
 the result runs only on systems like the build machine.
+
+On Linux x86-64 with musl (Alpine 3.23), the runtime is built natively by `scripts/build-runtime-musl.sh` instead, as the
+`runtime` workflow does in an Alpine container: `scripts/alpine-tools.sh --build` installs the tools (LLVM 23 from Alpine's
+edge), then `scripts/fetch-sources.sh` and `scripts/build-runtime-musl.sh --icu`. `--icu` builds the glibc sysroot's ICU from
+source and installs it into `/usr` as static libraries, with all of its data, so the executable needs no ICU package (Alpine's
+`icu-dev` must not be installed: its libraries would be linked instead). The musl runtime has a stamp of its own
+(`scripts/runtime-stamp.sh musl`). `build-pi.sh` and `package-release.sh` then make the `x64-musl`, `x64-musl-baseline` and
+`x64-musl-jit` builds and `pi-bolt-*-linux-x64-musl` archives. Based on the patch set by @nthrow in
+[#280](https://github.com/opensec-git/Pi-Bolt/issues/280).
 
 On macOS there is no sysroot: the runtime is built against Xcode's SDK for macOS 13 and later (Bun's own floor), with
 `-mcpu=apple-m1`, and uses the system's ICU. LLVM 23 from Homebrew (`brew install llvm cmake ninja bash xz`), Rust and Bun 1.4.2 are
@@ -76,6 +88,30 @@ Command Line Tools (`xcrun clang`) for the launcher. On an M5 MacBook Air (10 co
 scripts/fetch-sources.sh
 scripts/build-runtime.sh            # -> .work/runtime/bun (ThinLTO, as released)
 ```
+
+### Linux ARM64 in a container
+
+[`scripts/toolchain/linux-build.Dockerfile`](../scripts/toolchain/linux-build.Dockerfile) is a Linux machine with the tools above,
+for the architecture of the host: on a Mac with Apple silicon, Docker Desktop runs it as native arm64 Linux, and it builds the
+linux-arm64 runtime and Pi. Give Docker's VM 12 GB of memory and 8 GB of swap (Settings → Resources); the sysroot step
+starts a container of its own, through the host's Docker socket. On an M5 MacBook Air (10 cores, 16 GB) the runtime takes about
+45 minutes.
+
+```bash
+docker build -t pibolt-build -f scripts/toolchain/linux-build.Dockerfile scripts/toolchain
+docker run -d --name pibolt-arm64 -v /var/run/docker.sock:/var/run/docker.sock -v pibolt-work:/work pibolt-build sleep infinity
+# copy the repository to /work/repo (without node_modules), then in it:
+docker exec -w /work/repo pibolt-arm64 scripts/toolchain/make-sysroot.sh
+docker exec -w /work/repo pibolt-arm64 scripts/fetch-sources.sh
+docker exec -w /work/repo pibolt-arm64 scripts/build-runtime.sh
+docker exec -w /work/repo pibolt-arm64 scripts/prepare-pi.sh
+docker exec -w /work/repo pibolt-arm64 scripts/package-release.sh   # linux-arm64 and linux-arm64-jit, the runtime
+```
+
+On ARM64 Linux the static region is at 64 GB (0x1000000000) rather than at 32 TB: many ARM64 kernels give a process 512 GB of
+addresses (39-bit, as Android's and the Raspberry Pi's) or 4 TB (64 KB pages). The heap and the code image are laid out in 64 KB
+pages, the largest page size of ARM64 kernels, so one executable runs with 4, 16 and 64 KB pages. The executable's loader path
+(PT_INTERP) has room for a longer one, which the installer writes in Termux ([README](../README.md#android-termux)).
 
 ### Working on the engine
 
@@ -99,7 +135,7 @@ scripts/build-pi.sh [options]
 | `--pi DIR` | this repository | A built Pi tree (`scripts/prepare-pi.sh`). |
 | `--out DIR` | `out/pi-bolt` | Where the executable and its asset files go. |
 | `--jit on\|off` | `off` | `on` also JIT-compiles code loaded at run time, such as run-time plugins. |
-| `--cpu native\|baseline` | `native` | `native`: code for the build machine's instruction set (AVX2 class); on a CPU without it, the executable runs from bytecode. `baseline`: any x86-64 CPU. On ARM64 there is one build, for every Apple silicon CPU. |
+| `--cpu native\|baseline` | `native` (Linux ARM64: `baseline`) | `native`: code for the build machine's instruction set (AVX2 class); on a CPU without it, the executable runs from bytecode. `baseline`: any x86-64 CPU; on Linux ARM64, any ARMv8.0 CPU (none of LSE, JSCVT, FP16, FRINTTS, SHA3, DotProd), the build that is released. On macOS there is one build, for every Apple silicon CPU. |
 | `--profile DIR` | `profiles/pi-<version>` | Training profile ([below](#training-profiles)). |
 | `--plugins FILE` | | Compile plugins in ([PLUGINS.md](PLUGINS.md)). |
 | `--plugin-worker PATH` | | A worker script a plugin starts. Repeatable. |
@@ -124,9 +160,11 @@ A build without a profile works, with somewhat slower startup. `build-pi.sh` war
 
 ## Training profiles
 
-A profile ([`profiles/pi-1.1.0`](../profiles/pi-1.1.0)) has two files, recorded by running a plain bytecode build of Pi through
-two scripted interactive sessions (`scripts/lib/train_session.py`). The first is a plain start and a few plain turns, and gives
-the order. The second is there for the regular expressions: an answer that uses every kind of Markdown and a code block in
+A profile ([`profiles/pi-1.1.0`](../profiles/pi-1.1.0)) has two files, recorded by running two plain bytecode builds of Pi (one
+in a single file, one split as `build-pi.sh` and `build-pi.ps1` do: a function is named by its text, which splitting
+changes where it reaches into another chunk) through two scripted interactive sessions (`scripts/lib/train_session.py`). The
+first is a plain start and a few plain turns, and gives the order. The second is there for the regular expressions: an answer
+that uses every kind of Markdown and a code block in
 every language Pi highlights (`scripts/lib/training.md`), tool calls whose results the TUI renders, and the editor's
 completions. A regular expression that is not recorded is not compiled into the executable, and runs in the interpreter (ten
 times slower or more) on the default build: when Pi starts to highlight another language or to build new patterns, add what
@@ -138,8 +176,14 @@ exercises them to `training.md` and record again.
 | `regexps.txt` | Regular expressions the program built from strings at run time | Compiling them ahead of time, like regular-expression literals |
 
 ```bash
-scripts/train-profile.sh [--pi DIR] [--plugins FILE] [--out DIR]
+scripts/train-profile.sh [--pi DIR] [--plugins FILE] [--out DIR] [--with DIR]
 ```
+
+`--with DIR` merges in a profile recorded on another platform (`--out DIR` there), so that what only that platform runs has its
+place too. Recording into an existing profile keeps its strings' order (the prebuilt heap's, from `train-heap.ps1`).
+
+`bench/aot_coverage.py --build pi-bolt=out/pi-bolt/pi --profile profiles/pi-<version>` lists what a build still runs outside its
+compiled code: regular expressions that are not in the profile, and functions that have no code in the image.
 
 ### The runtime's order file (macOS)
 
@@ -161,9 +205,9 @@ scripts/train-runtime-hints.sh [--pi BUILD]   # traces sessions of out/pi-bolt (
 scripts/package-release.sh [--pi DIR] [--no-build]
 ```
 
-This builds the Pi targets of the machine it runs on (on Linux `linux-x64`, `linux-x64-baseline` and `linux-x64-jit`; on macOS
-`darwin-arm64` and `darwin-arm64-jit`) and checks that each uses its compiled code. It writes them as `.tar.xz` and `.tar.gz`, the
-runtime and `SHA256SUMS` to `dist/<VERSION>/`. A release puts the archives of both platforms together, with one `SHA256SUMS`. Each archive includes the license
+This builds the Pi targets of the machine it runs on (on Linux x86-64 `linux-x64`, `linux-x64-baseline` and `linux-x64-jit`; on
+Linux ARM64 `linux-arm64` and `linux-arm64-jit`; on macOS `darwin-arm64` and `darwin-arm64-jit`) and checks that each uses its compiled code. It writes them as `.tar.xz` and `.tar.gz`, the
+runtime and `SHA256SUMS` to `dist/<VERSION>/`. A release puts the archives of every platform together, with one `SHA256SUMS`. Each archive includes the license
 notices and a `pi-bolt.txt` naming the build. Publishing a release, by the release workflow or by hand, is described in
 [RELEASING.md](RELEASING.md).
 
@@ -182,7 +226,8 @@ notices and a `pi-bolt.txt` naming the build. Publishing a release, by the relea
 | `python3 bench/e2e_fullscreen.py --build pi-bolt=out/pi-bolt/pi` | The fullscreen TUI's scrolling of rows that only moved: after a long answer, paging and a resize, each screen (text and colors) must be what it is when every row is drawn, in tmux and in zmx. `--docker IMAGE` runs Pi and the terminals in a container. |
 | `python3 bench/pauses.py --build pi-bolt=out/pi-bolt/pi` | Large files written through a tool call in the TUI: the longest pause in drawing must not grow with the file. |
 | `python3 bench/long_answer.py --build pi-bolt=out/pi-bolt/pi` | The CPU it takes to stream answers of 5,000 to 60,000 characters: the share of a core must not grow with the length. |
-| `tests/compat/run.sh --builds DIR` | Linux only. Other systems and CPUs, without root: the three builds in the userlands of CentOS 7 (glibc 2.17), Debian 9 and Amazon Linux 2 (bubblewrap), and on emulated Intel Haswell, Skylake, Sandy Bridge and Nehalem (qemu-user). |
+| `tests/compat/run.sh --builds DIR` | Linux only. Other systems and CPUs, without root: the builds in the userlands of CentOS 7 (glibc 2.17), Debian 9 and Amazon Linux 2 (bubblewrap), and on emulated CPUs (qemu-user): Intel Haswell, Skylake, Sandy Bridge and Nehalem; on ARM64, Cortex-A53, Cortex-A72 and Neoverse N1. |
+| `tests/termux/run.sh --build DIR` | Linux ARM64. What the installer does in Termux, in a container that imitates Android's: Termux's prefix with a glibc loader there, its `LD_PRELOAD` (a library glibc cannot load), and a system call filter that kills a process for calls Android refuses, as Android's does. |
 | `python3 bench/tmux_check.py --build pi-bolt=out/pi-bolt/pi` | Pi in a real tmux pane: keystroke latency, paste, streaming, resize, Escape to abort, idle CPU, memory. |
 
 `out/pi-stable/pi` is the stock-Bun comparison build: `scripts/build-pi.sh --stable --out out/pi-stable`.

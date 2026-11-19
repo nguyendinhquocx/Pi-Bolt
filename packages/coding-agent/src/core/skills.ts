@@ -3,8 +3,9 @@ import ignore from "ignore";
 import { basename, dirname, join, relative, resolve, sep } from "path";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { parseFrontmatter } from "../utils/frontmatter.ts";
-import { canonicalizePath, resolvePath } from "../utils/paths.ts";
+import { isPathWithin, resolvePath } from "../utils/paths.ts";
 import type { ResourceDiagnostic } from "./diagnostics.ts";
+import { ResourcePathKeys } from "./resource-path-keys.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 
 /** Max name length per spec */
@@ -369,7 +370,7 @@ export function formatSkillsForPrompt(skills: Skill[], fileReadTool: "read" | "b
 			: fileReadTool === "bash"
 				? "Use bash to load a skill's file when the task matches its description."
 				: "Load a skill's file when the task matches its description.",
-		"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
+		"Resolve relative paths against the skill's directory (parent of SKILL.md). Use absolute paths in tool calls.",
 		"",
 		"<available_skills>",
 	];
@@ -405,6 +406,8 @@ export interface LoadSkillsOptions {
 	skillPaths: string[];
 	/** Include default skills directories. */
 	includeDefaults: boolean;
+	/** Dedupe keys of the caller's load pass, so that a path whose real path it already has is not resolved again. */
+	pathKeys?: ResourcePathKeys;
 }
 
 /**
@@ -413,6 +416,7 @@ export interface LoadSkillsOptions {
  */
 export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 	const { agentDir, skillPaths, includeDefaults } = options;
+	const pathKeys = options.pathKeys ?? new ResourcePathKeys();
 
 	// Resolve agentDir - if not provided, use default from config
 	const resolvedCwd = resolvePath(options.cwd);
@@ -423,11 +427,28 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 	const allDiagnostics: ResourceDiagnostic[] = [];
 	const collisionDiagnostics: ResourceDiagnostic[] = [];
 
+	// The first skill's real path, resolved only once a second skill needs it: a realpath costs about 0.17 M instructions,
+	// and a single skill (such as the bundled one alone) has nothing to be a duplicate of.
+	let unresolvedFirst: Skill | undefined;
+
 	function addSkills(result: LoadSkillsResult) {
 		allDiagnostics.push(...result.diagnostics);
+		if (result.skills.length > 1) {
+			pathKeys.prepare(result.skills.map((skill) => skill.filePath));
+		}
 		for (const skill of result.skills) {
+			if (skillMap.size === 0) {
+				skillMap.set(skill.name, skill);
+				unresolvedFirst = skill;
+				continue;
+			}
+			if (unresolvedFirst) {
+				realPathSet.add(pathKeys.keyOf(unresolvedFirst.filePath));
+				unresolvedFirst = undefined;
+			}
+
 			// Resolve symlinks to detect duplicate files
-			const realPath = canonicalizePath(skill.filePath);
+			const realPath = pathKeys.keyOf(skill.filePath);
 
 			// Skip silently if we've already loaded this exact file (via symlink)
 			if (realPathSet.has(realPath)) {
@@ -462,19 +483,10 @@ export function loadSkills(options: LoadSkillsOptions): LoadSkillsResult {
 	const userSkillsDir = join(resolvedAgentDir, "skills");
 	const projectSkillsDir = resolve(resolvedCwd, CONFIG_DIR_NAME, "skills");
 
-	const isUnderPath = (target: string, root: string): boolean => {
-		const normalizedRoot = resolve(root);
-		if (target === normalizedRoot) {
-			return true;
-		}
-		const prefix = normalizedRoot.endsWith(sep) ? normalizedRoot : `${normalizedRoot}${sep}`;
-		return target.startsWith(prefix);
-	};
-
 	const getSource = (resolvedPath: string): "user" | "project" | "path" => {
 		if (!includeDefaults) {
-			if (isUnderPath(resolvedPath, userSkillsDir)) return "user";
-			if (isUnderPath(resolvedPath, projectSkillsDir)) return "project";
+			if (isPathWithin(userSkillsDir, resolvedPath)) return "user";
+			if (isPathWithin(projectSkillsDir, resolvedPath)) return "project";
 		}
 		return "path";
 	};

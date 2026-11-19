@@ -153,7 +153,7 @@ function makeRelease({ signer, sumsVersion = VERSION, zips = { x64: buildZip() }
 
 const GITHUB = `https://github.com/opensec-git/Pi-Bolt/releases/download/bolt-v${VERSION}`;
 const REGISTRY = "https://registry.npmjs.org";
-const npmUrl = (variant = "x64") => `${REGISTRY}/pi-bolt-win32-${variant}/-/pi-bolt-win32-${variant}-${VERSION}.tgz`;
+const npmUrl = (variant = "x64") => `${REGISTRY}/@kushalkhemka/pi-bolt-win32-${variant}/-/pi-bolt-win32-${variant}-${VERSION}.tgz`;
 
 /** A fetch that serves `routes` (URL -> bytes) and records what was asked for. */
 function fakeFetch(routes) {
@@ -172,7 +172,7 @@ function githubRoutes(release, base = GITHUB) {
 
 function npmPackage(zip, variant = "x64") {
 	return makeTgz([
-		{ name: "package/package.json", data: Buffer.from(`{"name":"pi-bolt-win32-${variant}","version":"${VERSION}"}`) },
+		{ name: "package/package.json", data: Buffer.from(`{"name":"@kushalkhemka/pi-bolt-win32-${variant}","version":"${VERSION}"}`) },
 		{ name: `package/pi-bolt-win32-${variant}.zip`, data: zip },
 	]);
 }
@@ -340,16 +340,43 @@ test("Windows: a mirror (PIBOLT_DOWNLOAD_BASE) without a signature is refused", 
 	assertPlaceholder(pkgDir);
 });
 
-test("Windows: an unsigned release only with PIBOLT_ALLOW_UNSIGNED=1, and only the checksum is verified, which is said", async (t) => {
+// An opt-in left in the environment (a profile, setx, a CI image) would otherwise let any later download in without its signature.
+test("Windows: PIBOLT_ALLOW_UNSIGNED=1, or the SHA-256 of other checksums, does not let an unsigned release in", async (t) => {
+	const release = makeRelease();
+	const other = sha256(makeRelease({ sumsVersion: "0.0.1" }).SHA256SUMS);
+	for (const value of ["1", "yes", other]) {
+		const { fetch } = fakeFetch(githubRoutes(release, "http://mirror.test/pi-bolt"));
+		const pkgDir = makePackage(t);
+		const env = { PIBOLT_DOWNLOAD_BASE: "http://mirror.test/pi-bolt", PIBOLT_ALLOW_UNSIGNED: value };
+		await assert.rejects(run(pkgDir, { fetch, key: install.RELEASE_KEY, env }).promise, (error) => {
+			assert.match(error.message, /has no signature/);
+			assert.match(error.message, /not to this download's SHA-256/);
+			assert.ok(error.message.includes(`PIBOLT_ALLOW_UNSIGNED=${sha256(release.SHA256SUMS)}`), "it says the value for this download");
+			return true;
+		});
+		assertPlaceholder(pkgDir);
+	}
+});
+
+test("Windows: an unsigned release only with PIBOLT_ALLOW_UNSIGNED set to the SHA-256 of its SHA256SUMS, with a warning", async (t) => {
 	const mirror = "http://mirror.test/pi-bolt/";
 	const release = makeRelease();
 	const { fetch, asked } = fakeFetch(githubRoutes(release, "http://mirror.test/pi-bolt"));
 	const pkgDir = makePackage(t);
-	const env = { PIBOLT_DOWNLOAD_BASE: mirror, PIBOLT_ALLOW_UNSIGNED: "1" };
+	const env = { PIBOLT_DOWNLOAD_BASE: mirror, PIBOLT_ALLOW_UNSIGNED: sha256(release.SHA256SUMS).toUpperCase() };
 	const { promise, log } = run(pkgDir, { fetch, key: install.RELEASE_KEY, env });
 	assert.deepEqual(await promise, { variant: "x64", from: "http://mirror.test/pi-bolt", signed: false });
 	assert.ok(asked.every((url) => url.startsWith("http://mirror.test/pi-bolt/")));
-	assert.match(log.join("\n"), /note: http:\/\/mirror\.test\/pi-bolt has no signature for this release \(SHA256SUMS\.sig\): only its checksum was verified/);
+	assert.match(log.join("\n"), /WARNING: http:\/\/mirror\.test\/pi-bolt has no signature for this release \(SHA256SUMS\.sig\)/);
+});
+
+test("Windows: a signature that does not verify is refused, PIBOLT_ALLOW_UNSIGNED or not", async (t) => {
+	const release = makeRelease({ signer: newKey() });
+	const { fetch } = fakeFetch(githubRoutes(release, "http://mirror.test"));
+	const pkgDir = makePackage(t);
+	const env = { PIBOLT_DOWNLOAD_BASE: "http://mirror.test", PIBOLT_ALLOW_UNSIGNED: sha256(release.SHA256SUMS) };
+	await assert.rejects(run(pkgDir, { fetch, key: install.RELEASE_KEY, env }).promise, /signature does not verify/);
+	assertPlaceholder(pkgDir);
 });
 
 test("Windows: a mirror's signature is checked all the same", async (t) => {
@@ -478,6 +505,48 @@ test("Linux and macOS: the install script puts the launcher, with its #!/bin/sh,
 	assert.deepEqual(readdirSync(join(pkgDir, "bin")).sort(), ["pi-bolt", "pi-bolt.exe"]);
 });
 
+/** The folder whose presence tells the launcher it runs on macOS. */
+const MACOS_MARKER = "/System/Library/CoreServices";
+
+/** Makes the package's launcher look for macOS's folder at `marker` instead (a missing folder: as on Linux). */
+function launcherSeesMacosAt(pkgDir, marker) {
+	const file = join(pkgDir, "bin", "pi-bolt");
+	const text = readFileSync(file, "utf8");
+	assert.ok(text.includes(`[ -d ${MACOS_MARKER} ]`), "the launcher tests for macOS's folder");
+	writeFileSync(file, text.replaceAll(MACOS_MARKER, marker), { mode: 0o755 });
+}
+
+test("the launcher tells macOS from Linux without running uname", { skip: (!findSh() || process.platform === "win32") && "no sh" }, (t) => {
+	const pkgDir = makePackage(t);
+	const home = join(pkgDir, "home");
+	const ran = join(pkgDir, "uname-ran");
+	const bin = join(pkgDir, "fake-bin");
+	mkdirSync(bin);
+	writeFileSync(join(bin, "uname"), `#!/bin/sh\necho ran >> "${ran}"\necho Linux\n`, { mode: 0o755 });
+	const macosFolder = join(pkgDir, "System-Library-CoreServices");
+	mkdirSync(macosFolder);
+	for (const [platform, marker] of [
+		["linux", join(pkgDir, "no-such-folder")],
+		["darwin", macosFolder],
+	]) {
+		const dir = join(home, "npm", VERSION, `pi-bolt-${platform}-${platform === "linux" ? "x64" : "arm64"}`);
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "pi"), `#!/bin/sh\necho "${platform}: $* PIBOLT_NPM=$PIBOLT_NPM"\n`, { mode: 0o755 });
+		writeFileSync(join(pkgDir, "bin", "pi-bolt"), readFileSync(join(npmDir, "bin", "pi-bolt")));
+		launcherSeesMacosAt(pkgDir, marker);
+		install.installPosix({ pkgDir });
+		const env = { ...process.env, PIBOLT_HOME: home, PATH: `${bin}:${process.env.PATH}` };
+		// (On Linux the variant given, so that nothing else would be run to find it out.)
+		if (platform === "linux") env.PIBOLT_VARIANT = "x64";
+		else delete env.PIBOLT_VARIANT;
+		// As npm's link starts it: the file itself, through its #! line.
+		const result = spawnSync(join(pkgDir, "bin", "pi-bolt.exe"), ["--version"], { encoding: "utf8", env });
+		assert.equal(result.stdout, `${platform}: --version PIBOLT_NPM=1\n`, result.stderr);
+		assert.equal(result.status, 0);
+	}
+	assert.equal(existsSync(ran), false, "uname was not run");
+});
+
 /** sh, if there is one (Git's on Windows). */
 function findSh() {
 	const result = spawnSync("sh", ["-c", "echo ok"], { encoding: "utf8" });
@@ -494,6 +563,8 @@ function fakeUname(dir, system) {
 
 test("the placeholder, run without the install script: on Linux it starts the launcher; elsewhere it says what to run", { skip: !findSh() && "no sh" }, (t) => {
 	const pkgDir = makePackage(t);
+	// (Linux: no macOS folder, and uname says Linux.)
+	launcherSeesMacosAt(pkgDir, join(pkgDir, "no-such-folder"));
 	const separator = process.platform === "win32" ? ";" : ":";
 	// Elsewhere (Git Bash on Windows): how to run the install script, and a failure.
 	const windows = spawnSync("sh", [join(pkgDir, "bin", "pi-bolt.exe"), "--version"], {
@@ -519,6 +590,8 @@ test("the placeholder, run without the install script: on Linux it starts the la
 
 test("the launcher's first run of a version removes the versions installed before it", { skip: (!findSh() || process.platform === "win32") && "no sh" }, (t) => {
 	const pkgDir = makePackage(t);
+	// (Linux: no macOS folder, and uname says Linux.)
+	launcherSeesMacosAt(pkgDir, join(pkgDir, "no-such-folder"));
 	const home = join(pkgDir, "home");
 	// The installer, as far as the launcher sees it: it puts the build where PIBOLT_INSTALL says.
 	writeFileSync(
@@ -540,6 +613,81 @@ test("the launcher's first run of a version removes the versions installed befor
 	assert.equal(result.stdout, "the build: --version\n", result.stderr);
 	assert.equal(result.status, 0);
 	assert.deepEqual(readdirSync(join(home, "npm")).sort(), ["0.7.3", VERSION, "notes"]);
+});
+
+// #280: on a musl system (Alpine) the launcher runs the musl build, which install.sh names so.
+test("the launcher runs the musl build on a musl system", { skip: (!findSh() || process.platform === "win32") && "no sh" }, (t) => {
+	const pkgDir = makePackage(t);
+	// (Linux: no macOS folder, and uname says Linux.)
+	launcherSeesMacosAt(pkgDir, join(pkgDir, "no-such-folder"));
+	const home = join(pkgDir, "home");
+	const bin = fakeUname(pkgDir, "Linux");
+	writeFileSync(join(bin, "ldd"), "#!/bin/sh\necho 'musl libc (x86_64)' >&2\nexit 1\n", { mode: 0o755 });
+	for (const variant of ["x64", "x64-baseline", "x64-musl", "x64-musl-baseline"]) {
+		const dir = join(home, "npm", VERSION, `pi-bolt-linux-${variant}`);
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "pi"), `#!/bin/sh\necho "${variant}"\n`, { mode: 0o755 });
+	}
+	const env = { ...process.env, PIBOLT_HOME: home, PATH: `${bin}:${process.env.PATH}` };
+	delete env.PIBOLT_VARIANT;
+	const result = spawnSync("sh", [join(pkgDir, "bin", "pi-bolt")], { encoding: "utf8", env });
+	assert.equal(result.status, 0, result.stderr);
+	assert.match(result.stdout, /^x64-musl(-baseline)?\n$/);
+});
+
+// #280: BusyBox's ps (Alpine) has neither -A nor -ww; the launcher then lists the processes with `ps -o args`, so that a session
+// still running keeps its folder there too.
+test("the launcher's first run lists the processes with BusyBox's ps", { skip: (!findSh() || process.platform === "win32") && "no sh" }, (t) => {
+	const pkgDir = makePackage(t);
+	// (Linux: no macOS folder, and uname says Linux.)
+	launcherSeesMacosAt(pkgDir, join(pkgDir, "no-such-folder"));
+	const home = join(pkgDir, "home");
+	writeFileSync(
+		join(pkgDir, "install.sh"),
+		'mkdir -p "$PIBOLT_INSTALL/pi-bolt-linux-x64" && printf \'#!/bin/sh\\necho "the build"\\n\' > "$PIBOLT_INSTALL/pi-bolt-linux-x64/pi" && chmod 755 "$PIBOLT_INSTALL/pi-bolt-linux-x64/pi"\n',
+	);
+	const running = join(home, "npm", "0.7.3", "pi-bolt-linux-x64");
+	mkdirSync(running, { recursive: true });
+	mkdirSync(join(home, "npm", "0.7.4", "pi-bolt-linux-x64"), { recursive: true });
+	const bin = fakeUname(pkgDir, "Linux");
+	// (As BusyBox's: an unknown option is an error, and `-o args` lists every process.)
+	writeFileSync(
+		join(bin, "ps"),
+		`#!/bin/sh\ncase "$1" in -A) echo "ps: unrecognized option: A" >&2; exit 1 ;; esac\nprintf 'COMMAND\\n${running}/pi\\n'\n`,
+		{ mode: 0o755 },
+	);
+	const result = spawnSync("sh", [join(pkgDir, "bin", "pi-bolt")], {
+		encoding: "utf8",
+		env: { ...process.env, PIBOLT_HOME: home, PIBOLT_VARIANT: "x64", PATH: `${bin}:${process.env.PATH}` },
+	});
+	assert.equal(result.status, 0, result.stderr);
+	assert.deepEqual(readdirSync(join(home, "npm")).sort(), ["0.7.3", VERSION]);
+});
+
+// The first run is not asked for by the user: an opt-in to installing without a signature check, left in their environment, is
+// not passed on to the installer (which ignores it in the first run as well).
+test("the launcher's first run does not pass PIBOLT_UNVERIFIED on to the installer", { skip: (!findSh() || process.platform === "win32") && "no sh" }, (t) => {
+	const pkgDir = makePackage(t);
+	// (Linux: no macOS folder, and uname says Linux.)
+	launcherSeesMacosAt(pkgDir, join(pkgDir, "no-such-folder"));
+	const home = join(pkgDir, "home");
+	writeFileSync(
+		join(pkgDir, "install.sh"),
+		'mkdir -p "$PIBOLT_INSTALL/pi-bolt-linux-x64" && printf \'#!/bin/sh\\necho "the build"\\n\' > "$PIBOLT_INSTALL/pi-bolt-linux-x64/pi" && chmod 755 "$PIBOLT_INSTALL/pi-bolt-linux-x64/pi"\necho "installer: PIBOLT_UNVERIFIED=${PIBOLT_UNVERIFIED-unset} PIBOLT_LAUNCHER=$PIBOLT_LAUNCHER" >&2\n',
+	);
+	const result = spawnSync("sh", [join(pkgDir, "bin", "pi-bolt")], {
+		encoding: "utf8",
+		env: {
+			...process.env,
+			PIBOLT_HOME: home,
+			PIBOLT_VARIANT: "x64",
+			PIBOLT_UNVERIFIED: "1",
+			PATH: `${fakeUname(pkgDir, "Linux")}:${process.env.PATH}`,
+		},
+	});
+	assert.equal(result.status, 0, result.stderr);
+	assert.match(result.stderr, /installer: PIBOLT_UNVERIFIED=unset PIBOLT_LAUNCHER=1/);
+	assert.equal(result.stdout, "the build\n");
 });
 
 test("an archive entry's name: inside its folder, with / between its parts and no \\, :, .. or empty part", () => {

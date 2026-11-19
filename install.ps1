@@ -11,6 +11,8 @@
 #
 # Environment:
 #   PIBOLT_VERSION   a release tag such as bolt-v0.8.0 (default: the latest release)
+#   PIBOLT_CHANNEL   stable (the latest release; the default) or beta (the newest release, pre-releases included), for this
+#                    installation and its updates (`pi-bolt update --channel` changes it)
 #   PIBOLT_VARIANT   x64 (default), x64-baseline (any x86-64 CPU; picked when the CPU has no AVX2 and the release has one) or
 #                    x64-jit
 #   PIBOLT_INSTALL   where to install (default: %USERPROFILE%\.pi-bolt)
@@ -23,13 +25,17 @@
 #                    without asking. Without it the installer asks when it can; a run that cannot ask, or PIBOLT_YES=1,
 #                    installs none.
 #   PIBOLT_DOWNLOAD_BASE  a mirror of a release to download everything from (its SHA256SUMS.sig too)
-#   PIBOLT_ALLOW_UNSIGNED=1  install a release whose checksums have no signature (a build of your own); never needed otherwise
+#   PIBOLT_ALLOW_UNSIGNED  the SHA-256 of a release's SHA256SUMS (the installer shows it), to install that download although it
+#                    has no signature (a build of your own); never needed otherwise. It matches those checksums only, so a
+#                    value left in the environment does nothing for another download. A signature that does not verify always
+#                    stops the install.
 #
 # A folder given in PIBOLT_INSTALL outside your profile is made yours, SYSTEM's and the Administrators' only.
 
 # The public key that releases are signed with (keys/release.pub in the repository; scripts/sign-release.sh).
 $PiBoltReleaseKey = 'MCowBQYDK2VwAyEAoLboJqtKaoISPqffk03vHZr+1sRBG3uIRIWeKOew+aY='
 $PiBoltRepo = 'https://github.com/opensec-git/Pi-Bolt'
+$PiBoltApi = 'https://api.github.com/repos/opensec-git/Pi-Bolt'
 
 # --- Modules ---------------------------------------------------------------------------------------------------------------
 # PowerShell 7 passes its own module directories to everything it starts, and they come before this PowerShell's own. An
@@ -109,7 +115,15 @@ function Get-Ed25519Multiple($curve, $scalar, $point) {
 	$sum
 }
 
-# Whether $signature (64 bytes) is $publicKey's (32 bytes) signature of $message.
+# Whether $point's order is 1, 2, 4 or 8 ([8]P is the neutral point, X = 0 and Y = Z). Neither a public key nor a signature's R
+# has one; with them, a "signature" can verify for any message.
+function Test-Ed25519SmallOrder($curve, $point) {
+	$eight = Get-Ed25519Multiple $curve ([System.Numerics.BigInteger]8) $point
+	(Get-Ed25519Mod $curve $eight[0]).IsZero -and (Get-Ed25519Mod $curve ($eight[1] - $eight[2])).IsZero
+}
+
+# Whether $signature (64 bytes) is $publicKey's (32 bytes) signature of $message. Strict: A and R must be canonical encodings of
+# points on the curve (y < p; x = 0 only with its sign bit 0) of more than small order, and s below L (RFC 8032, 5.1.7).
 function Test-Ed25519Signature([byte[]]$publicKey, [byte[]]$message, [byte[]]$signature) {
 	if ($publicKey.Length -ne 32 -or $signature.Length -ne 64) { return $false }
 	if ($null -eq $message) { $message = [byte[]]::new(0) }
@@ -117,6 +131,7 @@ function Test-Ed25519Signature([byte[]]$publicKey, [byte[]]$message, [byte[]]$si
 	$A = Get-Ed25519Point $curve $publicKey
 	$R = Get-Ed25519Point $curve ([byte[]]$signature[0..31])
 	if ($null -eq $A -or $null -eq $R) { return $false }
+	if ((Test-Ed25519SmallOrder $curve $A) -or (Test-Ed25519SmallOrder $curve $R)) { return $false }
 	$s = ConvertFrom-Ed25519Bytes ([byte[]]$signature[32..63])
 	if ($s -ge $curve.L) { return $false }
 	$sha = [System.Security.Cryptography.SHA512]::Create()
@@ -159,6 +174,14 @@ function Stop-PiBolt([string]$message) {
 }
 
 # --- Steps ------------------------------------------------------------------------------------------------------------
+
+# Whether the user let the download whose SHA256SUMS has the SHA-256 $hash be installed without a signature:
+# PIBOLT_ALLOW_UNSIGNED is that SHA-256, which no other download has (a value kept in the environment does not let another
+# release in). Never in the npm package's first run (PIBOLT_LAUNCHER).
+function Test-PiBoltUnsignedAllowed([string]$hash) {
+	$allowed = $env:PIBOLT_ALLOW_UNSIGNED
+	$env:PIBOLT_LAUNCHER -ne '1' -and $allowed -and $allowed.Trim().ToLowerInvariant() -eq $hash
+}
 
 function Test-PiBoltPrerequisites {
 	$problems = @()
@@ -450,9 +473,13 @@ function Install-PiBoltRelease($state) {
 				Stop-PiBolt "the release's signature does not verify: the download is not Pi-Bolt's. Nothing was installed."
 			}
 			$signed = $true
-		} elseif ($env:PIBOLT_ALLOW_UNSIGNED -ne '1') {
+		} else {
 			# (A mirror, PIBOLT_DOWNLOAD_BASE, copies the signature too: it is not a reason to do without it.)
-			Stop-PiBolt "the release has no signature (SHA256SUMS.sig), and every Windows release is signed. Nothing was installed."
+			$sumsHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $sums).Hash.ToLowerInvariant()
+			if (-not (Test-PiBoltUnsignedAllowed $sumsHash)) {
+				$stale = if ($env:PIBOLT_ALLOW_UNSIGNED) { ' (PIBOLT_ALLOW_UNSIGNED is set, but not to this download''s SHA-256: it applies to one download only)' } else { '' }
+				Stop-PiBolt "the release has no signature (SHA256SUMS.sig), and every Windows release is signed. Nothing was installed$stale. Only for a build of your own: run the installer again with PIBOLT_ALLOW_UNSIGNED=$sumsHash, the SHA-256 of its SHA256SUMS."
+			}
 		}
 		# The signature covers the files, and the first line says which release they are: without it, an older release (signed all the
 		# same) could be served as a newer one.
@@ -517,11 +544,32 @@ function Install-PiBoltRelease($state) {
 		New-Item -ItemType Directory -Force -Path $state.Dir | Out-Null
 		if ($made) { Protect-PiBoltFolder $made }
 		Protect-PiBoltFolder $state.Dir
+		# The build this replaces is kept as <folder>.previous, for `pi-bolt update --rollback`: copied, since a running Pi-Bolt
+		# (`pi-bolt update`) keeps its folder from being renamed. The same build installed again (the same pi-bolt.txt) is not.
+		$current = Join-Path $state.Dir 'pi-bolt.txt'
+		$incoming = Join-Path (Join-Path $unpacked $name) 'pi-bolt.txt'
+		if ($env:PIBOLT_LAUNCHER -ne '1' -and (Test-Path -LiteralPath (Join-Path $state.Dir 'pi-bolt.exe')) -and
+			-not ((Test-Path -LiteralPath $current) -and (Get-Content -LiteralPath $current -Raw) -eq (Get-Content -LiteralPath $incoming -Raw))) {
+			$previous = "$($state.Dir).previous"
+			Show-PiBoltProgress 'keeping the build it replaces'
+			try {
+				if (Test-Path -LiteralPath $previous) { Remove-Item -LiteralPath $previous -Recurse -Force -ErrorAction Stop }
+				Copy-Item -LiteralPath $state.Dir -Destination $previous -Recurse -ErrorAction Stop
+				Get-ChildItem -LiteralPath $previous -Recurse -File | Where-Object { $_.Name -like '*.pibolt-old' -or $_.Name -like '*.pibolt-new' } |
+					Remove-Item -Force -ErrorAction SilentlyContinue
+				Protect-PiBoltFolder $previous
+			} catch {
+				Clear-PiBoltProgress
+				Write-Host "  ${dim}the build this replaces was not kept ($($_.Exception.Message)): pi-bolt update --rollback has none to go back to$reset"
+			}
+		}
 		Install-PiBoltFiles (Join-Path $unpacked $name) $state.Dir
+		# No build ships the mobile UI skill: the copy an earlier build left in this folder goes.
+		Remove-Item -LiteralPath (Join-Path $state.Dir 'skills\pibolt-mobile-ui') -Recurse -Force -ErrorAction SilentlyContinue
 		Clear-PiBoltProgress
 		$size = (Get-Item -LiteralPath $file).Length
 		Write-Host ("  $green" + 'ok' + "$reset install complete $dim($($state.Platform)-$($state.Variant), $(Format-MB $size) MB from $from$(if ($signed) { ', signature verified' }))$reset")
-		if (-not $signed) { Write-Host "  ${dim}note: $from has no signature for this release (SHA256SUMS.sig): only its checksum was verified$reset" }
+		if (-not $signed) { [Console]::Error.WriteLine("  $bold${red}WARNING:$reset $from has no signature for this release (SHA256SUMS.sig). It was installed because PIBOLT_ALLOW_UNSIGNED is the SHA-256 of its SHA256SUMS: that checksum is all that shows what it is.") }
 	} finally {
 		Clear-PiBoltProgress
 		Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
@@ -568,8 +616,7 @@ function Add-PiBoltToPath([string]$dir, [bool]$existed = $false) {
 			return
 		}
 		if (Test-PiBoltCanAsk) {
-			Write-Host -NoNewline "`nAdd $dir to your PATH (for your user account)? [Y/n] "
-			$answer = Read-Host
+			$answer = Read-PiBoltAnswer "`nAdd $dir to your PATH (for your user account)? [Y/n] "
 			if ($answer -match '^(n|no)$') {
 				Write-Host "Not added. Run Pi-Bolt as:`n`n  & '$dir\pi-bolt.exe'"
 				return
@@ -599,6 +646,21 @@ function Test-PiBoltCanAsk { $env:PIBOLT_YES -ne '1' -and [Environment]::UserInt
 
 function Read-PiBoltKey {
 	try { return [string][Console]::ReadKey($true).KeyChar } catch { return '' }
+}
+
+# Clear-PiBoltTypeahead: drops what was typed at the console before a question. Read-PiBoltKey takes one key, so the Enter typed
+# after it stays in the console's input, and would answer the next question with its default (#103). Without a console to read
+# (input redirected, say) [Console]::KeyAvailable throws, and nothing was typed ahead.
+function Clear-PiBoltTypeahead {
+	try { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } } catch { }
+}
+
+# Read-PiBoltAnswer PROMPT: asks a question and returns the line typed after it. What was typed before is dropped before the
+# question is shown, so an answer typed as soon as it appears is kept.
+function Read-PiBoltAnswer([string]$prompt) {
+	Clear-PiBoltTypeahead
+	Write-Host -NoNewline $prompt
+	Read-Host
 }
 
 function Select-PiBoltAction($state) {
@@ -725,8 +787,7 @@ function Install-PiBoltExtensions($state) {
 	if (-not $choice) {
 		Write-Host "`n${bold}Optional extensions by OpenSec$reset $dim(open source, built for Pi-Bolt)$reset`n"
 		foreach ($e in $wanted) { Write-Host ("  $cyan{0,-22}$reset {1}" -f $e.Package, $e.What) }
-		Write-Host -NoNewline "`nInstall them? [Y/n] "
-		if ((Read-Host) -match '^(n|no)$') { Write-Host "${dim}You can install them later with: pi-bolt install npm:<name>$reset"; return }
+		if ((Read-PiBoltAnswer "`nInstall them? [Y/n] ") -match '^(n|no)$') { Write-Host "${dim}You can install them later with: pi-bolt install --pi-bolt npm:<name>$reset"; return }
 	}
 	$registry = if ($env:PIBOLT_NPM_REGISTRY) { $env:PIBOLT_NPM_REGISTRY.TrimEnd('/') } else { 'https://registry.npmjs.org' }
 	foreach ($e in $wanted) {
@@ -744,7 +805,7 @@ function Install-PiBoltExtensions($state) {
 		# to settle it, and with them the one just downloaded, before its pin is compared.)
 		Push-Location -LiteralPath (Split-Path $exe)
 		try {
-			$out = & $exe install "npm:$spec" 2>&1
+			$out = & $exe install --pi-bolt "npm:$spec" 2>&1
 			$installed = $LASTEXITCODE -eq 0
 		} finally {
 			Pop-Location
@@ -757,18 +818,18 @@ function Install-PiBoltExtensions($state) {
 			if ($check -ne 'same') {
 				# (Not known is not the pin either: what was installed is a download the installer has not seen.)
 				Push-Location -LiteralPath (Split-Path $exe)
-				try { & $exe remove "npm:$spec" *> $null; $removed = $LASTEXITCODE -eq 0 } finally { Pop-Location }
+				try { & $exe remove --pi-bolt "npm:$spec" *> $null; $removed = $LASTEXITCODE -eq 0 } finally { Pop-Location }
 				$why = if ($check -eq 'different') { 'is not the one this release pins' } else { 'cannot be checked against the pin (no lockfile says what it is)' }
 				if ($removed) { Write-Host "  ${red}removed $spec again: what the package manager installed $why$reset" }
-				else { Write-Host "  ${red}$spec $why, and removing it failed: remove it yourself (pi-bolt remove npm:$spec)$reset" }
-				Write-Host "  ${dim}Install it yourself if you want it: pi-bolt install npm:$spec$reset"
+				else { Write-Host "  ${red}$spec $why, and removing it failed: remove it yourself (pi-bolt remove --pi-bolt npm:$spec)$reset" }
+				Write-Host "  ${dim}Install it yourself if you want it: pi-bolt install --pi-bolt npm:$spec$reset"
 				continue
 			}
 		}
 		if ($installed) { Write-Host "  ${green}ok$reset $spec installed" }
 		else {
 			Write-Host "  ${red}could not install $($e.Package) (Pi-Bolt itself is installed): $(($out | Select-Object -Last 1))$reset"
-			Write-Host "  ${dim}Install it later with: pi-bolt install npm:$($e.Package)$reset"
+			Write-Host "  ${dim}Install it later with: pi-bolt install --pi-bolt npm:$($e.Package)$reset"
 		}
 	}
 }
@@ -783,6 +844,8 @@ function Install-PiBolt {
 	Test-PiBoltPrerequisites
 
 	$version = if ($env:PIBOLT_VERSION) { $env:PIBOLT_VERSION } else { 'latest' }
+	$channel = $env:PIBOLT_CHANNEL
+	if ($channel -and $channel -notin 'stable', 'beta') { Stop-PiBolt 'PIBOLT_CHANNEL must be stable or beta' }
 	$source = if ($env:PIBOLT_SOURCE) { $env:PIBOLT_SOURCE } else { 'auto' }
 	if ($source -notin 'auto', 'npm', 'github') { Stop-PiBolt 'PIBOLT_SOURCE must be auto, npm or github' }
 	$variant = $env:PIBOLT_VARIANT
@@ -793,6 +856,16 @@ function Install-PiBolt {
 	if ($version -ne 'latest') {
 		if ($version -notmatch '^bolt-v(\d+\.\d+\.\d+)$') { Stop-PiBolt 'PIBOLT_VERSION must be a release tag such as bolt-v0.8.0' }
 		$shown = $Matches[1]
+	} elseif (-not $env:PIBOLT_DOWNLOAD_BASE -and $channel -eq 'beta') {
+		# The newest release, pre-releases included: the highest bolt-vX.Y.Z tag GitHub lists (it lists no drafts to anyone without
+		# write access).
+		try {
+			$releases = (New-PiBoltClient).GetStringAsync("$PiBoltApi/releases?per_page=30").GetAwaiter().GetResult() | ConvertFrom-Json
+			$newest = $releases | Where-Object { -not $_.draft -and $_.tag_name -match '^bolt-v\d+\.\d+\.\d+$' } |
+				ForEach-Object { [version]($_.tag_name -replace '^bolt-v', '') } | Sort-Object -Descending | Select-Object -First 1
+			if ($newest) { $shown = $newest.ToString() }
+		} catch { }
+		if (-not $shown) { Stop-PiBolt "could not find the newest release ($PiBoltApi/releases): try again, or set PIBOLT_VERSION=bolt-vX.Y.Z" }
 	} elseif (-not $env:PIBOLT_DOWNLOAD_BASE) {
 		try {
 			$response = (New-PiBoltClient).GetAsync("$PiBoltRepo/releases/latest").GetAwaiter().GetResult()
@@ -840,24 +913,32 @@ function Install-PiBolt {
 			Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
 			if (Test-Path -LiteralPath $dir.FullName) { Write-Host "  ${dim}$($dir.FullName) is in use (is Pi-Bolt running?): close it, then remove the folder$reset" }
 		}
+		foreach ($item in 'cache', 'compile.json', 'channel', 'auto-update.json', 'auto-update.log', 'auto-update.lock') {
+			Remove-Item -LiteralPath (Join-Path $install $item) -Recurse -Force -ErrorAction SilentlyContinue
+		}
 		if ((Test-Path -LiteralPath $install) -and -not (Get-ChildItem -LiteralPath $install -Force)) { Remove-Item -LiteralPath $install -Force }
 		Write-Host "`nPi-Bolt was uninstalled."
 		return
 	}
 	Install-PiBoltRelease $state
+	# The channel this installation's updates take (Pi-Bolt reads <install>\channel; stable, the default, is no file).
+	if ($channel -eq 'beta') { Set-Content -LiteralPath (Join-Path $install 'channel') -Value 'beta' -Encoding ascii }
+	elseif ($channel -eq 'stable') { Remove-Item -LiteralPath (Join-Path $install 'channel') -Force -ErrorAction SilentlyContinue }
 	$exe = Join-Path $state.Dir 'pi-bolt.exe'
 	# Pi-Bolt keeps the packages only it runs (OpenSec's extensions) out of Pi's list, which it does as it starts: once now, so
 	# that Pi, if it is started before Pi-Bolt, does not find them (an earlier installer put them there).
 	Push-Location -LiteralPath $state.Dir
 	try { & $exe list *> $null } catch { } finally { Pop-Location }
+	# A remote control service that runs (an earlier version's) is restarted, so it runs this version; nothing when none runs.
+	Push-Location -LiteralPath $state.Dir
+	try { & $exe service restart *> $null } catch { } finally { Pop-Location }
 	$word = if ($action -eq 'reinstall' -and $state.Installed -and $state.Installed -ne $state.Shown) { 'updated' } elseif ($action -eq 'reinstall') { 'reinstalled' } else { 'installed' }
 	Write-Host "`nPi-Bolt $($state.Shown) was $word successfully $dim(Pi $(& $exe --version))$reset."
 	Add-PiBoltToPath $state.Dir ([bool]$state.Existed)
 	Install-PiBoltExtensions $state
 	if ((Get-Command pi-bolt -ErrorAction SilentlyContinue).Source -ieq $exe) { Write-Host "`nRun it with: ${bold}pi-bolt$reset" }
 	if ((Test-PiBoltCanAsk) -and $env:PIBOLT_NO_START -ne '1') {
-		Write-Host -NoNewline "`nStart pi-bolt now? [Y/n] "
-		if ((Read-Host) -notmatch '^(n|no)$') { Write-Host ''; & $exe }
+		if ((Read-PiBoltAnswer "`nStart pi-bolt now? [Y/n] ") -notmatch '^(n|no)$') { Write-Host ''; & $exe }
 	}
 }
 

@@ -18,7 +18,8 @@ Add `"$schema": "https://pi.dev/schemas/settings.schema.json"` to `settings.json
 | `enabledModels` | `string[]` | All available models | Model patterns used for startup selection and model cycling. Uses the same format as `--models`. |
 | `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in the transcript. |
 | `showCacheMissNotices` | boolean | `false` | Show notices for significant cache misses, successful cache warming, compaction usage, and provider recovery. |
-| `cacheWarming` | `"off" \| "streaming" \| "idle"` | `"streaming"` | Keep eligible provider prompt caches warm during active runs or, with `"idle"`, between runs. Global setting only. |
+| `shadedCodeBlocks` | boolean | `false` | Render code blocks on a background (the `mdCodeBlockBg` theme color) with the language label above, instead of between literal ``` fence lines. |
+| `cacheWarming` | `"off" \| "streaming" \| "idle"` | `"streaming"` | Keep eligible provider prompt caches warm during active runs and, with `"idle"`, for up to 30 minutes between runs. `"idle"` re-sends the session's last request while you are away, and each refresh is billed. Global setting only. |
 
 Cache warming runs only when the model declares a cache lifetime and Pi estimates at least $0.05 in avoided cache-miss cost. Refresh usage counts toward session totals but does not enter model context. `/session` shows the next decision; extensions can override it with `cache_warming_decision`. See [Prompt Cache Lifetimes](models.md#prompt-cache-lifetimes).
 
@@ -39,7 +40,7 @@ See [Choose a Model](models.md) for model selection and thinking controls.
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
-| `defaultTools` | `string[]` | `read`, `bash`, `edit`, `write` | Tools enabled at startup. Plain names replace the defaults; `+name` adds a tool and `-name` removes one. An empty array disables all built-in tools but not extension or SDK tools. |
+| `defaultTools` | `string[]` | `read`, `bash`, `edit`, `write` (Pi-Bolt: also `grep` and `find`, unless FFF's extension is loaded) | Tools enabled at startup. Plain names replace the defaults; `+name` adds a tool and `-name` removes one. An empty array disables all built-in tools but not extension or SDK tools. |
 | `codemode.mode` | `"on"` \| `"only"` | `"on"` | How the `codemode` tool presents tools while it is active. `on`: declared tools get a note on calling them from scripts appended to their description, and `codemode` lists only tools that are not declared. `only`: `codemode` lists every tool scripts can call, and active built-in and extension tools are hidden from the model, so it reaches them through `codemode`. |
 | `codemode.inlineBudget` | number | `3000` | Estimated tokens (characters / 4) the `codemode` tool's description may spend on tool declarations. Tools that do not fit are left out and found with `searchTools()`. `0` lists only namespaces. |
 
@@ -53,7 +54,7 @@ A list of only `+name` and `-name` entries changes the inherited selection inste
 }
 ```
 
-This replaces `bash` with `powershell` and enables `grep`: `["-bash", "+powershell", "+grep"]`. Project settings apply on top of user settings: a project list with only `+name` and `-name` entries changes the user's selection, and a project list with a plain name replaces it. In one list, plain names form the selection, and `+name` and `-name` then apply in order.
+This replaces `bash` with `powershell` and enables `grep`: `["-bash", "+powershell", "+grep"]`. In Pi-Bolt, `["-grep", "-find"]` turns off its built-in search tools, for example when another extension provides search tools. Project settings apply on top of user settings: a project list with only `+name` and `-name` entries changes the user's selection, and a project list with a plain name replaces it. In one list, plain names form the selection, and `+name` and `-name` then apply in order.
 
 `/reload` enables tools newly added to `defaultTools`. It does not disable tools removed from it or re-enable unchanged tools you turned off. `--tools` with plain names, `--no-tools`, and `--no-builtin-tools` override `defaultTools`, also on reload.
 
@@ -64,19 +65,30 @@ CLI tool options override this setting for one invocation. `--tools` with only `
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `sessionDir` | string | Agent session directory | Session storage directory. Relative paths resolve from the working directory. `PI_CODING_AGENT_SESSION_DIR` and `--session-dir` override this setting. |
+| `sessionShareDestination` | `"auto" \| "gist" \| "radius"` | `"auto"` | Destination used by `/share`. `auto` uses Radius when authenticated and otherwise creates a GitHub gist. `gist` always uses a gist. `radius` requires Radius authentication and never falls back to a gist. |
 
 ### Compaction
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `compaction.enabled` | boolean | `true` | Enable automatic compaction. |
-| `compaction.reserveTokens` | number | `16384` | Tokens reserved for the model response. |
-| `compaction.keepRecentTokens` | number | `20000` | Recent tokens retained without summarization. |
+| `compaction.reserveTokens` | number | `16384` | Tokens reserved for the model response. Setting it turns off the `thresholdPercent` default and the context-window share of the summary cap. |
+| `compaction.keepRecentTokens` | number | Larger of `20000` and 5% of the context window | Recent tokens retained without summarization. |
+| `compaction.thresholdPercent` | number | `90` while `reserveTokens` is unset | Also compact above this percentage of the context window when that is below `contextWindow - reserveTokens`. |
+| `compaction.summaryMaxTokens` | number | Largest of 80% of `reserveTokens`, `4096` and 3.2% of the context window | Output cap of a compaction summary; a split turn's prefix gets half. The window share applies only while `reserveTokens` is unset. |
 | `compaction.modelOverrides` | object | None | Per-model token settings keyed by exact `provider/modelId`. |
+
+The defaults scale with the context window only while the matching setting is unset:
+
+| Context window | Compacts above | Kept recent tokens | Summary cap |
+|---|---|---|---|
+| 128K | 111616 | 20000 | 13107 |
+| 200K | 180000 | 20000 | 13107 |
+| 1M | 900000 | 50000 | 32000 |
 
 <a id="per-model-compaction-overrides"></a>
 
-Compaction token values must be non-negative safe integers. Each value resolves independently from the matching model override, then the ordinary compaction setting, then the built-in default. Project and user objects merge before model lookup.
+`reserveTokens` and `keepRecentTokens` must be non-negative safe integers, `thresholdPercent` an integer from 1 to 100, and `summaryMaxTokens` a positive safe integer. Each value resolves independently from the matching model override, then the ordinary compaction setting, then the built-in default. Project and user objects merge before model lookup.
 
 See [Compaction Reference](compaction.md) for trigger, summarization, and validation behavior.
 
@@ -104,7 +116,7 @@ See [Compaction Reference](compaction.md) for trigger, summarization, and valida
 | `showHardwareCursor` | boolean | `false` | Use the terminal cursor instead of Pi's drawn cursor. Pi still positions it for input methods. |
 | `terminal.showImages` | boolean | `true` | Display inline images when supported. |
 | `terminal.imageWidthCells` | number | `60` | Preferred inline image width in terminal cells. |
-| `terminal.clearOnShrink` | boolean | `false` | Clear empty rows when rendered content shrinks. |
+| `terminal.clearOnShrink` | boolean | `false` | Clear empty rows when rendered content shrinks. When unset, `PI_CLEAR_ON_SHRINK=1` enables it. |
 | `terminal.showTerminalProgress` | boolean | `false` | Show OSC 9;4 progress in the terminal tab. |
 | `terminal.hyperlinks` | `boolean \| "auto"` | `"auto"` | Override OSC 8 hyperlink detection. |
 | `terminal.images` | `"kitty" \| "iterm2" \| "auto" \| false` | `"auto"` | Override inline-image protocol detection. |
@@ -122,12 +134,12 @@ See [Themes](themes.md) and [Terminal Setup](terminal-setup.md) for format and p
 |---|---|---|---|
 | `transport` | `"auto" \| "sse" \| "websocket" \| "websocket-cached"` | `"auto"` | Preferred transport for AI providers that support multiple transports. |
 | `httpProxy` | string | None | Proxy URL applied as `HTTP_PROXY` and `HTTPS_PROXY` for Pi-managed HTTP clients. **Can only be set in agent-directory settings.** |
-| `httpIdleTimeoutMs` | number | `300000` | HTTP header and body idle timeout in milliseconds. Set to `0` to disable. |
-| `websocketConnectTimeoutMs` | number | `15000` | WebSocket connection timeout in milliseconds. Set to `0` to disable. |
+| `httpIdleTimeoutMs` | number \| `"disabled"` | `300000` | HTTP header and body idle timeout in milliseconds. Set to `0` or `"disabled"` to disable. |
+| `websocketConnectTimeoutMs` | number \| `"disabled"` | `15000` | WebSocket connection timeout in milliseconds. Set to `0` or `"disabled"` to disable. |
 | `retry.enabled` | boolean | `true` | Enable automatic agent-level retry for transient failures. |
 | `retry.maxRetries` | number | `3` | Maximum agent-level retry attempts. |
 | `retry.baseDelayMs` | number | `2000` | Initial exponential-backoff delay in milliseconds. |
-| `retry.maxAgentDelayMs` | number | `60000` | Maximum agent-level retry delay in milliseconds. |
+| `retry.maxAgentDelayMs` | number | `60000` | Maximum agent-level retry delay in milliseconds. A longer `Retry-After` from the server is honoured up to this limit. |
 | `retry.provider.timeoutMs` | number | `httpIdleTimeoutMs` | Provider request timeout in milliseconds. |
 | `retry.provider.maxRetries` | number | `0` | Provider-level retry attempts. |
 | `retry.provider.maxRetryDelayMs` | number | `60000` | Maximum server-requested delay in milliseconds. Set to `0` to disable the limit. |
@@ -141,6 +153,7 @@ Keep `retry.provider.maxRetries` at `0` unless provider-level retries are requir
 | `shellPath` | string | Platform default | Custom shell executable path. Supports a leading `~`. |
 | `shellCommandPrefix` | string | None | Prefix prepended to every shell command. |
 | `npmCommand` | `string[]` | `npm` | Command and arguments used for npm package lookup and installation. A compiled Bun executable (such as Pi-Bolt) without `npm` on `PATH` uses the bun package manager built into it. |
+| `selfUpdateCommand` | `string[]` | None | Command and arguments `pi update` runs to update Pi itself, with `{packageName}`, `{version}`, and `{installSpec}` placeholders. `PI_SELF_UPDATE_COMMAND` takes precedence. **Can only be set in agent-directory settings.** See [Custom update command](cli.md#custom-update-command). |
 
 See [Shell aliases](shell-aliases.md) for shell setup and [Pi Packages](packages.md) for package-manager behavior.
 
@@ -165,7 +178,7 @@ The built-in extensions are named `builtin:mcp`, `builtin:llama.cpp`, `builtin:c
 
 | Setting | Type | Default | Description |
 |---|---|---|---|
-| `collapseChangelog` | boolean | `false` | Show a condensed changelog after an update. |
+| `collapseChangelog` | boolean | `false` | Show a condensed changelog after an update. Also condenses extension package changelogs to one line per package. |
 | `enableInstallTelemetry` | boolean | `true` | Enable anonymous install/update reporting and selected provider attribution headers. Does not control update checks. |
 | `enableAnalytics` | boolean | `false` | Opt in to analytics data sharing. Currently used only by the experimental first-run setup. |
 | `warnings.anthropicExtraUsage` | boolean | `true` | Warn when Anthropic subscription authentication may use paid extra usage. |

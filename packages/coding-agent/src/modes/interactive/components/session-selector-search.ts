@@ -23,27 +23,83 @@ function normalizeWhitespaceLower(text: string): string {
 	return text.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-interface SessionSearchText {
-	text: string;
+/**
+ * Match tiers, best first. Each token is scored by the best field it matches; tiers dominate
+ * fuzzy scores so an exact hit anywhere beats a scattered subsequence in a short field.
+ */
+const TIER_NAME = 0; // query text appears in the session name
+const TIER_TEXT = 1; // query text appears in the session id, messages, or cwd
+const TIER_FUZZY = 2; // query characters appear scattered in the session name or cwd
+const TIER_WEIGHT = 1_000_000;
+
+interface LowercaseCache {
+	source: string;
 	lower: string;
 	normalized?: string;
 }
 
 /**
- * The search text of each session, made once. The text of a session is all of its messages: making it, lowercasing it
- * (fuzzyMatch()) and normalizing it again for every session on every key typed in the search box goes over all the text
- * of every session each time.
+ * Lowercased message text per session. allMessagesText holds every user/assistant message and
+ * can be megabytes, so lowercase it once instead of on every keystroke.
  */
-const sessionSearchTexts = new WeakMap<SessionInfo, SessionSearchText>();
+const messageTextCache = new WeakMap<SessionInfo, LowercaseCache>();
 
-function getSessionSearchText(session: SessionInfo): SessionSearchText {
-	let entry = sessionSearchTexts.get(session);
-	if (!entry) {
-		const text = `${session.id} ${session.name ?? ""} ${session.allMessagesText} ${session.cwd}`;
-		entry = { text, lower: text.toLowerCase() };
-		sessionSearchTexts.set(session, entry);
+function getMessageText(session: SessionInfo): LowercaseCache {
+	let cached = messageTextCache.get(session);
+	if (!cached || cached.source !== session.allMessagesText) {
+		cached = { source: session.allMessagesText, lower: session.allMessagesText.toLowerCase() };
+		messageTextCache.set(session, cached);
 	}
-	return entry;
+	return cached;
+}
+
+function getNormalizedMessageText(session: SessionInfo): string {
+	const cached = getMessageText(session);
+	cached.normalized ??= cached.lower.replace(/\s+/g, " ").trim();
+	return cached.normalized;
+}
+
+function tierScore(tier: number, score = 0): number {
+	return tier * TIER_WEIGHT + score;
+}
+
+/** Exact (case-insensitive) text match. Messages and ids are only matched exactly: scattered matches in them are noise. */
+function matchLiteralToken(session: SessionInfo, value: string): number | undefined {
+	const name = session.name?.toLowerCase() ?? "";
+	if (name.includes(value)) return tierScore(TIER_NAME, fuzzyMatch(value, name).score);
+	if (session.id.toLowerCase().includes(value)) return tierScore(TIER_TEXT);
+	if (getMessageText(session).lower.includes(value)) return tierScore(TIER_TEXT);
+	if (session.cwd.toLowerCase().includes(value)) return tierScore(TIER_TEXT);
+	return undefined;
+}
+
+function matchFuzzyToken(session: SessionInfo, value: string): number | undefined {
+	const literal = matchLiteralToken(session, value.toLowerCase());
+	if (literal !== undefined) return literal;
+
+	let best: number | undefined;
+	for (const field of [session.name ?? "", session.cwd]) {
+		const m = fuzzyMatch(value, field);
+		if (m.matches && (best === undefined || m.score < best)) best = m.score;
+	}
+	return best === undefined ? undefined : tierScore(TIER_FUZZY, best);
+}
+
+function matchPhraseToken(session: SessionInfo, phrase: string): number | undefined {
+	const name = normalizeWhitespaceLower(session.name ?? "");
+	if (name.includes(phrase)) return tierScore(TIER_NAME, fuzzyMatch(phrase, name).score);
+	if (session.id.toLowerCase().includes(phrase)) return tierScore(TIER_TEXT);
+	if (getNormalizedMessageText(session).includes(phrase)) return tierScore(TIER_TEXT);
+	if (normalizeWhitespaceLower(session.cwd).includes(phrase)) return tierScore(TIER_TEXT);
+	return undefined;
+}
+
+function matchRegex(session: SessionInfo, regex: RegExp): number | undefined {
+	if (session.name && regex.test(session.name)) return tierScore(TIER_NAME);
+	if (regex.test(session.id) || regex.test(session.allMessagesText) || regex.test(session.cwd)) {
+		return tierScore(TIER_TEXT);
+	}
+	return undefined;
 }
 
 export function hasSessionName(session: SessionInfo): boolean {
@@ -132,41 +188,32 @@ export function parseSearchQuery(query: string): ParsedSearchQuery {
 	return { mode: "tokens", tokens, regex: null };
 }
 
+/**
+ * Each field is matched separately, so a token never matches across field boundaries.
+ * Different tokens may match different fields.
+ */
 export function matchSession(session: SessionInfo, parsed: ParsedSearchQuery): MatchResult {
-	const searchText = getSessionSearchText(session);
-	const text = searchText.text;
-
 	if (parsed.mode === "regex") {
 		if (!parsed.regex) {
 			return { matches: false, score: 0 };
 		}
-		const idx = text.search(parsed.regex);
-		if (idx < 0) return { matches: false, score: 0 };
-		return { matches: true, score: idx * 0.1 };
-	}
-
-	if (parsed.tokens.length === 0) {
-		return { matches: true, score: 0 };
+		const score = matchRegex(session, parsed.regex);
+		return score === undefined ? { matches: false, score: 0 } : { matches: true, score };
 	}
 
 	let totalScore = 0;
 
 	for (const token of parsed.tokens) {
+		let score: number | undefined;
 		if (token.kind === "phrase") {
-			searchText.normalized ??= normalizeWhitespaceLower(searchText.lower);
-			const normalizedText = searchText.normalized;
 			const phrase = normalizeWhitespaceLower(token.value);
 			if (!phrase) continue;
-			const idx = normalizedText.indexOf(phrase);
-			if (idx < 0) return { matches: false, score: 0 };
-			totalScore += idx * 0.1;
-			continue;
+			score = matchPhraseToken(session, phrase);
+		} else {
+			score = matchFuzzyToken(session, token.value);
 		}
-
-		// (Lowercasing text that has no capital letters in it gives the same string, without a copy.)
-		const m = fuzzyMatch(token.value, searchText.lower);
-		if (!m.matches) return { matches: false, score: 0 };
-		totalScore += m.score;
+		if (score === undefined) return { matches: false, score: 0 };
+		totalScore += score;
 	}
 
 	return { matches: true, score: totalScore };

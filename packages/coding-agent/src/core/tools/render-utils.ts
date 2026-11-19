@@ -1,20 +1,23 @@
-import * as os from "node:os";
 import { pathToFileURL } from "node:url";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
-import { getCapabilities, getImageDimensions, hyperlink, imageFallback } from "@earendil-works/pi-tui";
+import {
+	getCapabilities,
+	getImageDimensions,
+	hyperlink,
+	imageFallback,
+	type SanitizedTerminalText,
+	sanitizeTerminalText,
+	sanitizeTerminalTextFrom,
+} from "@earendil-works/pi-tui";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../../utils/ansi.ts";
-import { resolvePath } from "../../utils/paths.ts";
+import { resolvePath, shortenHomePath } from "../../utils/paths.ts";
 import { sanitizeBinaryOutput } from "../../utils/shell.ts";
 import type { ToolRenderContext } from "../extensions/types.ts";
 
 export function shortenPath(path: unknown): string {
 	if (typeof path !== "string") return "";
-	const home = os.homedir();
-	if (path.startsWith(home)) {
-		return `~${path.slice(home.length)}`;
-	}
-	return path;
+	return shortenHomePath(path);
 }
 
 export function linkPath(styledText: string, rawPath: string, cwd: string): string {
@@ -23,10 +26,61 @@ export function linkPath(styledText: string, rawPath: string, cwd: string): stri
 	return hyperlink(styledText, pathToFileURL(absolutePath).href);
 }
 
+/**
+ * A tool call argument as text to show, or null when it is not a string. The model wrote it: escape sequences in it are
+ * removed (sanitizeTerminalText()), so it cannot draw over the call's header or its command line.
+ */
 export function str(value: unknown): string | null {
-	if (typeof value === "string") return value;
+	if (typeof value === "string") return sanitizeArgument(value);
 	if (value == null) return "";
 	return null;
+}
+
+/**
+ * Long arguments str() sanitised last, most recent last. An argument streaming in (a file's content) is shown again for
+ * each chunk: what was sanitised of it the time before is kept, and only the text added since is gone through.
+ */
+const sanitizedArguments: SanitizedTerminalText[] = [];
+const SANITIZED_ARGUMENTS_KEPT = 4;
+/** Shorter arguments (a path, a pattern) are sanitised whole: that costs less than looking for them. */
+const SANITIZED_ARGUMENT_MIN_LENGTH = 1024;
+
+/** sanitizeTerminalText(text), from what a shorter text it begins with was sanitised to when there is one. */
+function sanitizeArgument(text: string): string {
+	if (text.length < SANITIZED_ARGUMENT_MIN_LENGTH) return sanitizeTerminalText(text);
+	let previous: SanitizedTerminalText | undefined;
+	for (let i = sanitizedArguments.length - 1; i >= 0; i--) {
+		const entry = sanitizedArguments[i];
+		if (text.length >= entry.raw.length && text.startsWith(entry.raw)) {
+			previous = entry;
+			sanitizedArguments.splice(i, 1);
+			break;
+		}
+	}
+	const sanitized = sanitizeTerminalTextFrom(text, previous);
+	sanitizedArguments.push(sanitized);
+	if (sanitizedArguments.length > SANITIZED_ARGUMENTS_KEPT) {
+		sanitizedArguments.shift();
+	}
+	return sanitized.text;
+}
+
+function parseLineNumber(value: unknown): number | undefined {
+	if (typeof value === "string" && value.trim() !== "") value = Number(value);
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** Format finite numbers or numeric strings as a read line range, omitting malformed ranges. */
+export function formatReadLineRange(offset: unknown, limit: unknown): string {
+	// Strict schemas represent omitted optional arguments as null.
+	if (offset == null && limit == null) return "";
+	const start = offset == null ? 1 : parseLineNumber(offset);
+	if (start === undefined) return "";
+	if (limit == null) return `:${start}`;
+	const count = parseLineNumber(limit);
+	if (count === undefined) return "";
+	const end = start + count - 1;
+	return `:${start}${end ? `-${end}` : ""}`;
 }
 
 export function replaceTabs(text: string): string {
@@ -77,7 +131,9 @@ const COLLAPSED_ARGS_CHARS = 100;
  * line below the title, with strings shown raw and continuation lines indented.
  */
 export function formatToolCallWithArgs(title: string, args: unknown, theme: Theme, expanded: boolean): string {
-	const header = theme.fg("toolTitle", theme.bold(title));
+	// (The title can come from an MCP server, the arguments from the model: sanitizeTerminalText() keeps escape sequences in
+	// either from acting on the terminal. JSON.stringify() escapes C0 controls, but not DEL and C1 controls.)
+	const header = theme.fg("toolTitle", theme.bold(sanitizeTerminalText(title)));
 	if (args == null) return header;
 	const entries =
 		typeof args === "object" && !Array.isArray(args)
@@ -87,13 +143,14 @@ export function formatToolCallWithArgs(title: string, args: unknown, theme: Them
 	if (expanded) {
 		const lines = entries.map(([key, value]) => {
 			const text = typeof value === "string" ? value : (JSON.stringify(value, null, 2) ?? String(value));
-			return `  ${key}: ${replaceTabs(text).replace(/\r/g, "").split("\n").join("\n    ")}`;
+			const shown = replaceTabs(sanitizeTerminalText(text)).replace(/\r/g, "");
+			return `  ${sanitizeTerminalText(key)}: ${shown.split("\n").join("\n    ")}`;
 		});
 		return `${header}\n${theme.fg("muted", lines.join("\n"))}`;
 	}
 	const pairs = entries.map(([key, value]) => `${key}=${JSON.stringify(value) ?? String(value)}`).join(" ");
 	const preview = pairs.length > COLLAPSED_ARGS_CHARS ? `${pairs.slice(0, COLLAPSED_ARGS_CHARS - 3)}...` : pairs;
-	return `${header} ${theme.fg("muted", preview)}`;
+	return `${header} ${theme.fg("muted", sanitizeTerminalText(preview))}`;
 }
 
 /** Duration as `4.2s` below a minute, then `1m 30s` and `2h 3m 4s`. */

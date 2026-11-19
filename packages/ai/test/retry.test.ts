@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { fauxAssistantMessage } from "../src/providers/faux.ts";
+import type { AssistantMessage } from "../src/types.ts";
 import { isRetryableAssistantError, type RetryPolicy, retryAssistantCall, retryDelayMs } from "../src/utils/retry.ts";
 
 const openAIExplicitRetryMessage =
@@ -70,6 +71,39 @@ describe("provider retry classification", () => {
 		},
 	);
 
+	it.each([
+		// Regression for #10965 (provider unknown, no status code in the message).
+		"The service is temporarily unavailable. Please retry later.",
+		// Bedrock ServiceUnavailableException as formatted by formatBedrockError.
+		"Service unavailable: The service is temporarily unavailable.",
+	])("matches service unavailable wording: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+	});
+
+	it.each([
+		// Regression for #10996: node-fetch errors from the google-vertex OAuth token refresh.
+		"request to https://oauth2.googleapis.com/token failed, reason:",
+		"request to https://oauth2.googleapis.com/token failed, reason: connect ECONNREFUSED 127.0.0.1:9",
+	])("matches node-fetch request failure wording: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+	});
+
+	it.each([
+		// Regression for #10920: gateway upstream failures sent as `response.failed` error codes.
+		"unknown: Unable to forward upstream stream",
+		"upstream_error: Upstream request failed",
+		"upstream_stream_read_error: Upstream response stream was interrupted",
+		"Upstream HTTP/2 stream failed",
+	])("matches gateway upstream failure wording: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+	});
+
+	it("matches gateway wording for a stream cut short mid-reply", () => {
+		// Regression for #11879.
+		const errorMessage = "Claude Code's stream from Anthropic was cut short after the reply had begun";
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+	});
+
 	it("matches OpenAI Responses streams that end before terminal events", () => {
 		expect(
 			isRetryableAssistantError(
@@ -99,6 +133,12 @@ describe("provider retry classification", () => {
 		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
 	});
 
+	it("keeps the ChatGPT Business workspace usage limit non-retryable", () => {
+		const errorMessage =
+			'OpenAI API error (429): {"code":"subscription_sharing_workplace_individual_usage_limit_exceeded","message":"Usage limit reached."}';
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+	});
+
 	it.each([
 		"subscription_sharing_usage_unavailable: Usage cannot be checked.",
 		"subscription_sharing_user_unavailable: User cannot be loaded.",
@@ -123,6 +163,14 @@ describe("provider retry classification", () => {
 		).toBe(true);
 		expect(isRetryableAssistantError(fauxAssistantMessage("not an error"))).toBe(false);
 	});
+
+	it.each([
+		// Regression for #11057: status codes inside ids or other numbers are not status codes.
+		'401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"},"request_id":"req_011CU503xyz"}',
+		"400 image exceeds 5 MB maximum: 5316784 bytes > 5242880 bytes",
+	])("does not match status codes inside ids or longer numbers: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+	});
 });
 
 describe("retryDelayMs", () => {
@@ -131,6 +179,18 @@ describe("retryDelayMs", () => {
 		expect(retryDelayMs({ baseDelayMs: 2000 }, 6)).toBe(60000);
 		expect(retryDelayMs({ baseDelayMs: 2000, maxAgentDelayMs: 5000 }, 5)).toBe(5000);
 		expect(retryDelayMs({ baseDelayMs: 2000, maxAgentDelayMs: 0 }, 5)).toBe(0);
+	});
+
+	// earendil-works/pi#10601
+	it("waits at least the server-requested delay, within the cap", () => {
+		expect(retryDelayMs({ baseDelayMs: 2000 }, 1, 30_000)).toBe(30_000);
+		expect(retryDelayMs({ baseDelayMs: 2000 }, 3, 1_000)).toBe(8_000);
+		expect(retryDelayMs({ baseDelayMs: 2000 }, 1, 120_000)).toBe(60_000);
+		expect(retryDelayMs({ baseDelayMs: 2000, maxAgentDelayMs: 10_000 }, 1, 30_000)).toBe(10_000);
+		// A Retry-After date in the past gives a negative delay.
+		expect(retryDelayMs({ baseDelayMs: 2000 }, 1, -5_000)).toBe(2_000);
+		// retry-after: 2.5005 seconds.
+		expect(retryDelayMs({ baseDelayMs: 2000 }, 1, 2_500.5)).toBe(2_501);
 	});
 });
 
@@ -193,6 +253,23 @@ describe("retryAssistantCall", () => {
 		await retryAssistantCall(produce, policy, undefined, { onRetryScheduled });
 
 		expect(onRetryScheduled.mock.calls.map((call) => call[2])).toEqual([10, 15, 15, 15]);
+	});
+
+	// earendil-works/pi#10601
+	it("waits for the failed response's retryAfterMs", async () => {
+		const policy: RetryPolicy = { enabled: true, maxRetries: 1, baseDelayMs: 1 };
+		const produce = vi
+			.fn<() => Promise<AssistantMessage>>()
+			.mockResolvedValueOnce({
+				...fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 rate limit" }),
+				retryAfterMs: 20,
+			})
+			.mockResolvedValueOnce(fauxAssistantMessage("recovered"));
+		const onRetryScheduled = vi.fn();
+
+		await retryAssistantCall(produce, policy, undefined, { onRetryScheduled });
+
+		expect(onRetryScheduled.mock.calls.map((call) => call[2])).toEqual([20]);
 	});
 
 	it("stops retrying once a call succeeds", async () => {

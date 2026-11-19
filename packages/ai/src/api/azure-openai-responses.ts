@@ -5,13 +5,20 @@ import type { Api, AssistantMessage, Model, SimpleStreamOptions, StreamFunction,
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
-import { getPiUserAgent } from "../utils/pi-user-agent.ts";
-import { retryProviderRequest } from "../utils/provider-retry.ts";
+import { getIdentityHeaders } from "../utils/identity.ts";
+import { getServerRetryDelayMs, retryProviderRequest } from "../utils/provider-retry.ts";
+import { cacheRequestBody } from "../utils/request-body.ts";
+import { beginRequestCache, type RequestCacheRun } from "../utils/request-cache.ts";
 import { getDeclaredTools, resolveTranscript, resolveTranscriptTools } from "../utils/transcript.ts";
 import { type AzureEndpointOptions, resolveAzureConfig, resolveDeploymentName } from "./azure-openai-config.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
-import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
+import {
+	convertResponsesMessages,
+	convertResponsesTools,
+	getResponsesToolSupport,
+	processResponsesStream,
+} from "./openai-responses-shared.ts";
 import { iterateOpenAIStream } from "./openai-sse.ts";
 import { buildBaseOptions, resolveSamplingParams } from "./simple-options.ts";
 
@@ -63,6 +70,7 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 			timestamp: Date.now(),
 		};
 
+		let cache: RequestCacheRun | undefined;
 		try {
 			// Create Azure OpenAI client
 			const apiKey = options?.apiKey;
@@ -74,11 +82,22 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 				getDeclaredTools(normalizedContext.messages),
 				model.compat?.supportsOpenAIGrammarTools ?? false,
 			);
-			let params = buildParams(model, normalizedContext, options, deploymentName, grammarToolInputProperties);
+			// Everything buildParams's conversion reads besides the messages: the model and its compat settings.
+			cache = beginRequestCache("azure-openai-responses", options, [
+				model.id,
+				model.provider,
+				model.api,
+				model.input,
+				model.reasoning,
+				model.compat,
+				grammarToolInputProperties,
+			]);
+			let params = buildParams(model, normalizedContext, options, deploymentName, grammarToolInputProperties, cache);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
 				params = nextParams as ResponseCreateParamsStreaming;
 			}
+			cacheRequestBody(client, params.input, "input", options?.sessionId, cache);
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
@@ -92,6 +111,7 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 					signal: options?.signal,
 				},
 			);
+			cache?.end();
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
@@ -114,14 +134,11 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
-			for (const block of output.content) {
-				delete (block as { index?: number }).index;
-				// Streaming scratch buffers are only used during parsing; never persist them.
-				delete (block as { partialJson?: string }).partialJson;
-				delete (block as { customInput?: unknown }).customInput;
-			}
+			cache?.end();
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = formatAzureOpenAIError(error);
+			const retryAfterMs = getServerRetryDelayMs(error);
+			if (retryAfterMs !== undefined) output.retryAfterMs = retryAfterMs;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -154,7 +171,7 @@ export const streamSimple: StreamFunction<"azure-openai-responses", SimpleStream
 };
 
 function createClient(model: Model<"azure-openai-responses">, apiKey: string, options?: AzureOpenAIResponsesOptions) {
-	const headers = { "User-Agent": getPiUserAgent(), ...model.headers };
+	const headers = { ...getIdentityHeaders(model, options?.identity), ...model.headers };
 
 	if (options?.headers) {
 		Object.assign(headers, options.headers);
@@ -181,10 +198,18 @@ function buildParams(
 		getDeclaredTools(context.messages),
 		model.compat?.supportsOpenAIGrammarTools ?? false,
 	),
+	cache?: RequestCacheRun,
 ) {
 	const supportsAdditionalTools = model.compat?.supportsAdditionalTools ?? false;
 	const supportsToolSearch = model.compat?.supportsToolSearch ?? false;
-	const transcriptTools = resolveTranscriptTools(context.messages, supportsAdditionalTools || supportsToolSearch);
+	const transcriptTools = resolveTranscriptTools(
+		context.messages,
+		getResponsesToolSupport({
+			supportsMidConvoSystemMessages: model.compat?.supportsMidConvoSystemMessages ?? false,
+			supportsAdditionalTools,
+			supportsToolSearch,
+		}),
+	);
 	const messages = convertResponsesMessages(model, context, AZURE_TOOL_CALL_PROVIDERS, {
 		grammarToolInputProperties,
 		supportsMidConvoSystemMessages: model.compat?.supportsMidConvoSystemMessages ?? false,
@@ -194,13 +219,15 @@ function buildParams(
 			supportsStrictMode: model.compat?.supportsStrictMode ?? true,
 			supportsOpenAIGrammarTools: model.compat?.supportsOpenAIGrammarTools ?? false,
 		},
+		cache,
 	});
 
 	const params: ResponseCreateParamsStreaming = {
 		model: deploymentName,
 		input: messages,
 		stream: true,
-		prompt_cache_key: clampOpenAIPromptCacheKey(options?.sessionId),
+		prompt_cache_key:
+			model.compat?.promptCacheKeyMode === "disabled" ? undefined : clampOpenAIPromptCacheKey(options?.sessionId),
 		store: false,
 	};
 

@@ -1,4 +1,4 @@
-import { Container, Markdown, type MarkdownTheme } from "@earendil-works/pi-tui";
+import { Container, Markdown, type MarkdownTheme, markReportsChanges } from "@earendil-works/pi-tui";
 import type { MarkdownTransformer } from "../../../core/extensions/types.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
 import { mentionsAny } from "./assistant-message.ts";
@@ -16,6 +16,8 @@ export class UserMessageComponent extends Container {
 	private markdownTheme: MarkdownTheme;
 	private outputPad: number;
 	private markdownTransformers: readonly MarkdownTransformer[];
+	private messageId?: string;
+	private timestamp?: string;
 	/** The children's lines with the prompt markers added, and the lines they were added to. */
 	private markedFrom?: string[];
 	private markedLines: string[] = [];
@@ -25,12 +27,16 @@ export class UserMessageComponent extends Container {
 		markdownTheme: MarkdownTheme = getMarkdownTheme(),
 		outputPad = 1,
 		markdownTransformers: readonly MarkdownTransformer[] = [],
+		messageId?: string,
+		timestamp?: string,
 	) {
 		super();
 		this.text = text;
 		this.markdownTheme = markdownTheme;
 		this.outputPad = outputPad;
 		this.markdownTransformers = markdownTransformers;
+		this.messageId = messageId;
+		this.timestamp = timestamp;
 		this.rebuild();
 	}
 
@@ -61,7 +67,13 @@ export class UserMessageComponent extends Container {
 				{
 					preserveOrderedListMarkers: true,
 					preserveBackslashEscapes: true,
-					transform: createMarkdownTransform("user", false, this.markdownTransformers),
+					transform: createMarkdownTransform(
+						"user",
+						() => false,
+						this.markdownTransformers,
+						this.messageId,
+						this.timestamp,
+					),
 				},
 			),
 		);
@@ -83,3 +95,5 @@ export class UserMessageComponent extends Container {
 		return this.markedLines;
 	}
 }
+
+markReportsChanges(UserMessageComponent);

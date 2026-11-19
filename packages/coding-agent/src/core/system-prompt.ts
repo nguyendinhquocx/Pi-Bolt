@@ -125,8 +125,117 @@ function buildRules(
 	return rules.map((rule) => `- ${rule}`).join("\n");
 }
 
-/** Build the ordered, independently replaceable sections of the structured system prompt. */
+/** The inputs `buildSystemPromptSections` read for its last result, copied, with the defaults applied. */
+interface SectionsInput {
+	customPrompt: string | undefined;
+	selectedTools: string[];
+	hiddenTools: string[];
+	toolSnippets: Record<string, string>;
+	toolGuidelines: Record<string, string[]>;
+	promptGuidelines: string[];
+	appendSystemPrompt: string;
+	sections: Record<string, string>;
+	cwd: string;
+	contextFiles: Array<{ path: string; content: string }>;
+	/** Only the fields `formatSkillsForPrompt` reads. */
+	skills: Array<Pick<Skill, "name" | "description" | "filePath" | "disableModelInvocation">>;
+}
+
+const DEFAULT_SELECTED_TOOLS = ["read", "bash", "edit", "write"];
+
+let lastSectionsInput: SectionsInput | undefined;
+let lastSections: SystemPromptSections | undefined;
+
+function sameArray<T>(left: readonly T[], right: readonly T[]): boolean {
+	if (left.length !== right.length) return false;
+	for (let i = 0; i < left.length; i++) if (left[i] !== right[i]) return false;
+	return true;
+}
+
+/** Same keys in the same order, each value equal by `same`. */
+function sameRecord<T>(left: Record<string, T>, right: Record<string, T>, same: (a: T, b: T) => boolean): boolean {
+	const leftKeys = Object.keys(left);
+	const rightKeys = Object.keys(right);
+	if (!sameArray(leftKeys, rightKeys)) return false;
+	for (const key of leftKeys) if (!same(left[key], right[key])) return false;
+	return true;
+}
+
+const sameValue = <T>(a: T, b: T): boolean => a === b;
+
+function sameSectionsInput(last: SectionsInput, input: BuildSystemPromptOptions): boolean {
+	if (
+		last.customPrompt !== input.customPrompt ||
+		last.cwd !== input.cwd ||
+		last.appendSystemPrompt !== (input.appendSystemPrompt ?? "") ||
+		!sameArray(last.selectedTools, input.selectedTools ?? DEFAULT_SELECTED_TOOLS) ||
+		!sameArray(last.hiddenTools, input.hiddenTools ?? []) ||
+		!sameArray(last.promptGuidelines, input.promptGuidelines ?? []) ||
+		!sameRecord(last.toolSnippets, input.toolSnippets ?? {}, sameValue) ||
+		!sameRecord(last.toolGuidelines, input.toolGuidelines ?? {}, sameArray) ||
+		!sameRecord(last.sections, input.sections ?? {}, sameValue)
+	) {
+		return false;
+	}
+	const contextFiles = input.contextFiles ?? [];
+	if (last.contextFiles.length !== contextFiles.length) return false;
+	for (let i = 0; i < contextFiles.length; i++) {
+		const file = contextFiles[i];
+		const lastFile = last.contextFiles[i];
+		if (lastFile.path !== file.path || lastFile.content !== file.content) return false;
+	}
+	const skills = input.skills ?? [];
+	if (last.skills.length !== skills.length) return false;
+	for (let i = 0; i < skills.length; i++) {
+		const skill = skills[i];
+		const lastSkill = last.skills[i];
+		if (
+			lastSkill.name !== skill.name ||
+			lastSkill.description !== skill.description ||
+			lastSkill.filePath !== skill.filePath ||
+			lastSkill.disableModelInvocation !== skill.disableModelInvocation
+		) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * Build the ordered, independently replaceable sections of the structured system prompt. The prompt is built again
+ * before every model request, almost always from the same inputs: the last result is reused while they are equal
+ * (compared by value), which also keeps the section strings the same objects, so comparing them with the replayed
+ * transcript is cheap.
+ */
 export function buildSystemPromptSections(input: BuildSystemPromptOptions): SystemPromptSections {
+	if (lastSectionsInput !== undefined && lastSections !== undefined && sameSectionsInput(lastSectionsInput, input)) {
+		return { ...lastSections };
+	}
+	const sections = buildSystemPromptSectionsUncached(input);
+	const options = normalizeBuildSystemPromptOptions(input);
+	lastSectionsInput = {
+		customPrompt: options.customPrompt,
+		selectedTools: options.selectedTools,
+		hiddenTools: options.hiddenTools,
+		toolSnippets: options.toolSnippets,
+		toolGuidelines: options.toolGuidelines,
+		promptGuidelines: options.promptGuidelines,
+		appendSystemPrompt: options.appendSystemPrompt,
+		sections: options.sections,
+		cwd: options.cwd,
+		contextFiles: options.contextFiles,
+		skills: options.skills.map(({ name, description, filePath, disableModelInvocation }) => ({
+			name,
+			description,
+			filePath,
+			disableModelInvocation,
+		})),
+	};
+	lastSections = sections;
+	return { ...sections };
+}
+
+function buildSystemPromptSectionsUncached(input: BuildSystemPromptOptions): SystemPromptSections {
 	const options = normalizeBuildSystemPromptOptions(input);
 	const {
 		customPrompt,
@@ -154,21 +263,20 @@ export function buildSystemPromptSections(input: BuildSystemPromptOptions): Syst
 		promptSections.preamble = customPrompt;
 	} else {
 		promptSections.preamble = PIBOLT
-			? "You are an expert coding assistant operating inside Pi-Bolt, a build of pi (a coding agent harness) compiled ahead of time. You help users by reading files, executing commands, editing code, and writing new files."
-			: "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
+			? "You are a coding assistant running inside Pi-Bolt, a build of pi (a coding agent harness) compiled ahead of time. Help users inspect files, run commands, and modify code."
+			: "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
 		const visibleTools = declaredTools.filter((name) => !!toolSnippets[name]);
 		const tools =
 			visibleTools.length > 0 ? visibleTools.map((name) => `- ${name}: ${toolSnippets[name]}`).join("\n") : "(none)";
-		promptSections.tools = `${tools}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.`;
+		promptSections.tools = `${tools}\n\nAdditional tools may be available.`;
 		promptSections.rules = buildRules(declaredTools, toolGuidelines, promptGuidelines);
-		promptSections.docs = `Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):
+		promptSections.docs = `Pi documentation (read only when the user asks about the harness itself, its SDK, extensions, themes, skills, or TUI):
 - Main documentation: ${getReadmePath()}
 - Additional docs: ${getDocsPath()}
 - Examples: ${getExamplesPath()} (extensions, custom tools, SDK)
 - When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory
-- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)
-- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing
-- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)${
+- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)
+- Before implementing harness changes, read the relevant docs and examples in full, following related cross-references.${
 			PIBOLT
 				? "\n- This is Pi-Bolt: its command is `pi-bolt`, and it is updated with `pi-bolt update` (https://github.com/opensec-git/Pi-Bolt). The install and update commands in pi's README install pi itself, not Pi-Bolt: do not suggest them."
 				: ""

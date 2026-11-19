@@ -1,5 +1,8 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { normalizeSessionName, parseArgs } from "../src/cli/args.ts";
+import { missingExtensionPaths, normalizeSessionName, parseArgs } from "../src/cli/args.ts";
 
 describe("parseArgs", () => {
 	describe("--version flag", () => {
@@ -155,9 +158,21 @@ describe("parseArgs", () => {
 
 	// Issue #9045
 	describe("--mode flag", () => {
-		test.each(["text", "json", "rpc"] as const)("parses --mode %s", (mode) => {
+		test.each(["text", "json", "rpc", "acp", "mcp"] as const)("parses --mode %s", (mode) => {
 			const result = parseArgs(["--mode", mode]);
 			expect(result.mode).toBe(mode);
+			expect(result.diagnostics).toEqual([]);
+		});
+
+		test("parses --acp as --mode acp", () => {
+			const result = parseArgs(["--acp"]);
+			expect(result.mode).toBe("acp");
+			expect(result.diagnostics).toEqual([]);
+		});
+
+		test("parses --mcp as --mode mcp", () => {
+			const result = parseArgs(["--mcp"]);
+			expect(result.mode).toBe("mcp");
 			expect(result.diagnostics).toEqual([]);
 		});
 
@@ -168,7 +183,7 @@ describe("parseArgs", () => {
 			expect(result.messages).toEqual([]);
 			expect(result.unknownFlags.size).toBe(0);
 			expect(result.diagnostics).toEqual([
-				{ type: "error", message: `Invalid mode "${mode}". Valid values: text, json, rpc` },
+				{ type: "error", message: `Invalid mode "${mode}". Valid values: text, json, rpc, acp, mcp` },
 			]);
 		});
 
@@ -176,7 +191,9 @@ describe("parseArgs", () => {
 			const result = parseArgs(["--mode"]);
 			expect(result.mode).toBeUndefined();
 			expect(result.unknownFlags.size).toBe(0);
-			expect(result.diagnostics).toEqual([{ type: "error", message: "--mode requires text, json, or rpc" }]);
+			expect(result.diagnostics).toEqual([
+				{ type: "error", message: "--mode requires text, json, rpc, acp, or mcp" },
+			]);
 		});
 
 		test("does not consume another option as a --mode value", () => {
@@ -184,13 +201,15 @@ describe("parseArgs", () => {
 			expect(result.mode).toBeUndefined();
 			expect(result.version).toBe(true);
 			expect(result.unknownFlags.size).toBe(0);
-			expect(result.diagnostics).toEqual([{ type: "error", message: "--mode requires text, json, or rpc" }]);
+			expect(result.diagnostics).toEqual([
+				{ type: "error", message: "--mode requires text, json, rpc, acp, or mcp" },
+			]);
 		});
 
 		test("reports an invalid --mode value after a valid one", () => {
 			const result = parseArgs(["--mode", "json", "--mode", "yaml"]);
 			expect(result.diagnostics).toEqual([
-				{ type: "error", message: 'Invalid mode "yaml". Valid values: text, json, rpc' },
+				{ type: "error", message: 'Invalid mode "yaml". Valid values: text, json, rpc, acp, mcp' },
 			]);
 		});
 	});
@@ -409,6 +428,14 @@ describe("parseArgs", () => {
 		});
 	});
 
+	describe("--herdr-pi flag", () => {
+		test("parses --herdr-pi as a known flag, not an extension flag", () => {
+			const result = parseArgs(["--herdr-pi"]);
+			expect(result.herdrPi).toBe(true);
+			expect(result.unknownFlags.size).toBe(0);
+		});
+	});
+
 	describe("--tui-mode flag", () => {
 		test.each(["regular", "fullscreen"] as const)("parses %s mode", (mode) => {
 			const result = parseArgs(["--tui-mode", mode]);
@@ -567,5 +594,33 @@ describe("parseArgs", () => {
 			expect(result.fileArgs).toEqual(["prompt.md"]);
 			expect(result.messages).toEqual(["Do the task"]);
 		});
+	});
+});
+
+describe("missingExtensionPaths", () => {
+	test("reports a local path that does not exist", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-bolt-ext-"));
+		try {
+			const missing = join(dir, "nope.ts");
+			expect(missingExtensionPaths([missing])).toEqual([missing]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("leaves an existing file, builtin names and package sources alone", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-bolt-ext-"));
+		try {
+			const present = join(dir, "ext.ts");
+			writeFileSync(present, "export default function () {}\n");
+			expect(missingExtensionPaths([present, "builtin:mcp", "npm:pi-intercom", "git:github.com/x/y"])).toEqual([]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("returns nothing when no extension was given", () => {
+		expect(missingExtensionPaths(undefined)).toEqual([]);
+		expect(missingExtensionPaths([])).toEqual([]);
 	});
 });

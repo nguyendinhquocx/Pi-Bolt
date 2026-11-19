@@ -1,3 +1,4 @@
+import { type ClientIdentity, PI_ATTRIBUTION } from "@earendil-works/pi-ai";
 import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
@@ -6,7 +7,7 @@ import {
 	toToolDeclaration,
 	type UserMessage,
 } from "@earendil-works/pi-ai/compat";
-import { Type } from "typebox";
+import { num, obj, str } from "@earendil-works/pi-schema";
 import { describe, expect, it } from "vitest";
 import {
 	Agent,
@@ -48,7 +49,7 @@ function createTool(name: string): AgentTool {
 		name,
 		label: name,
 		description: `${name} tool`,
-		parameters: Type.Object({}),
+		parameters: obj({}),
 		execute: async () => ({ content: [{ type: "text", text: name }], details: {} }),
 	};
 }
@@ -145,7 +146,7 @@ describe("Agent", () => {
 			name: "echo",
 			label: "Echo",
 			description: "Echo input",
-			parameters: Type.Object({}),
+			parameters: obj({}),
 			execute: async () => ({ content: [{ type: "text", text: "echo" }], details: {} }),
 		};
 		const agent = new Agent({
@@ -199,7 +200,7 @@ describe("Agent", () => {
 		expect(update).toEqual({
 			role: "system",
 			content: "",
-			toolsAdded: [{ name: "second", description: "second tool", parameters: Type.Object({}) }],
+			toolsAdded: [{ name: "second", description: "second tool", parameters: obj({}) }],
 			toolsRemoved: [{ name: "first" }],
 			timestamp: expect.any(Number),
 		});
@@ -208,12 +209,71 @@ describe("Agent", () => {
 		expect(initial.toolsAdded?.[0]).not.toHaveProperty("execute");
 	});
 
+	it("declares a tool again when a declared field of the same tool object changes", async () => {
+		const tool = createTool("echo");
+		const declarations: string[] = [];
+		const agent = new Agent({
+			initialState: { systemPrompt: "You are helpful.", tools: [tool] },
+			streamFn: () => {
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") });
+				});
+				return stream;
+			},
+		});
+		const record = () => {
+			declarations.push(
+				agent.state.messages
+					.filter((message) => message.role === "system")
+					.map(
+						(message) =>
+							`+${(message.toolsAdded ?? []).map((added) => `${added.name}:${added.description}:${JSON.stringify(added.parameters)}`).join(",")}` +
+							` -${(message.toolsRemoved ?? []).map((removed) => removed.name).join(",")}`,
+					)
+					.join(" | "),
+			);
+		};
+
+		await agent.prompt("unchanged");
+		record();
+		await agent.prompt("unchanged again");
+		record();
+		tool.description = "changed in place";
+		await agent.prompt("description");
+		record();
+		tool.parameters = obj({});
+		await agent.prompt("equal parameters in a new object");
+		record();
+		tool.parameters = obj({ value: str() });
+		await agent.prompt("different parameters");
+		record();
+		(tool.parameters as { properties: Record<string, unknown> }).properties.extra = num();
+		await agent.prompt("parameters changed in place");
+		record();
+
+		const initial = '+echo:echo tool:{"type":"object","properties":{},"additionalProperties":false} -';
+		const described = '+echo:changed in place:{"type":"object","properties":{},"additionalProperties":false} -echo';
+		const reshaped =
+			'+echo:changed in place:{"type":"object","properties":{"value":{"type":"string"}},"required":["value"],"additionalProperties":false} -echo';
+		const extended =
+			'+echo:changed in place:{"type":"object","properties":{"value":{"type":"string"},"extra":{"type":"number"}},"required":["value"],"additionalProperties":false} -echo';
+		expect(declarations).toEqual([
+			initial,
+			initial,
+			`${initial} | ${described}`,
+			`${initial} | ${described}`,
+			`${initial} | ${described} | ${reshaped}`,
+			`${initial} | ${described} | ${reshaped} | ${extended}`,
+		]);
+	});
+
 	it("merges tool changes into a pending system message", async () => {
 		const tool: AgentTool = {
 			name: "echo",
 			label: "Echo",
 			description: "Echo input",
-			parameters: Type.Object({}),
+			parameters: obj({}),
 			execute: async () => ({ content: [{ type: "text", text: "echo" }], details: {} }),
 		};
 		const agent = new Agent({
@@ -238,7 +298,7 @@ describe("Agent", () => {
 			role: "system",
 			content: "",
 			sections: { skills: "<skills>x</skills>" },
-			toolsAdded: [{ name: "echo", description: "Echo input", parameters: Type.Object({}) }],
+			toolsAdded: [{ name: "echo", description: "Echo input", parameters: obj({}) }],
 			timestamp: 1,
 		});
 	});
@@ -283,7 +343,7 @@ describe("Agent", () => {
 			name: "echo",
 			label: "Echo",
 			description: "Echo input",
-			parameters: Type.Object({}),
+			parameters: obj({}),
 			execute: async () => ({ content: [{ type: "text", text: "echo" }], details: {} }),
 		};
 		const agent = new Agent({
@@ -431,6 +491,120 @@ describe("Agent", () => {
 		expect(agent.state.isStreaming).toBe(false);
 	});
 
+	it("calls listeners in order, holding later listeners until an earlier one's promise settles", async () => {
+		const streamedText = ["a", "b", "c"];
+		const agent = new Agent({
+			streamFn: () => {
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					let text = "";
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					for (const delta of streamedText) {
+						text += delta;
+						stream.push({ type: "text_delta", contentIndex: 0, delta, partial: createAssistantMessage(text) });
+					}
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage(text) });
+				});
+				return stream;
+			},
+		});
+
+		const calls: string[] = [];
+		const gate = createDeferred();
+		agent.subscribe((event) => {
+			if (event.type === "message_update") calls.push(`sync:${event.assistantMessageEvent.type}`);
+		});
+		agent.subscribe((event) => {
+			if (event.type !== "message_update" || event.assistantMessageEvent.type !== "text_delta") return;
+			calls.push(`async:${event.assistantMessageEvent.delta}`);
+			if (event.assistantMessageEvent.delta === "b") return gate.promise;
+		});
+		agent.subscribe((event) => {
+			if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+				calls.push(`last:${event.assistantMessageEvent.delta}`);
+			}
+		});
+
+		const promptPromise = agent.prompt("hello");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(calls).toEqual(["sync:text_delta", "async:a", "last:a", "sync:text_delta", "async:b"]);
+
+		gate.resolve();
+		await promptPromise;
+		expect(calls).toEqual([
+			"sync:text_delta",
+			"async:a",
+			"last:a",
+			"sync:text_delta",
+			"async:b",
+			"last:b",
+			"sync:text_delta",
+			"async:c",
+			"last:c",
+		]);
+	});
+
+	it("calls a listener that an earlier listener subscribes for the same event", async () => {
+		const agent = new Agent({
+			streamFn: () => {
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("ok") });
+				});
+				return stream;
+			},
+		});
+		const seen: string[] = [];
+		agent.subscribe((event) => {
+			if (event.type === "agent_start") {
+				agent.subscribe((later) => {
+					seen.push(later.type);
+				});
+			}
+		});
+
+		await agent.prompt("hello");
+		expect(seen[0]).toBe("agent_start");
+		expect(seen.at(-1)).toBe("agent_end");
+	});
+
+	it("ends the run with an error when a synchronous listener throws, as when an async one rejects", async () => {
+		for (const failing of [
+			() => {
+				throw new Error("listener failed");
+			},
+			async () => {
+				throw new Error("listener failed");
+			},
+		]) {
+			const agent = new Agent({
+				streamFn: () => {
+					const stream = createAssistantMessageEventStream();
+					queueMicrotask(() => {
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("ok") });
+					});
+					return stream;
+				},
+			});
+			const events: string[] = [];
+			let thrown = false;
+			agent.subscribe((event) => {
+				events.push(event.type);
+				if (event.type === "turn_start" && !thrown) {
+					thrown = true;
+					return failing();
+				}
+			});
+
+			await agent.prompt("hello");
+			const lastMessage = agent.state.messages.at(-1);
+			if (lastMessage?.role !== "assistant") throw new Error("Expected assistant message");
+			expect(lastMessage.stopReason).toBe("error");
+			expect(lastMessage.errorMessage).toBe("listener failed");
+			expect(events).toEqual(["agent_start", "turn_start", "message_start", "message_end", "turn_end", "agent_end"]);
+		}
+	});
+
 	it("should pass the active abort signal to subscribers", async () => {
 		let receivedSignal: AbortSignal | undefined;
 		const agent = new Agent({
@@ -470,7 +644,7 @@ describe("Agent", () => {
 	});
 
 	it("should ignore tool updates after the tool execution settles", async () => {
-		const toolSchema = Type.Object({});
+		const toolSchema = obj({});
 		let delayedUpdate: AgentToolUpdateCallback<{ status: string }> | undefined;
 		const events: AgentEvent[] = [];
 		const unhandledRejections: unknown[] = [];
@@ -535,7 +709,7 @@ describe("Agent", () => {
 	});
 
 	it("should ignore a settled parallel tool update while another tool is still running", async () => {
-		const toolSchema = Type.Object({});
+		const toolSchema = obj({});
 		const slowStarted = createDeferred();
 		const settledToolEnded = createDeferred();
 		const releaseSlow = createDeferred();
@@ -857,7 +1031,7 @@ describe("Agent", () => {
 	});
 
 	it("keeps legacy prepareNextTurn signal callback behavior", async () => {
-		const schema = Type.Object({});
+		const schema = obj({});
 		const tool: AgentTool<typeof schema> = {
 			name: "noop",
 			label: "Noop",
@@ -898,7 +1072,7 @@ describe("Agent", () => {
 	});
 
 	it("forwards finishTurn through AgentOptions with the active abort signal", async () => {
-		const schema = Type.Object({});
+		const schema = obj({});
 		const tool: AgentTool<typeof schema> = {
 			name: "noop",
 			label: "Noop",
@@ -1197,5 +1371,32 @@ describe("Agent", () => {
 
 		await agent.prompt("hello again");
 		expect(receivedSessionId).toBe("session-def");
+	});
+
+	it("attributes requests to pi by default and merges a configured identity over it", async () => {
+		const received: (ClientIdentity | undefined)[] = [];
+		const agent = new Agent({
+			streamFn: (_model, _context, options) => {
+				received.push(options?.identity);
+				const stream = createAssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("ok") });
+				});
+				return stream;
+			},
+		});
+
+		await agent.prompt("hello");
+		const acme = { name: "acme", url: "https://acme.example" };
+		agent.identity = { userAgent: "short", attribution: acme };
+		await agent.prompt("hello again");
+		agent.identity = { userAgent: "short" };
+		await agent.prompt("and again");
+
+		expect(received).toEqual([
+			{ attribution: PI_ATTRIBUTION },
+			{ attribution: acme, userAgent: "short" },
+			{ attribution: PI_ATTRIBUTION, userAgent: "short" },
+		]);
 	});
 });

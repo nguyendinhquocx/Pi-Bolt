@@ -11,6 +11,15 @@
     "lastChangelogVersion": {
       "type": "string"
     },
+    "extensionChangelogVersions": {
+      "type": "object",
+      "patternProperties": {
+        "^.*$": {
+          "type": "string"
+        }
+      },
+      "description": "Last seen changelog version per extension package."
+    },
     "defaultProvider": {
       "type": "string"
     },
@@ -49,6 +58,121 @@
         }
       ],
       "default": "auto"
+    },
+    "sessionShareDestination": {
+      "anyOf": [
+        {
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "type": "string",
+          "const": "gist"
+        },
+        {
+          "type": "string",
+          "const": "radius"
+        }
+      ],
+      "description": "Destination used by /share. \"auto\" uses Radius when authenticated and otherwise creates a GitHub gist.",
+      "default": "auto"
+    },
+    "remoteControl": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Turn on /remote-control and the background service (pi-bolt service). Default false. Read from the global settings only: a project's settings cannot turn it on."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "Port of the /remote-control listener. 0 picks a free port each time; a fixed port lets paired phones reconnect on the LAN without a new QR code."
+        },
+        "tunnel": {
+          "anyOf": [
+            {
+              "type": "string",
+              "const": "quick"
+            },
+            {
+              "type": "string",
+              "const": "off"
+            },
+            {
+              "type": "object",
+              "required": [
+                "name",
+                "hostname"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "description": "Named Cloudflare tunnel (cloudflared tunnel create)."
+                },
+                "hostname": {
+                  "type": "string",
+                  "description": "Public hostname routed to the tunnel."
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
+        "cloudflared": {
+          "type": "string",
+          "description": "Path to the cloudflared executable."
+        },
+        "askCloudflared": {
+          "type": "boolean",
+          "description": "Offer to install cloudflared when /remote-control finds none (false after \"Don't ask again\")."
+        },
+        "readSecretFiles": {
+          "type": "boolean",
+          "description": "Let paired phones read files that look like secrets (.env*, keys, .git/, ...) when reviewing the session's folder. Default false."
+        },
+        "service": {
+          "type": "object",
+          "properties": {
+            "tunnel": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "const": "quick"
+                },
+                {
+                  "type": "string",
+                  "const": "off"
+                },
+                {
+                  "type": "object",
+                  "required": [
+                    "name",
+                    "hostname"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "description": "Named Cloudflare tunnel (cloudflared tunnel create)."
+                    },
+                    "hostname": {
+                      "type": "string",
+                      "description": "Public hostname routed to the tunnel."
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              ],
+              "description": "Tunnel of the background service (pi-bolt service install). Default: the remoteControl.tunnel setting; \"off\" serves the local network and Tailscale only."
+            }
+          },
+          "additionalProperties": false,
+          "description": "The background service (pi-bolt service)."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Settings of /remote-control (Pi-Bolt Android app)."
     },
     "steeringMode": {
       "anyOf": [
@@ -90,13 +214,28 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 9007199254740991,
+          "description": "Tokens reserved for the model response: compaction triggers above contextWindow - reserveTokens. Setting it turns off the thresholdPercent default and the context-window share of the summary cap.",
           "default": 16384
         },
         "keepRecentTokens": {
           "type": "integer",
           "minimum": 0,
           "maximum": 9007199254740991,
+          "description": "Recent tokens kept without summarization. Unset: the larger of 20000 and 5% of the context window.",
           "default": 20000
+        },
+        "thresholdPercent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Also compact above this percentage of the context window when that is below contextWindow - reserveTokens. The default applies only while reserveTokens is unset.",
+          "default": 90
+        },
+        "summaryMaxTokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "Output cap of a compaction summary; a split turn's prefix summary gets half. Unset: the largest of 80% of reserveTokens, 4096 and (while reserveTokens is unset) 3.2% of the context window, capped by the model's output limit."
         },
         "modelOverrides": {
           "type": "object",
@@ -112,6 +251,16 @@
                 "keepRecentTokens": {
                   "type": "integer",
                   "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "thresholdPercent": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 100
+                },
+                "summaryMaxTokens": {
+                  "type": "integer",
+                  "minimum": 1,
                   "maximum": 9007199254740991
                 }
               }
@@ -190,6 +339,11 @@
       "description": "Show cache cost and provider recovery notices.",
       "default": false
     },
+    "shadedCodeBlocks": {
+      "type": "boolean",
+      "description": "Render code blocks on a background instead of between literal ``` fence lines.",
+      "default": false
+    },
     "externalEditor": {
       "type": "string",
       "description": "Command for Ctrl+G external editor; takes precedence over VISUAL and EDITOR."
@@ -239,6 +393,14 @@
         "type": "string"
       },
       "description": "Command used for npm package lookup and installation, in argv form such as [\"mise\", \"exec\", \"node@20\", \"--\", \"npm\"]."
+    },
+    "selfUpdateCommand": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "description": "Command `pi update` runs to update Pi itself, in argv form such as [\"mise\", \"use\", \"-g\", \"npm:{packageName}@{version}\"]. Placeholders: {packageName}, {version}, {installSpec}. PI_SELF_UPDATE_COMMAND takes precedence. Global setting only."
     },
     "collapseChangelog": {
       "type": "boolean",
@@ -364,7 +526,15 @@
             ],
             "description": "Package source for npm or git packages. Use the string form to load all resources or the object form to filter resources."
           },
-          "description": "Pi-Bolt's own package sources, loaded by Pi-Bolt in place of packages; Pi keeps using packages."
+          "description": "Pi-Bolt package additions and same-identity replacements over this file's shared packages. Use -<source> strings to exclude inherited packages. An empty list inherits shared packages."
+        },
+        "packagesOverlay": {
+          "type": "boolean",
+          "description": "Set by Pi-Bolt when it writes packages. A list without it and without -<source> entries is taken for an independent copy written before Pi-Bolt 0.9.1 and converted to an overlay once."
+        },
+        "autoUpdate": {
+          "type": "boolean",
+          "description": "Install new Pi-Bolt releases in the background when an interactive session starts, at most once a day: the installer's installations only. Default false. Read from the global settings only: a project's settings cannot turn it on. PIBOLT_NO_AUTO_UPDATE=1 turns it off."
         }
       },
       "description": "Pi-Bolt only settings."

@@ -1,4 +1,4 @@
-import { type Component, markStableRender } from "../tui.ts";
+import { type Component, markReportsChanges, markStableRender, reportRenderChange } from "../tui.ts";
 import { applyBackgroundToLine, flattenLines, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
 
 /**
@@ -23,10 +23,13 @@ export class Text implements Component {
 	}
 
 	setText(text: string): void {
+		// Renderers often set the same text on every update; keep the wrapped lines then.
+		if (text === this.text) return;
 		this.text = text;
 		this.cachedText = undefined;
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		reportRenderChange(this);
 	}
 
 	setCustomBgFn(customBgFn?: (text: string) => string): void {
@@ -34,6 +37,7 @@ export class Text implements Component {
 		this.cachedText = undefined;
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		reportRenderChange(this);
 	}
 
 	setPaddingX(paddingX: number): void {
@@ -45,6 +49,7 @@ export class Text implements Component {
 		this.cachedText = undefined;
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		reportRenderChange(this);
 	}
 
 	render(width: number): string[] {
@@ -113,3 +118,4 @@ export class Text implements Component {
 }
 
 markStableRender(Text);
+markReportsChanges(Text);

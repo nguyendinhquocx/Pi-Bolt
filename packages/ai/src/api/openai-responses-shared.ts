@@ -1,6 +1,7 @@
 import type OpenAI from "openai";
 import type {
 	Tool as OpenAITool,
+	ResponseConfigurationUpdateItemParam,
 	ResponseCreateParamsStreaming,
 	ResponseInput,
 	ResponseInputContent,
@@ -18,6 +19,7 @@ import type {
 	Api,
 	AssistantMessage,
 	ImageContent,
+	Message,
 	Model,
 	StopReason,
 	StreamOptions,
@@ -32,13 +34,14 @@ import type {
 } from "../types.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
-import { parseStreamingJson, parseStreamingJsonWhileStreaming } from "../utils/json-parse.ts";
+import type { RequestCacheRun } from "../utils/request-cache.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import { ToolCallArgumentsStream } from "../utils/streaming-json.ts";
 import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
-import { resolveTranscript, resolveTranscriptTools } from "../utils/transcript.ts";
+import { resolveTranscript, resolveTranscriptTools, type TranscriptToolSupport } from "../utils/transcript.ts";
 import {
-	appendGrammarToolInputJsonChunk,
 	appendGrammarToolInputJsonDelta,
+	closeGrammarToolInputJson,
 	type GrammarToolInputJsonBuffer,
 	getGrammarToolInput,
 	getJsonSchemaToolParameters,
@@ -88,7 +91,7 @@ function convertToolResultOutput<TApi extends Api>(
 		.map((c) => c.text)
 		.join("\n");
 	const images = content.filter((c): c is ImageContent => c.type === "image");
-	const hasText = textResult.length > 0;
+	const hasText = textResult.trim().length > 0;
 
 	if (images.length === 0 || !model.input.includes("image")) {
 		return sanitizeSurrogates(hasText ? textResult : images.length > 0 ? "(see attached image)" : "(no tool output)");
@@ -130,6 +133,22 @@ export interface ConvertResponsesMessagesOptions {
 	supportsAdditionalTools?: boolean;
 	supportsToolSearch?: boolean;
 	toolOptions?: ConvertResponsesToolsOptions;
+	/**
+	 * Effort for the reply being generated. When set, the thinking level is sent as
+	 * configuration_update items instead of a changing reasoning.effort, which would invalidate the
+	 * prompt cache. Each item sets the effort from that point on: one goes before every earlier
+	 * reply with the level recorded on it (`providerThinkingLevel`), and one with this effort goes
+	 * at the end. Earlier input therefore never changes. OpenAI documents the item before user
+	 * messages only. After tool results it was verified on gpt-6-luna (October 2026) to be accepted
+	 * and to apply to the next reply.
+	 */
+	configurationUpdateEffort?: string;
+	/**
+	 * Reuse what unchanged messages converted to in the conversation's previous requests (request-cache.ts). Its
+	 * context must hold the model, the tool call providers and every option above except `configurationUpdateEffort`,
+	 * of which only whether it is set.
+	 */
+	cache?: RequestCacheRun;
 }
 
 export interface ConvertResponsesToolsOptions {
@@ -142,6 +161,41 @@ export interface ConvertResponsesToolsOptions {
 // =============================================================================
 // Message conversion
 // =============================================================================
+
+/**
+ * How a Responses transport expresses tool changes.
+ *
+ * `additional_tools` items accumulate: a later item adds tools and replaces same-name
+ * definitions from earlier items, but it cannot replace a top-level tool and cannot remove any
+ * tool (verified with strict schemas on the OpenAI, Codex, and Copilot backends, October 2026).
+ * Like Codex, every tool is therefore declared in `additional_tools` items, starting with one
+ * at the head of the input, and removals are announced as text. Synthetic tool search can
+ * only add tools. Without mid-conversation system messages there is nothing to anchor.
+ */
+export function getResponsesToolSupport(options: {
+	supportsMidConvoSystemMessages?: boolean;
+	supportsAdditionalTools?: boolean;
+	supportsToolSearch?: boolean;
+}): TranscriptToolSupport {
+	if (options.supportsMidConvoSystemMessages && options.supportsAdditionalTools) return "changes";
+	return options.supportsToolSearch ? "additions" : "none";
+}
+
+/**
+ * Precedes every additional_tools item after the first. Without it, models read the latest item as
+ * the complete tool set once a removal was announced; Codex precedes its incremental tool batches
+ * with the same guidance. Restating the tools that are still unavailable keeps smaller models
+ * (gpt-5.6-luna, gpt-6-luna) from calling them again after later loads (verified October 2026).
+ */
+function renderIncrementalToolsNotice(unavailable: ReadonlySet<string>): string {
+	const notice =
+		"This is an incremental tools update. Previously declared tools remain available unless explicitly marked unavailable. A tool declared again here is available again, and its latest definition replaces the earlier one.";
+	return unavailable.size > 0 ? `${notice}\nStill unavailable: ${[...unavailable].join(", ")}.` : notice;
+}
+
+function renderToolRemovalNotice(names: readonly string[]): string {
+	return `The following tools are no longer available. Do not call them:\n${names.map((name) => `- ${name}`).join("\n")}`;
+}
 
 export function convertResponsesMessages<TApi extends Api>(
 	model: Model<TApi>,
@@ -177,23 +231,46 @@ export function convertResponsesMessages<TApi extends Api>(
 		return `${normalizedCallId}|${normalizedItemId}`;
 	};
 
-	const transformedMessages = transformMessages(normalizedContext.messages, model, normalizeToolCallId);
-	const transcriptTools = resolveTranscriptTools(
+	const cache = options?.cache;
+	const sources: (Message | undefined)[] = [];
+	const transformedMessages = transformMessages(
 		normalizedContext.messages,
-		(options?.supportsAdditionalTools ?? false) || (options?.supportsToolSearch ?? false),
+		model,
+		normalizeToolCallId,
+		cache,
+		cache ? sources : undefined,
 	);
+	/**
+	 * Converts one message with `convert`, which pushes what it converts to and returns what the loop needs besides;
+	 * with the cache, the values of an unchanged message are reused. `extra` is what the conversion reads besides the
+	 * message and the cache context.
+	 */
+	const unit = <M>(source: Message | undefined, extra: unknown, convert: (out: ResponseInput) => M): M => {
+		if (!cache || source === undefined) return convert(messages);
+		return cache.unit([source], extra, messages, convert as (out: unknown[]) => M);
+	};
+	const toolSupport = getResponsesToolSupport(options ?? {});
+	const transcriptTools = resolveTranscriptTools(normalizedContext.messages, toolSupport);
+	let declaredAdditionalTools = false;
+	/** Tools announced as removed and not declared again since. */
+	const unavailableTools = new Set<string>();
 	const appendSystemToolAdditions = (message: SystemMessage, seed: string): void => {
-		const tools = transcriptTools.anchorsAdditions ? (message.toolsAdded ?? []) : [];
+		const tools = message.toolsAdded ?? [];
+		for (const tool of tools) unavailableTools.delete(tool.name);
 		if (tools.length === 0) return;
-		if (options?.supportsAdditionalTools) {
+		if (toolSupport === "changes") {
+			if (declaredAdditionalTools) {
+				messages.push({ role: instructionRole, content: renderIncrementalToolsNotice(unavailableTools) });
+			}
+			declaredAdditionalTools = true;
 			messages.push({
 				type: "additional_tools",
 				role: "developer",
-				tools: convertResponsesTools(tools, options.toolOptions),
+				tools: convertResponsesTools(tools, options?.toolOptions),
 			} satisfies ResponseInputItem);
 			return;
 		}
-		if (!options?.supportsToolSearch) return;
+		if (toolSupport !== "additions") return;
 		const names = tools.map((tool) => tool.name);
 		const callId = `pi_tool_load_${shortHash(`${seed}:${names.join(",")}`)}`;
 		messages.push({
@@ -208,32 +285,53 @@ export function convertResponsesMessages<TApi extends Api>(
 			call_id: callId,
 			execution: "client",
 			status: "completed",
-			tools: convertResponsesTools(tools, { ...options.toolOptions, toolSearchResult: true }),
+			tools: convertResponsesTools(tools, { ...options?.toolOptions, toolSearchResult: true }),
 		} satisfies ResponseToolSearchOutputItemParam);
 	};
 	const includeInitialSystemMessage = options?.includeSystemPrompt ?? true;
+	const pushConfigurationUpdate = (effort: string): void => {
+		messages.push({
+			type: "configuration_update",
+			reasoning: { effort: effort as NonNullable<ResponseConfigurationUpdateItemParam.Reasoning["effort"]> },
+		} satisfies ResponseConfigurationUpdateItemParam);
+	};
 	const compat = model.compat as { supportsDeveloperRole?: boolean } | undefined;
 	const instructionRole = model.reasoning && compat?.supportsDeveloperRole !== false ? "developer" : "system";
 
 	let msgIndex = 0;
 	let sourceIndex = 0;
-	for (const msg of transformedMessages) {
+	let systemIndex = 0;
+	for (let index = 0; index < transformedMessages.length; index++) {
+		const msg = transformedMessages[index];
 		const isLeadingSystemMessage = sourceIndex++ === 0 && msg.role === "system";
 		if (msg.role === "system") {
-			if (!isLeadingSystemMessage) appendSystemToolAdditions(msg, `system:${msgIndex}`);
+			// transformMessages keeps system messages in order, so their position matches the transcript.
+			const anchorsToolChanges = systemIndex++ >= transcriptTools.foldedSystemMessages;
+			if (anchorsToolChanges) appendSystemToolAdditions(msg, `system:${msgIndex}`);
 			if (!isLeadingSystemMessage || includeInitialSystemMessage) {
-				const text = isLeadingSystemMessage ? getSystemMessageText(msg) : renderSystemMessageUpdate(msg);
+				const parts = [isLeadingSystemMessage ? getSystemMessageText(msg) : renderSystemMessageUpdate(msg)];
+				if (anchorsToolChanges) {
+					// A redefinition is a removal plus an addition of the same name; only true removals are announced.
+					const added = new Set((msg.toolsAdded ?? []).map((tool) => tool.name));
+					const removed = (msg.toolsRemoved ?? []).map((tool) => tool.name).filter((name) => !added.has(name));
+					if (removed.length > 0) parts.push(renderToolRemovalNotice(removed));
+					// Recorded after this message's additions, whose notice precedes this removal notice.
+					for (const name of removed) unavailableTools.add(name);
+				}
+				const text = parts.filter((part) => part.length > 0).join("\n\n");
 				if (text.length > 0) {
 					messages.push({ role: instructionRole, content: sanitizeSurrogates(text) });
 				}
 			}
 		} else if (msg.role === "user") {
-			if (typeof msg.content === "string") {
-				messages.push({
-					role: "user",
-					content: [{ type: "input_text", text: sanitizeSurrogates(msg.content) }],
-				});
-			} else {
+			const converted = unit(sources[index], undefined, (out) => {
+				if (typeof msg.content === "string") {
+					out.push({
+						role: "user",
+						content: [{ type: "input_text", text: sanitizeSurrogates(msg.content) }],
+					});
+					return true;
+				}
 				const content: ResponseInputContent[] = msg.content.map((item): ResponseInputContent => {
 					if (item.type === "text") {
 						return {
@@ -247,109 +345,134 @@ export function convertResponsesMessages<TApi extends Api>(
 						image_url: `data:${item.mimeType};base64,${item.data}`,
 					} satisfies ResponseInputImage;
 				});
-				if (content.length === 0) continue;
-				messages.push({
+				if (content.length === 0) return false;
+				out.push({
 					role: "user",
 					content,
 				});
-			}
+				return true;
+			});
+			if (!converted) continue;
 		} else if (msg.role === "assistant") {
-			const output: ResponseInput = [];
-			const assistantMsg = msg as AssistantMessage;
-			const isSameProviderAndApi = assistantMsg.provider === model.provider && assistantMsg.api === model.api;
-			const isSameModel = isSameProviderAndApi && assistantMsg.model === model.id;
-			const isDifferentModel = isSameProviderAndApi && assistantMsg.model !== model.id;
-			let textBlockIndex = 0;
+			// Text items without an id of their own are named after the message's index.
+			const converted = unit(sources[index], msgIndex, (out) => {
+				const output: ResponseInput = [];
+				const assistantMsg = msg as AssistantMessage;
+				const isSameProviderAndApi = assistantMsg.provider === model.provider && assistantMsg.api === model.api;
+				const isSameModel = isSameProviderAndApi && assistantMsg.model === model.id;
+				const isDifferentModel = isSameProviderAndApi && assistantMsg.model !== model.id;
+				let textBlockIndex = 0;
 
-			for (const block of msg.content) {
-				if (block.type === "thinking") {
-					if (block.thinkingSignature) {
-						const reasoningItem = JSON.parse(block.thinkingSignature) as ResponseReasoningItem;
-						output.push(reasoningItem);
-					}
-				} else if (block.type === "text") {
-					const textBlock = block as TextContent;
-					const parsedSignature = parseTextSignature(textBlock.textSignature);
-					const fallbackMessageId =
-						textBlockIndex === 0 ? `msg_pi_${msgIndex}` : `msg_pi_${msgIndex}_${textBlockIndex}`;
-					textBlockIndex++;
-					// OpenAI requires id to be max 64 characters
-					let msgId = parsedSignature?.id;
-					if (!msgId) {
-						msgId = fallbackMessageId;
-					} else if (msgId.length > 64) {
-						msgId = `msg_${shortHash(msgId)}`;
-					}
-					output.push({
-						type: "message",
-						role: "assistant",
-						content: [{ type: "output_text", text: sanitizeSurrogates(textBlock.text), annotations: [] }],
-						status: "completed",
-						id: msgId,
-						phase: parsedSignature?.phase,
-					} satisfies ResponseOutputMessage);
-				} else if (block.type === "toolCall") {
-					const toolCall = block as ToolCall;
-					const [callId, itemIdRaw] = toolCall.id.split("|");
-					const customInputProperty = options?.grammarToolInputProperties?.get(toolCall.name);
-					let itemId: string | undefined = itemIdRaw;
-
-					// For different-model messages, set id to undefined to avoid pairing validation.
-					// OpenAI tracks which item IDs were paired with rs_xxx reasoning items.
-					// By omitting the id, we avoid triggering that validation (like cross-provider does).
-					// Also drop ids that do not match the replayed item type: function_call ids must be fc_*
-					// and custom_tool_call ids must be ctc_*. Foreign tool call ids are normalized to fc_*, and
-					// a call can switch between the two types when grammar tool support differs.
-					const itemIdPrefix = customInputProperty === undefined ? "fc_" : "ctc_";
-					if (isDifferentModel || !itemId?.startsWith(itemIdPrefix)) {
-						itemId = undefined;
-					}
-
-					if (customInputProperty !== undefined) {
+				for (const block of msg.content) {
+					if (block.type === "thinking") {
+						if (block.thinkingSignature) {
+							const reasoningItem = JSON.parse(block.thinkingSignature) as ResponseReasoningItem;
+							output.push(reasoningItem);
+						}
+					} else if (block.type === "text") {
+						const textBlock = block as TextContent;
+						const parsedSignature = parseTextSignature(textBlock.textSignature);
+						const fallbackMessageId =
+							textBlockIndex === 0 ? `msg_pi_${msgIndex}` : `msg_pi_${msgIndex}_${textBlockIndex}`;
+						textBlockIndex++;
+						// OpenAI requires id to be max 64 characters
+						let msgId = parsedSignature?.id;
+						if (!msgId) {
+							msgId = fallbackMessageId;
+						} else if (msgId.length > 64) {
+							msgId = `msg_${shortHash(msgId)}`;
+						}
 						output.push({
-							type: "custom_tool_call",
-							id: itemId,
-							call_id: callId,
-							name: toolCall.name,
-							input: sanitizeSurrogates(
-								getGrammarToolInput(toolCall.name, toolCall.arguments, customInputProperty),
-							),
-							...(isSameModel && toolCall.namespace !== undefined ? { namespace: toolCall.namespace } : {}),
-						} satisfies ResponseOutputItem);
-					} else {
-						output.push({
-							type: "function_call",
-							id: itemId,
-							call_id: callId,
-							name: toolCall.name,
-							arguments: JSON.stringify(toolCall.arguments),
-							...(isSameModel && toolCall.namespace !== undefined ? { namespace: toolCall.namespace } : {}),
-						});
+							type: "message",
+							role: "assistant",
+							content: [{ type: "output_text", text: sanitizeSurrogates(textBlock.text), annotations: [] }],
+							status: "completed",
+							id: msgId,
+							phase: parsedSignature?.phase,
+						} satisfies ResponseOutputMessage);
+					} else if (block.type === "toolCall") {
+						const toolCall = block as ToolCall;
+						const [callId, itemIdRaw] = toolCall.id.split("|");
+						const customInputProperty = options?.grammarToolInputProperties?.get(toolCall.name);
+						let itemId: string | undefined = itemIdRaw;
+
+						// For different-model messages, set id to undefined to avoid pairing validation.
+						// OpenAI tracks which item IDs were paired with rs_xxx reasoning items.
+						// By omitting the id, we avoid triggering that validation (like cross-provider does).
+						// Also drop ids that do not match the replayed item type: function_call ids must be fc_*
+						// and custom_tool_call ids must be ctc_*. Foreign tool call ids are normalized to fc_*, and
+						// a call can switch between the two types when grammar tool support differs.
+						const itemIdPrefix = customInputProperty === undefined ? "fc_" : "ctc_";
+						if (isDifferentModel || !itemId?.startsWith(itemIdPrefix)) {
+							itemId = undefined;
+						}
+
+						if (customInputProperty !== undefined) {
+							output.push({
+								type: "custom_tool_call",
+								id: itemId,
+								call_id: callId,
+								name: toolCall.name,
+								input: sanitizeSurrogates(
+									getGrammarToolInput(toolCall.name, toolCall.arguments, customInputProperty),
+								),
+								...(isSameModel && toolCall.namespace !== undefined ? { namespace: toolCall.namespace } : {}),
+							} satisfies ResponseOutputItem);
+						} else {
+							output.push({
+								type: "function_call",
+								id: itemId,
+								call_id: callId,
+								name: toolCall.name,
+								arguments: JSON.stringify(toolCall.arguments),
+								...(isSameModel && toolCall.namespace !== undefined ? { namespace: toolCall.namespace } : {}),
+							});
+						}
 					}
 				}
-			}
-			if (output.length === 0) continue;
-			messages.push(...output);
+				if (output.length === 0) return false;
+				if (
+					options?.configurationUpdateEffort !== undefined &&
+					isSameModel &&
+					msg.providerThinkingLevel !== undefined
+				) {
+					out.push({
+						type: "configuration_update",
+						reasoning: {
+							effort: msg.providerThinkingLevel as NonNullable<
+								ResponseConfigurationUpdateItemParam.Reasoning["effort"]
+							>,
+						},
+					} satisfies ResponseConfigurationUpdateItemParam);
+				}
+				out.push(...output);
+				return true;
+			});
+			if (!converted) continue;
 		} else if (msg.role === "toolResult") {
-			const [callId] = msg.toolCallId.split("|");
-			const output = convertToolResultOutput(model, msg.content);
+			// The conversion also reads the (possibly renamed) tool call id.
+			unit(sources[index], msg.toolCallId, (out) => {
+				const [callId] = msg.toolCallId.split("|");
+				const output = convertToolResultOutput(model, msg.content);
 
-			if (options?.grammarToolInputProperties?.has(msg.toolName)) {
-				messages.push({
-					type: "custom_tool_call_output",
-					call_id: callId,
-					output,
-				});
-			} else {
-				messages.push({
-					type: "function_call_output",
-					call_id: callId,
-					output,
-				});
-			}
+				if (options?.grammarToolInputProperties?.has(msg.toolName)) {
+					out.push({
+						type: "custom_tool_call_output",
+						call_id: callId,
+						output,
+					});
+				} else {
+					out.push({
+						type: "function_call_output",
+						call_id: callId,
+						output,
+					});
+				}
+			});
 		}
 		if (!isLeadingSystemMessage) msgIndex++;
 	}
+	if (options?.configurationUpdateEffort !== undefined) pushConfigurationUpdate(options.configurationUpdateEffort);
 
 	return messages;
 }
@@ -401,44 +524,24 @@ export function convertResponsesTools(tools: readonly Tool[], options?: ConvertR
 // Stream processing
 // =============================================================================
 
-type StreamingToolCall = ToolCall & {
-	partialJson?: string;
-	customInput?: {
-		property: string;
-		jsonBuffer: GrammarToolInputJsonBuffer;
-	};
-};
-
-function getCustomToolCallInput(block: StreamingToolCall): string {
-	const property = block.customInput?.property;
-	if (property === undefined) return "";
-	const value = block.arguments[property];
-	return typeof value === "string" ? value : "";
-}
-
-function appendCustomToolCallInput(block: StreamingToolCall, nextInput: string, close: boolean): string | undefined {
-	const customInput = block.customInput;
-	if (!customInput) return undefined;
-	const delta = appendGrammarToolInputJsonDelta(customInput.jsonBuffer, customInput.property, nextInput, close);
-	block.arguments = { [customInput.property]: nextInput };
-	return delta;
-}
-
-function appendCustomToolCallInputChunk(block: StreamingToolCall, inputDelta: string): string | undefined {
-	const customInput = block.customInput;
-	if (!customInput) return undefined;
-	// Input the item started with has not been emitted yet. Afterwards both hold the same string, so this is cheap.
-	const input = getCustomToolCallInput(block);
-	if (input !== customInput.jsonBuffer.input) return appendCustomToolCallInput(block, input + inputDelta, false);
-	const delta = appendGrammarToolInputJsonChunk(customInput.jsonBuffer, customInput.property, inputDelta);
-	block.arguments = { [customInput.property]: customInput.jsonBuffer.input };
-	return delta;
-}
+/**
+ * Stream state of a tool call, kept in its output slot and never on the content block, so it never reaches partials:
+ * the JSON arguments of a function call, or the input of a custom (grammar) tool call.
+ */
+type ToolCallInput =
+	| { readonly kind: "json"; readonly arguments: ToolCallArgumentsStream }
+	| {
+			readonly kind: "custom";
+			readonly property: string;
+			readonly buffer: GrammarToolInputJsonBuffer;
+			/** JSON text of the item's initial input, sent with the first delta. */
+			unsent: string;
+	  };
 
 type ResponsesOutputSlot =
 	| { type: "thinking"; block: ThinkingContent; contentIndex: number }
 	| { type: "text"; block: TextContent; contentIndex: number }
-	| { type: "toolCall"; block: StreamingToolCall; contentIndex: number };
+	| { type: "toolCall"; block: ToolCall; contentIndex: number; input: ToolCallInput };
 
 type ToolCallOutputSlot = Extract<ResponsesOutputSlot, { type: "toolCall" }>;
 
@@ -451,6 +554,8 @@ export async function processResponsesStream<TApi extends Api>(
 ): Promise<void> {
 	let sawTerminalResponseEvent = false;
 	const outputSlots = new Map<number, ResponsesOutputSlot>();
+	// Tool calls whose output_item.done has not arrived yet.
+	const unfinishedToolCalls = new Set<ToolCall>();
 	const reasoningBlocksById = new Map<string, ThinkingContent>();
 	const applyMessagePhaseStopReason = (item: ResponseOutputItem): void => {
 		if (item.type === "message" && item.phase === "final_answer") {
@@ -496,19 +601,21 @@ export async function processResponsesStream<TApi extends Api>(
 			return slot;
 		}
 		if (item.type === "function_call") {
-			const block: StreamingToolCall = {
+			const args = new ToolCallArgumentsStream();
+			const block: ToolCall = {
 				type: "toolCall",
 				id: `${item.call_id}|${item.id}`,
 				name: item.name,
-				arguments: {},
+				arguments: item.arguments ? args.append(item.arguments) : {},
 				...(item.namespace !== undefined ? { namespace: item.namespace } : {}),
-				partialJson: item.arguments || "",
 			};
 			output.content.push(block);
+			unfinishedToolCalls.add(block);
 			const slot = {
 				type: "toolCall",
 				block,
 				contentIndex: output.content.length - 1,
+				input: { kind: "json", arguments: args },
 			} satisfies ResponsesOutputSlot;
 			outputSlots.set(outputIndex, slot);
 			stream.push({ type: "toolcall_start", contentIndex: slot.contentIndex, partial: output });
@@ -517,22 +624,20 @@ export async function processResponsesStream<TApi extends Api>(
 		if (item.type === "custom_tool_call") {
 			const inputProperty = options?.grammarToolInputProperties?.get(item.name) ?? "input";
 			const input = item.input || "";
-			const block: StreamingToolCall = {
+			const block: ToolCall = {
 				type: "toolCall",
 				id: `${item.call_id}|${item.id}`,
 				name: item.name,
 				arguments: { [inputProperty]: input },
 				...(item.namespace !== undefined ? { namespace: item.namespace } : {}),
-				customInput: {
-					property: inputProperty,
-					jsonBuffer: { input: "", started: false, closed: false },
-				},
 			};
 			output.content.push(block);
+			unfinishedToolCalls.add(block);
 			const slot = {
 				type: "toolCall",
 				block,
 				contentIndex: output.content.length - 1,
+				input: customInput(inputProperty, input),
 			} satisfies ResponsesOutputSlot;
 			outputSlots.set(outputIndex, slot);
 			stream.push({ type: "toolcall_start", contentIndex: slot.contentIndex, partial: output });
@@ -666,33 +771,23 @@ export async function processResponsesStream<TApi extends Api>(
 			});
 		} else if (event.type === "response.function_call_arguments.delta") {
 			const slot = getSlot(event.output_index, "toolCall");
-			if (!slot || slot.block.partialJson === undefined) continue;
-			slot.block.partialJson += event.delta;
-			slot.block.arguments = parseStreamingJsonWhileStreaming(
-				slot.block,
-				slot.block.partialJson,
-				slot.block.arguments,
-			);
+			if (slot?.input.kind !== "json") continue;
+			slot.block.arguments = slot.input.arguments.append(event.delta);
 			pushToolCallDelta(slot, event.delta);
 		} else if (event.type === "response.function_call_arguments.done") {
 			const slot = getSlot(event.output_index, "toolCall");
-			if (!slot || slot.block.partialJson === undefined) continue;
-			const previousPartialJson = slot.block.partialJson;
-			slot.block.partialJson = event.arguments;
-			slot.block.arguments = parseStreamingJson(slot.block.partialJson);
-
-			if (event.arguments.startsWith(previousPartialJson)) {
-				const delta = event.arguments.slice(previousPartialJson.length);
-				if (delta.length > 0) pushToolCallDelta(slot, delta);
-			}
+			if (slot?.input.kind !== "json") continue;
+			const replaced = slot.input.arguments.replace(event.arguments);
+			slot.block.arguments = replaced.arguments;
+			if (replaced.delta) pushToolCallDelta(slot, replaced.delta);
 		} else if (event.type === "response.custom_tool_call_input.delta") {
 			const slot = getSlot(event.output_index, "toolCall");
-			if (!slot || !slot.block.customInput) continue;
-			pushToolCallDelta(slot, appendCustomToolCallInputChunk(slot.block, event.delta));
+			if (slot?.input.kind !== "custom") continue;
+			pushToolCallDelta(slot, appendCustomInput(slot.block, slot.input, event.delta));
 		} else if (event.type === "response.custom_tool_call_input.done") {
 			const slot = getSlot(event.output_index, "toolCall");
-			if (!slot || !slot.block.customInput) continue;
-			pushToolCallDelta(slot, appendCustomToolCallInput(slot.block, event.input, true));
+			if (slot?.input.kind !== "custom") continue;
+			pushToolCallDelta(slot, closeCustomInput(slot.block, slot.input, event.input));
 		} else if (event.type === "response.output_item.done") {
 			const item = event.item;
 			applyMessagePhaseStopReason(item);
@@ -721,16 +816,11 @@ export async function processResponsesStream<TApi extends Api>(
 					partial: output,
 				});
 				outputSlots.delete(event.output_index);
-			} else if (
-				item.type === "function_call" &&
-				slot?.type === "toolCall" &&
-				slot.block.partialJson !== undefined
-			) {
-				slot.block.arguments = parseStreamingJson(item.arguments || slot.block.partialJson || "{}");
+			} else if (item.type === "function_call" && slot?.type === "toolCall" && slot.input.kind === "json") {
+				if (item.arguments) slot.input.arguments.replace(item.arguments);
+				Object.assign(slot.block, slot.input.arguments.finish());
 				if (item.namespace !== undefined) slot.block.namespace = item.namespace;
-				// Finalize in-place and strip the scratch buffer so replay only
-				// carries parsed arguments.
-				delete slot.block.partialJson;
+				unfinishedToolCalls.delete(slot.block);
 				stream.push({
 					type: "toolcall_end",
 					contentIndex: slot.contentIndex,
@@ -738,13 +828,10 @@ export async function processResponsesStream<TApi extends Api>(
 					partial: output,
 				});
 				outputSlots.delete(event.output_index);
-			} else if (item.type === "custom_tool_call" && slot?.type === "toolCall" && slot.block.customInput) {
-				pushToolCallDelta(
-					slot,
-					appendCustomToolCallInput(slot.block, item.input ?? getCustomToolCallInput(slot.block), true),
-				);
+			} else if (item.type === "custom_tool_call" && slot?.type === "toolCall" && slot.input.kind === "custom") {
+				pushToolCallDelta(slot, closeCustomInput(slot.block, slot.input, item.input));
 				if (item.namespace !== undefined) slot.block.namespace = item.namespace;
-				delete slot.block.customInput;
+				unfinishedToolCalls.delete(slot.block);
 				stream.push({
 					type: "toolcall_end",
 					contentIndex: slot.contentIndex,
@@ -775,18 +862,45 @@ export async function processResponsesStream<TApi extends Api>(
 	}
 	// The agent runs every tool call in the final message. Refuse to hand over calls whose
 	// output_item.done never arrived: their arguments may be cut off or mixed up, e.g. when a
-	// non-compliant server omits output_index. Finished calls have their scratch buffers removed.
+	// non-compliant server omits output_index.
 	if (output.stopReason === "toolUse") {
-		for (const block of output.content) {
-			if (block.type !== "toolCall") continue;
-			const toolCall = block as StreamingToolCall;
-			if (toolCall.partialJson !== undefined || toolCall.customInput !== undefined) {
-				throw new Error(
-					`OpenAI Responses stream completed with an unfinished tool call: ${toolCall.name} (${toolCall.id})`,
-				);
-			}
+		for (const toolCall of unfinishedToolCalls) {
+			throw new Error(
+				`OpenAI Responses stream completed with an unfinished tool call: ${toolCall.name} (${toolCall.id})`,
+			);
 		}
 	}
+}
+
+type CustomInput = Extract<ToolCallInput, { kind: "custom" }>;
+
+/** Stream state of a custom tool call that starts with `initialInput`. */
+function customInput(property: string, initialInput: string): CustomInput {
+	const buffer = { input: "", started: false, closed: false };
+	return {
+		kind: "custom",
+		property,
+		buffer,
+		unsent: appendGrammarToolInputJsonDelta(buffer, property, initialInput) ?? "",
+	};
+}
+
+/** Append to a streaming custom tool input; returns the matching piece of its JSON arguments text. */
+function appendCustomInput(block: ToolCall, input: CustomInput, delta: string): string | undefined {
+	return sendCustomInput(block, input, appendGrammarToolInputJsonDelta(input.buffer, input.property, delta));
+}
+
+/** Close a custom tool input with the provider's complete input, if it sent one. */
+function closeCustomInput(block: ToolCall, input: CustomInput, finalInput: string | undefined): string | undefined {
+	return sendCustomInput(block, input, closeGrammarToolInputJson(input.buffer, input.property, finalInput));
+}
+
+function sendCustomInput(block: ToolCall, input: CustomInput, jsonDelta: string | undefined): string | undefined {
+	block.arguments = { [input.property]: input.buffer.input };
+	if (input.unsent === "") return jsonDelta;
+	const sent = input.unsent + (jsonDelta ?? "");
+	input.unsent = "";
+	return sent;
 }
 
 function mapStopReason(

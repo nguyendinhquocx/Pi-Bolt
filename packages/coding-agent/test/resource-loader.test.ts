@@ -84,6 +84,90 @@ describe("DefaultResourceLoader", () => {
 			]);
 		});
 
+		// #11088
+		it("should warn and keep loading when a configured package cannot be installed", async () => {
+			vi.stubEnv("PI_OFFLINE", "");
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				settingsManager: SettingsManager.inMemory({
+					packages: ["npm:broken-package"],
+					// Any non-zero exit stands in for an npm install that cannot reach the registry.
+					npmCommand: [process.execPath, "-e", "process.exit(1)"],
+				}),
+			});
+
+			await loader.reload();
+
+			const warnings = loader.getExtensions().warnings ?? [];
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0].path).toBe("npm:broken-package");
+			expect(warnings[0].warning).toMatch(/^failed to install \(.*failed with code 1\)\./);
+			expect(warnings[0].warning).toContain('Run "pi remove npm:broken-package" to remove it from settings.json.');
+		});
+
+		// #11088
+		it("should point temporary extension sources at the source instead of pi remove", async () => {
+			vi.stubEnv("PI_OFFLINE", "");
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				additionalExtensionPaths: ["npm:broken-package"],
+				settingsManager: SettingsManager.inMemory({
+					npmCommand: [process.execPath, "-e", "process.exit(1)"],
+				}),
+			});
+
+			await loader.reload();
+
+			const warnings = loader.getExtensions().warnings ?? [];
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0].path).toBe("npm:broken-package");
+			expect(warnings[0].warning).toContain("Check the source and try again.");
+			expect(warnings[0].warning).not.toContain("pi remove");
+		});
+
+		// #11088
+		it("should point project extension packages at pi remove --local", async () => {
+			vi.stubEnv("PI_OFFLINE", "");
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ npmCommand: [process.execPath, "-e", "process.exit(1)"] }),
+			);
+			mkdirSync(join(cwd, ".pi"), { recursive: true });
+			writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ packages: ["npm:broken-package"] }));
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				settingsManager: SettingsManager.create(cwd, agentDir, { projectTrusted: true }),
+			});
+
+			await loader.reload();
+
+			const warnings = loader.getExtensions().warnings ?? [];
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0].warning).toContain('Run "pi remove npm:broken-package --local"');
+		});
+
+		// #11088
+		it("should warn once about a failing install when project trust is resolved", async () => {
+			vi.stubEnv("PI_OFFLINE", "");
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				settingsManager: SettingsManager.inMemory({
+					packages: ["npm:broken-package"],
+					npmCommand: [process.execPath, "-e", "process.exit(1)"],
+				}),
+			});
+
+			await loader.reload({ resolveProjectTrust: async () => false });
+
+			const warnings = loader.getExtensions().warnings ?? [];
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0].path).toBe("npm:broken-package");
+		});
+
 		it("should fail when an extension package manifest cannot be parsed", async () => {
 			const packageRoot = join(tempDir, "invalid-extension-package");
 			const extensionsDir = join(packageRoot, "extensions");
@@ -552,6 +636,108 @@ Project skill content`,
 			await loader.reload();
 
 			expect(loader.getAppendSystemPrompt()).toContain("Additional instructions.");
+		});
+	});
+
+	describe("prompt templates at first use", () => {
+		function writePrompts(): { userPromptsDir: string; projectPromptsDir: string } {
+			const userPromptsDir = join(agentDir, "prompts");
+			const projectPromptsDir = join(cwd, ".pi", "prompts");
+			mkdirSync(userPromptsDir, { recursive: true });
+			mkdirSync(projectPromptsDir, { recursive: true });
+			writeFileSync(
+				join(userPromptsDir, "review.md"),
+				'---\ndescription: Review\nargument-hint: "[file]"\n---\nReview $1',
+			);
+			writeFileSync(join(userPromptsDir, "commit.md"), "User commit");
+			writeFileSync(join(projectPromptsDir, "commit.md"), "Project commit");
+			return { userPromptsDir, projectPromptsDir };
+		}
+
+		it("reads the template files when the templates are first asked for, not at reload", async () => {
+			const { userPromptsDir } = writePrompts();
+			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			await loader.reload();
+			writeFileSync(join(userPromptsDir, "review.md"), "---\ndescription: Changed after reload\n---\nChanged");
+
+			const review = loader.getPrompts().prompts.find((prompt) => prompt.name === "review");
+			expect(review?.description).toBe("Changed after reload");
+			expect(loader.getPromptFiles().loaded).toBe(true);
+		});
+
+		it("lists the templates without reading them, as loading them gives", async () => {
+			writePrompts();
+			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			await loader.reload();
+
+			const listed = loader.getPromptFiles();
+			expect(listed.loaded).toBe(false);
+			const loaded = loader.getPrompts();
+			expect(listed.prompts).toEqual(
+				loaded.prompts.map(({ name, filePath, sourceInfo }) => ({ name, filePath, sourceInfo })),
+			);
+			// Includes the collision of the two commit templates.
+			expect(listed.diagnostics).toEqual(loaded.diagnostics);
+			expect(loaded.diagnostics).toEqual([expect.objectContaining({ type: "collision" })]);
+		});
+
+		it("lists a template whose frontmatter cannot be parsed, which loading reports and leaves out", async () => {
+			const promptsDir = join(agentDir, "prompts");
+			mkdirSync(promptsDir, { recursive: true });
+			writeFileSync(join(promptsDir, "broken.md"), "---\ndescription: Broken: unquoted colon\n---\nBody");
+			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			await loader.reload();
+
+			expect(loader.getPromptFiles().prompts.map((prompt) => prompt.name)).toEqual(["broken"]);
+			const loaded = loader.getPrompts();
+			expect(loaded.prompts).toEqual([]);
+			expect(loaded.diagnostics).toEqual([expect.objectContaining({ type: "warning" })]);
+			expect(loader.getPromptFiles()).toEqual({ ...loaded, loaded: true });
+		});
+
+		it("reports explicit prompt paths that do not exist both before and after loading", async () => {
+			const missing = join(tempDir, "missing-prompts");
+			const loader = new DefaultResourceLoader({ cwd, agentDir, additionalPromptTemplatePaths: [missing] });
+			await loader.reload();
+
+			const expected = [{ type: "error", message: "Prompt template path does not exist", path: missing }];
+			expect(loader.getPromptFiles().diagnostics).toEqual(expected);
+			expect(loader.getPrompts().diagnostics).toEqual(expected);
+		});
+
+		it("loads the templates to list them when an override would change them", async () => {
+			writePrompts();
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				promptsOverride: (base) => ({
+					...base,
+					prompts: base.prompts.filter((prompt) => prompt.name === "review"),
+				}),
+			});
+			await loader.reload();
+
+			const listed = loader.getPromptFiles();
+			expect(listed.loaded).toBe(true);
+			expect(listed.prompts.map((prompt) => prompt.name)).toEqual(["review"]);
+		});
+
+		it("leaves templates that extensions add to their first use as well", async () => {
+			const extraPromptDir = join(tempDir, "extra-prompts");
+			mkdirSync(extraPromptDir, { recursive: true });
+			const promptPath = join(extraPromptDir, "extra.md");
+			writeFileSync(promptPath, "Extra prompt content");
+			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			await loader.reload();
+			expect(loader.getPrompts().prompts).toEqual([]);
+
+			loader.extendResources({
+				promptPaths: [
+					{ path: promptPath, metadata: { source: "extension:extra", scope: "temporary", origin: "top-level" } },
+				],
+			});
+			expect(loader.getPromptFiles()).toMatchObject({ loaded: false, prompts: [{ name: "extra" }] });
+			expect(loader.getPrompts().prompts.map((prompt) => prompt.content)).toEqual(["Extra prompt content"]);
 		});
 	});
 
